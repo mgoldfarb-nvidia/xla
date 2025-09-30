@@ -870,7 +870,7 @@ absl::StatusOr<Layout> PjRtCApiClient::GetDefaultLayout(
   // TODO(yueshengys): once b/338478940 is fixed, we can get rid of the
   // serialization here and wrap the `args.layout` into a subclass of
   // `PjRtLayout`.
-  PJRT_Layouts_MemoryLayout_Serialize_Args serialize_args;
+  PJRT_Layouts_MemoryLayout_Serialize_Args serialize_args{};
   serialize_args.struct_size =
       PJRT_Layouts_MemoryLayout_Serialize_Args_STRUCT_SIZE;
   serialize_args.extension_start = nullptr;
@@ -2490,7 +2490,7 @@ std::shared_ptr<const PjRtLayout> PjRtCApiBuffer::layout() const {
 
         // TODO(b/343274093): returns a PjRtLayout that wraps a C API layout
         // directly instead of de/serializing into an xla::Layout.
-        PJRT_Layouts_MemoryLayout_Serialize_Args serialize_args;
+        PJRT_Layouts_MemoryLayout_Serialize_Args serialize_args{};
         serialize_args.struct_size =
             PJRT_Layouts_MemoryLayout_Serialize_Args_STRUCT_SIZE;
         serialize_args.extension_start = nullptr;
