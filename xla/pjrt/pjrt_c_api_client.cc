@@ -3115,7 +3115,7 @@ absl::StatusOr<std::unique_ptr<PjRtClient>> WrapClientAroundCApi(
     const PJRT_Api* c_api,
     const absl::flat_hash_map<std::string, PjRtValueType>& create_options,
     std::shared_ptr<KeyValueStoreInterface> kv_store) {
-  PJRT_Client_Create_Args init_args;
+  PJRT_Client_Create_Args init_args{};
   init_args.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
   init_args.extension_start = nullptr;
   TF_ASSIGN_OR_RETURN(std::vector<PJRT_NamedValue> c_options,
