@@ -54,6 +54,11 @@ namespace xla::gpu {
 // clique have a well defined total execution order, enforced with events.
 TSL_LIB_GTL_DEFINE_INT_TYPE(CommunicationId, uint64_t);
 
+// Number of compute and collective execution streams. These constants are used
+// to configure ExecutionStreamAssignment's round-robin allocation.
+inline constexpr int kNumComputeStreams = 4;
+inline constexpr int kNumCollectiveStreams = 2;
+
 // StrJoin for device groups that shortens long list of devices for readability.
 std::string HumanReadableDeviceGroups(
     absl::Span<const std::vector<GlobalDeviceId>> device_groups,

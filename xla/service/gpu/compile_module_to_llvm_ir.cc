@@ -65,6 +65,7 @@ limitations under the License.
 #include "xla/service/buffer_value.h"
 #include "xla/service/dump.h"
 #include "xla/service/gpu/alias_info.h"
+#include "xla/backends/gpu/collectives/gpu_clique_key.h"
 #include "xla/service/gpu/execution_stream_assignment.h"
 #include "xla/service/gpu/gpu_constants.h"
 #include "xla/service/gpu/gpu_executable.h"
@@ -106,18 +107,16 @@ CompileModuleResults InitializeResults(const HloModule* hlo_module) {
   CompileModuleResults results;
   results.module_name = hlo_module->name();
   results.use_original_allocations = true;
+  const auto& debug_opts = hlo_module->config().debug_options();
+  const int num_collective_streams =
+      debug_opts.xla_gpu_experimental_enable_collective_multi_streaming()
+          ? kNumCollectiveStreams
+          : 1;
   results.execution_stream_assignment =
       std::make_unique<ExecutionStreamAssignment>(
           hlo_module,
-          ExecutionStreamAssignment::Options{
-              kDefaultNumComputeStreams,
-              /*number_of_collective_execution_streams=*/
-              hlo_module->config()
-                      .debug_options()
-                      .xla_gpu_experimental_enable_collective_multi_streaming()
-                  ? kDefaultNumCommunicationStreams
-                  : 1,
-          });
+          ExecutionStreamAssignment::Options{kNumComputeStreams,
+                                             num_collective_streams});
   return results;
 }
 

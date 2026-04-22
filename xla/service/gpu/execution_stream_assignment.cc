@@ -35,6 +35,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/service/collective_ops_utils.h"
 #include "xla/service/collective_opt_utils.h"
+#include "xla/service/collective_ops_utils.h"
 #include "xla/side_effect_util.h"
 
 namespace xla::gpu {

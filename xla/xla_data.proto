@@ -172,6 +172,9 @@ enum AsyncStreamKind {
   ASYNC_STREAM_KIND_P2P1 = 2;
   // Stream for MemCpyP2P
   ASYNC_STREAM_KIND_MEMCPYP2P = 3;
+  // Second collective stream, used to run all-gather concurrently with
+  // reduce-scatter when xla_gpu_enable_ag_rs_split_streams is set.
+  ASYNC_STREAM_KIND_COLLECTIVE2 = 4;
 }
 
 // There are broadly 4 modes that collective communication ops use to describe

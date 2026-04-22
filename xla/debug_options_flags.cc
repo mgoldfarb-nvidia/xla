@@ -277,6 +277,9 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
       DebugOptions::COLLECTIVES_PRIVATE_MEMORY);
   opts.set_xla_gpu_enable_reduce_scatter_combine_by_dim(false);
   opts.set_xla_gpu_enable_approx_costly_collectives(false);
+  opts.set_xla_gpu_pgle_latency_scaling_factor(1.0f);
+  opts.set_xla_gpu_collective_hints_file("");
+  opts.set_xla_gpu_experimental_enable_collective_multi_streaming(false);
 
   opts.set_xla_gpu_enable_reassociation_for_converted_ar(true);
 
@@ -1769,6 +1772,28 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       debug_options->xla_gpu_enable_approx_costly_collectives(),
       "Enables more accurate latency approximation of collectives. Used in "
       "`ApproximateLatencyEstimator` scheduler."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_pgle_latency_scaling_factor",
+      float_setter_for(&DebugOptions::set_xla_gpu_pgle_latency_scaling_factor),
+      debug_options->xla_gpu_pgle_latency_scaling_factor(),
+      "Scaling factor applied to PGLE-measured collective latencies. Values "
+      "> 1.0 widen the scheduling window, potentially improving overlap at "
+      "the cost of higher memory pressure."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_collective_hints_file",
+      string_setter_for(&DebugOptions::set_xla_gpu_collective_hints_file),
+      debug_options->xla_gpu_collective_hints_file(),
+      "Path to a CollectiveHintsConfig proto text file. When set, XLA will "
+      "inject scheduling hints (latency_metadata, force_earliest, "
+      "scheduling_group_id) onto matching collective async-start instructions "
+      "before running the latency hiding scheduler."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_experimental_enable_collective_multi_streaming",
+      bool_setter_for(
+          &DebugOptions::
+              set_xla_gpu_experimental_enable_collective_multi_streaming),
+      debug_options->xla_gpu_experimental_enable_collective_multi_streaming(),
+      "Enable multi-stream runtime for collectives."));
   flag_list->push_back(tsl::Flag(
       "xla_gpu_all_reduce_blueconnect_num_devices_per_host",
       int32_setter_for(

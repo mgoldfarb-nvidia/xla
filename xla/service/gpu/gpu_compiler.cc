@@ -253,6 +253,7 @@ limitations under the License.
 #include "xla/service/gpu/compile_module_to_llvm_ir.h"
 #include "xla/service/gpu/conv_layout_normalization.h"
 #include "xla/service/gpu/cublas_cudnn.h"
+#include "xla/backends/gpu/collectives/gpu_clique_key.h"
 #include "xla/service/gpu/early_exit_compilation_result.h"
 #include "xla/service/gpu/execution_stream_assignment.h"
 #include "xla/service/gpu/flag_utils.h"
@@ -3156,16 +3157,15 @@ GpuCompiler::LoadExecutableFromAotResult(
       std::unique_ptr<HloModule> hlo_module,
       HloModule::CreateFromProtoWithConfig(proto.hlo_module_with_config()));
 
+  const auto& dbg_opts = hlo_module->config().debug_options();
+  const int num_collective_streams =
+      dbg_opts.xla_gpu_experimental_enable_collective_multi_streaming()
+          ? kNumCollectiveStreams
+          : 1;
   ExecutionStreamAssignment execution_stream_assignment(
       hlo_module.get(),
-      {
-          kDefaultNumComputeStreams,
-          hlo_module->config()
-                  .debug_options()
-                  .xla_gpu_experimental_enable_collective_multi_streaming()
-              ? kDefaultNumCommunicationStreams
-              : 1,
-      });
+      ExecutionStreamAssignment::Options{kNumComputeStreams,
+                                         num_collective_streams});
 
   std::vector<uint8_t> binary(proto.binary().begin(), proto.binary().end());
 

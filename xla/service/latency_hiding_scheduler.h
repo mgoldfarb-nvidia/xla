@@ -167,6 +167,7 @@ struct SchedulerConfig {
   // useful when the memory pressure is high. Without this, under high memory
   // pressure, aggressive_flexible_annotation_scheduling is not respected.
   bool force_delay_over_memory_pressure = false;
+  float pgle_latency_scaling_factor = 1.0f;
   // If true, estimate the fragmentation size of the module by running the heap
   // simulator.
   bool estimate_fragmentation_size = false;

@@ -1479,6 +1479,7 @@ cc_library(
         ":alias_info",
         ":execution_stream_assignment",
         ":gpu_constants",
+        "//xla/backends/gpu/collectives:gpu_clique_key",
         ":gpu_executable",
         ":gpu_hlo_ordering",
         ":gpu_memory_space_assignment",
@@ -1617,6 +1618,7 @@ cc_library(
         ":cublas_cudnn",
         ":early_exit_compilation_result",
         ":execution_stream_assignment",
+        "//xla/backends/gpu/collectives:gpu_clique_key",
         ":flag_utils",
         ":fusion_dispatch_pipeline",
         ":fusion_pipeline",
@@ -2686,6 +2688,7 @@ cc_library(
     deps = [
         ":alias_info",
         ":backend_configs_cc",
+        ":collective_hints_annotator",
         ":flag_utils",
         ":gpu_latency_hiding_scheduler",
         ":hlo_fusion_analysis",
@@ -3486,6 +3489,7 @@ cc_library(
         ":backend_configs_cc",
         ":cublas_cudnn",
         "//xla:shape_util",
+        "//xla/backends/gpu/collectives:gpu_clique_key",
         "//xla/backends/gpu/transforms/collectives:collective_ops_utils",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/utils:hlo_query",
@@ -3499,6 +3503,49 @@ cc_library(
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+tf_proto_library(
+    name = "collective_hints_proto",
+    srcs = ["collective_hints.proto"],
+)
+
+cc_library(
+    name = "collective_hints_annotator",
+    srcs = ["collective_hints_annotator.cc"],
+    hdrs = ["collective_hints_annotator.h"],
+    deps = [
+        ":backend_configs_cc",
+        ":collective_hints_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass",
+        "//xla/hlo/utils:hlo_query",
+        "//xla:shape_util",
+        "//xla/tsl/platform:env",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@tsl//tsl/platform:protobuf",
+    ],
+)
+
+xla_cc_test(
+    name = "collective_hints_annotator_test",
+    srcs = ["collective_hints_annotator_test.cc"],
+    deps = [
+        ":backend_configs_cc",
+        ":collective_hints_annotator",
+        ":collective_hints_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
     ],
 )
 

@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/service/profile_guided_latency_estimator.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <memory>
 #include <utility>
@@ -113,7 +114,12 @@ LatencyEstimator::TimeCost ProfileGuidedLatencyEstimator::GetLatencyBetween(
     VLOG(2) << "PGLE found latency between " << from.GetInstr().name()
             << " and " << target.GetInstr().name() << " in latency info";
     HandleFoundInstructionLatency(aggregator_.get(), from, target);
-    return it2->second * CyclesPerMicrosecond();
+    TimeCost scaled =
+        it2->second * config_.pgle_latency_scaling_factor * CyclesPerMicrosecond();
+    if (const auto annotation = GetLatencyFromMetadata(from.GetInstr())) {
+      return std::max(scaled, *annotation);
+    }
+    return scaled;
   }
 
   // For async-start/done instructions, if there is no entry in latencies, fall
@@ -124,7 +130,12 @@ LatencyEstimator::TimeCost ProfileGuidedLatencyEstimator::GetLatencyBetween(
             << " and (assumed)" << target.GetInstr().name()
             << " in instruction costs";
     HandleFoundInstructionLatency(aggregator_.get(), from, target);
-    return *it->second.cost * CyclesPerMicrosecond();
+    TimeCost scaled =
+        *it->second.cost * config_.pgle_latency_scaling_factor * CyclesPerMicrosecond();
+    if (const auto annotation = GetLatencyFromMetadata(from.GetInstr())) {
+      return std::max(scaled, *annotation);
+    }
+    return scaled;
   }
 
   VLOG(1) << "PGLE did not find relevant profiling info for '"

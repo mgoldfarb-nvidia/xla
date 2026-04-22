@@ -1,0 +1,120 @@
+// Copyright 2024 The OpenXLA Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package xla.gpu;
+
+// Matching criteria for a collective hint rule.
+// At least one op_name filter is required when using metadata-based matching.
+message CollectiveHintMatch {
+  // Exact op_name match (from HLO metadata).
+  string op_name = 1;
+
+  // op_name ends with this suffix.
+  string op_name_suffix = 2;
+
+  // op_name contains this substring.
+  string op_name_contains = 3;
+
+  // Pass filter: "forward", "backward", "remat", or "" (any).
+  //   forward  - op_name contains "/jvp(" but not "transpose("
+  //   backward - op_name contains "transpose("
+  //   remat    - op_name contains "rematted_computation"
+  //   ""       - no filter (matches any pass)
+  string pass_filter = 4;
+
+  // Substring match on HloOpcodeString(instr->opcode()).
+  // E.g. "all-gather-start", "all-reduce-start", "reduce-scatter-start".
+  string collective_type = 5;
+
+  // Substring match on ShapeUtil::HumanString of any result shape component.
+  string operand_shape = 6;
+}
+
+// A single collective hint rule. Either `name` (legacy) or `match` must be set.
+message CollectiveHint {
+  // Legacy: exact HLO instruction name, or glob pattern using '*' and '?'.
+  // Use `match` instead for stable hints that survive recompilation.
+  string name = 1;
+
+  // Metadata-based matching (stable across recompiles).
+  CollectiveHintMatch match = 2;
+
+  // Hints to apply to matching instructions:
+
+  // Latency override in nanoseconds (string). Sets the `latency_metadata`
+  // frontend attribute, which overrides the LHS scheduling window size.
+  string latency_metadata = 3;
+
+  // If true, sets `force_earliest_schedule=true` in the instruction's
+  // GpuBackendConfig, causing LHS to schedule this async-start as late as
+  // possible (maximizing the overlap window fill).
+  bool force_earliest = 4;
+
+  // If non-empty, sets `_scheduling_group_id` to this value, binding the
+  // collective to compute ops that share the same scheduling group ID.
+  string scheduling_group_id = 5;
+
+  // If non-zero, pins this collective to a specific execution stream by setting
+  // `_xla_stream_annotation` on the async-start instruction.  This overrides
+  // the default round-robin assignment that XLA uses when
+  // xla_gpu_experimental_enable_collective_multi_streaming is enabled.
+  //
+  // Stream IDs with kNumComputeStreams=4 and kNumCollectiveStreams=2:
+  //   0  — main/host stream (do not use)
+  //   1–4 — compute streams (for async compute ops)
+  //   5  — first collective stream  (default for odd-numbered collectives)
+  //   6  — second collective stream (default for even-numbered collectives)
+  //
+  // Example: set stream_id=5 to force all matching collectives onto stream 5,
+  // effectively serialising them onto one stream.
+  int32 stream_id = 6;
+
+  // Priority for conflict resolution when multiple rules match the same
+  // instruction. Higher values win. Rules with equal priority are resolved
+  // by their order in the hints list (later entry wins).
+  //
+  // Default (0) is the lowest priority. Use higher values for more-specific
+  // rules that should override generic catch-all rules. For example:
+  //
+  //   hints { match { collective_type: "all-gather" } stream_id: 5 priority: 0 }
+  //   hints { match { op_name_suffix: "w3/all_gather" } stream_id: 6 priority: 1 }
+  //
+  // The second rule overrides the first for the w3 all-gather specifically,
+  // even though the first rule also matches it.
+  int32 priority = 7;
+
+  // If set, apply this rule only on the Nth instruction (0-indexed) whose
+  // other criteria match.  Lets you distinguish otherwise-identical
+  // instructions that share the same op_name/shape/opcode — e.g. a set of
+  // same-signature all-gathers inside one MoE while-body — without relying
+  // on compiler-assigned instance numbers which shift across recompiles.
+  //
+  // Ordinal is counted per-rule across the module's non-fusion computations
+  // in `MakeNonfusionComputations()` iteration order.  Only instructions
+  // that pass the opcode gate (async-collective-start or compute-group-
+  // target) and satisfy all other criteria increment the counter.
+  //
+  // Unset means apply on every match (original behavior).
+  optional int32 match_ordinal = 8;
+}
+
+// Top-level config: an ordered list of rules. All matching rules are applied
+// and merged. When multiple rules match the same instruction, the rule with
+// the highest `priority` wins for each hint field. Rules with equal priority
+// are resolved by their position in the list (later entry wins).
+message CollectiveHintsConfig {
+  repeated CollectiveHint hints = 1;
+}

@@ -58,6 +58,7 @@ limitations under the License.
 #include "xla/service/buffer_value.h"
 #include "xla/service/gpu/alias_info.h"
 #include "xla/service/gpu/backend_configs.pb.h"
+#include "xla/service/gpu/collective_hints_annotator.h"
 #include "xla/service/gpu/flag_utils.h"
 #include "xla/service/gpu/gpu_latency_hiding_scheduler.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
@@ -553,11 +554,17 @@ LegalizeSchedulingAnnotations::Config SchedulingAnnotationsConfig() {
     if (hlo == nullptr) {
       return false;
     }
-    if (hlo->IsCustomCall("__cublas$gemm")) {
+    if (hlo->opcode() == HloOpcode::kCustomCall) {
       return true;
     }
     if (hlo->opcode() == HloOpcode::kFusion) {
       return IsGpuFusionKind(*hlo, kTritonGemmFusionKind);
+    }
+    if (hlo->opcode() == HloOpcode::kDot) {
+      return true;
+    }
+    if (hlo->opcode() == HloOpcode::kConvolution) {
+      return true;
     }
     return false;
   };
@@ -624,6 +631,18 @@ absl::Status RunLatencyHidingSchedulerPasses(
   tsl::profiler::TraceMe traceme("RunLatencyHidingSchedulerPasses");
   HloPassPipeline pipeline("latency-hiding-scheduler");
   const DebugOptions& options = module->config().debug_options();
+
+  // Inject collective hints before legalizing scheduling annotations, so that
+  // latency_metadata / force_earliest / scheduling_group_id attributes are
+  // visible to LegalizeSchedulingAnnotations and the scheduler.
+  if (!options.xla_gpu_collective_hints_file().empty()) {
+    TF_ASSIGN_OR_RETURN(
+        auto hints_pass,
+        CollectiveHintsAnnotatorPass::Create(
+            options.xla_gpu_collective_hints_file()));
+    pipeline.AddPass<CollectiveHintsAnnotatorPass>(std::move(hints_pass));
+  }
+
   pipeline.AddPass<LegalizeSchedulingAnnotations>(
       SchedulingAnnotationsConfig());
 
@@ -631,6 +650,8 @@ absl::Status RunLatencyHidingSchedulerPasses(
       memory_limit,
       options.xla_gpu_experimental_parallel_collective_overlap_limit(),
       options.xla_gpu_experimental_parallel_async_compute_limit());
+  config.pgle_latency_scaling_factor =
+      options.xla_gpu_pgle_latency_scaling_factor();
 
   auto shape_size_in_bytes = ShapeSizeBytesFunction(pointer_size);
 

@@ -1241,5 +1241,69 @@ TEST_F(GpuLatencyHidingSchedulerBaseTest, DelayMoveToHostAsyncStart) {
       GetIndexByName(instruction_sequence, "all-to-all-start.4"));
 }
 
+// Tests that GpuLatencyEstimator uses latency_metadata annotation instead of
+// the default kHighLatency when the annotation is present on the async-start.
+class GpuLatencyEstimatorAnnotationTest
+    : public HloHardwareIndependentTestBase {};
+
+TEST_F(GpuLatencyEstimatorAnnotationTest,
+       AnnotationOverridesDefaultHighLatency) {
+  // collective-permute-start with latency_metadata="5000000" ns.
+  // Expected: 5000000 * CyclesPerMicrosecond() / 1000 = 5000.0 cycles.
+  // Without annotation the default is kHighLatency = 5000.0, but we verify the
+  // code path actually reads the annotation rather than coincidentally matching.
+  absl::string_view hlo_string = R"(
+HloModule module, is_scheduled=true
+
+ENTRY entry {
+  p0 = f32[1024,2048]{1,0} parameter(0)
+  cp_start = (f32[1024,2048]{1,0}, f32[1024,2048]{1,0}, u32[], u32[]) collective-permute-start(p0), source_target_pairs={{0,1}}, frontend_attributes={latency_metadata="10000000"}
+  ROOT cp_done = f32[1024,2048]{1,0} collective-permute-done(cp_start)
+}
+)";
+
+  TF_ASSERT_OK_AND_ASSIGN(auto hlo_module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+
+  HloInstruction* cp_start = FindInstruction(hlo_module.get(), "cp_start");
+  HloInstruction* cp_done = FindInstruction(hlo_module.get(), "cp_done");
+  HloGraphNode cp_start_node(cp_start, 0);
+  HloGraphNode cp_done_node(cp_done, 1);
+
+  GpuLatencyEstimator estimator(/*pointer_size=*/8);
+
+  double latency = estimator.GetLatencyBetween(cp_start_node, cp_done_node);
+  // latency_metadata="10000000" ns * 1 cycle/us / 1000 = 10000.0 cycles.
+  // This is different from kHighLatency (5000), proving annotation was used.
+  EXPECT_NEAR(latency, 10000.0, 1e-3);
+}
+
+TEST_F(GpuLatencyEstimatorAnnotationTest, DefaultHighLatencyWithoutAnnotation) {
+  absl::string_view hlo_string = R"(
+HloModule module, is_scheduled=true
+
+ENTRY entry {
+  p0 = f32[1024,2048]{1,0} parameter(0)
+  cp_start = (f32[1024,2048]{1,0}, f32[1024,2048]{1,0}, u32[], u32[]) collective-permute-start(p0), source_target_pairs={{0,1}}
+  ROOT cp_done = f32[1024,2048]{1,0} collective-permute-done(cp_start)
+}
+)";
+
+  TF_ASSERT_OK_AND_ASSIGN(auto hlo_module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+
+  HloInstruction* cp_start = FindInstruction(hlo_module.get(), "cp_start");
+  HloInstruction* cp_done = FindInstruction(hlo_module.get(), "cp_done");
+  HloGraphNode cp_start_node(cp_start, 0);
+  HloGraphNode cp_done_node(cp_done, 1);
+
+  GpuLatencyEstimator estimator(/*pointer_size=*/8);
+
+  double latency = estimator.GetLatencyBetween(cp_start_node, cp_done_node);
+  // ApproximateLatencyEstimator::kHighLatency == 5000.0 (protected constant,
+  // inlined here so the test doesn't need friendship).
+  EXPECT_NEAR(latency, 5000.0, 1e-3);
+}
+
 }  // namespace
 }  // namespace xla::gpu
