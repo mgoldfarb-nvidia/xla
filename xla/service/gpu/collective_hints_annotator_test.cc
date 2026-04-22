@@ -516,6 +516,82 @@ TEST_F(CollectiveHintsAnnotatorTest, GlobPrefixMatchesAgStart) {
 }
 
 // ---------------------------------------------------------------------------
+// Async-wrapper op_name fall-through
+// ---------------------------------------------------------------------------
+
+// HLO with an async-start wrapper whose OUTER instruction has no metadata,
+// but whose wrapped reduce-scatter carries an op_name. Exercises the
+// annotator's fall-through that lets metadata-based rules target wrapped
+// collectives via the inner instruction's op_name.
+constexpr absl::string_view kAsyncWrappedRsHlo = R"(
+  HloModule m, is_scheduled=true
+
+  add_fn {
+    x = f32[] parameter(0)
+    y = f32[] parameter(1)
+    ROOT _ = f32[] add(x, y)
+  }
+
+  async_computation {
+    p = f32[4] parameter(0)
+    ROOT inner_rs = f32[2] reduce-scatter(p), dimensions={0},
+        to_apply=add_fn, replica_groups={},
+        metadata={op_name="my/rs/inner/scope"}
+  }
+
+  ENTRY main {
+    p0 = f32[4] parameter(0)
+    async_rs_start = ((f32[4]), f32[2]) async-start(p0),
+        calls=async_computation
+    ROOT async_rs_done = f32[2] async-done(async_rs_start)
+  }
+)";
+
+TEST_F(CollectiveHintsAnnotatorTest, AsyncWrapperInheritsWrappedOpName) {
+  // The outer async-start has no op_name of its own, but the wrapped
+  // reduce-scatter carries one. A rule with op_name_contains targeting the
+  // inner op_name must match the outer wrapper via the fall-through.
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kAsyncWrappedRsHlo));
+
+  CollectiveHintsConfig config;
+  auto* hint = config.add_hints();
+  hint->mutable_match()->set_op_name_contains("my/rs/inner");
+  hint->mutable_match()->set_collective_type("reduce-scatter-start");
+  hint->set_scheduling_group_id("inherit-ok");
+
+  CollectiveHintsAnnotatorPass pass(config);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, pass.Run(module.get()));
+  EXPECT_TRUE(changed);
+
+  // Rule landed on the outer async-start (what LHS sees), not on the inner
+  // reduce-scatter inside the callee computation.
+  EXPECT_EQ(GetFrontendAttr(FindInstruction(module.get(), "async_rs_start"),
+                            "_scheduling_group_id"),
+            "inherit-ok");
+}
+
+TEST_F(CollectiveHintsAnnotatorTest, AsyncWrapperOpNameMismatchSkips) {
+  // Same HLO, but a rule whose op_name_contains does NOT match the wrapped
+  // instruction's op_name. The fall-through must still respect the filter.
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kAsyncWrappedRsHlo));
+
+  CollectiveHintsConfig config;
+  auto* hint = config.add_hints();
+  hint->mutable_match()->set_op_name_contains("some/unrelated/scope");
+  hint->mutable_match()->set_collective_type("reduce-scatter-start");
+  hint->set_scheduling_group_id("should-not-apply");
+
+  CollectiveHintsAnnotatorPass pass(config);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, pass.Run(module.get()));
+  EXPECT_FALSE(changed);
+  EXPECT_EQ(GetFrontendAttr(FindInstruction(module.get(), "async_rs_start"),
+                            "_scheduling_group_id"),
+            "");
+}
+
+// ---------------------------------------------------------------------------
 // match_ordinal
 // ---------------------------------------------------------------------------
 

@@ -140,7 +140,19 @@ bool Matches(const CollectiveHint& hint, const HloInstruction* instr) {
   }
 
   // op_name filters.
-  const std::string& op_name = instr->metadata().op_name();
+  // For HloAsyncStartInstruction wrappers, the outer instruction's own
+  // metadata.op_name is often empty; fall through to the async-wrapped
+  // instruction's op_name so metadata-based rules can target the collective
+  // by its JAX source-location path.
+  std::string effective_op_name = instr->metadata().op_name();
+  if (effective_op_name.empty()) {
+    if (const auto* async = DynCast<HloAsyncStartInstruction>(instr);
+        async != nullptr && async->async_wrapped_instruction() != nullptr) {
+      effective_op_name =
+          async->async_wrapped_instruction()->metadata().op_name();
+    }
+  }
+  const std::string& op_name = effective_op_name;
   if (has_op_name_filter) {
     if (op_name.empty()) {
       VLOG(3) << "CollectiveHintsAnnotator: op_name filter requires metadata"
