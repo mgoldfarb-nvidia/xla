@@ -2083,7 +2083,22 @@ DefaultSchedulerCore::FindAndExtractBestNodeAvailable(
           GetNumResourcesNeededForAnnotation(
               sched_state, sched_state.ready_annotations.front());
       for (const auto& [resource, num_needed] : num_resources_needed) {
-        int64_t limit = sched_state.max_concurrent_resource.at(resource);
+        // Defensive lookup: the error-reporting path must not itself crash
+        // with absl::flat_hash_map::at() if an unexpected resource id shows
+        // up in num_resources_needed. Crashing here masks the real
+        // "overlap limit exceeded" error with an opaque raw_hash_map::at
+        // failure.
+        auto limit_it = sched_state.max_concurrent_resource.find(resource);
+        if (limit_it == sched_state.max_concurrent_resource.end()) {
+          absl::StrAppend(
+              &error_message,
+              "(resource_id=", resource,
+              " [", sched_state.async_tracker->GetResourceName(resource),
+              "] not registered in max_concurrent_resource; num_needed=",
+              num_needed, "). ");
+          continue;
+        }
+        int64_t limit = limit_it->second;
         if (num_needed > limit) {
           absl::StrAppend(&error_message, "It needs ", num_needed, " ",
                           sched_state.async_tracker->GetResourceName(resource),

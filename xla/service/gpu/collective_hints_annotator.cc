@@ -519,6 +519,40 @@ absl::StatusOr<bool> CollectiveHintsAnnotatorPass::RunImpl(
     }
   }
 
+  // End-of-pass inventory: with VLOG(1) enabled, dump every instruction
+  // we annotated so downstream-pass crashes (e.g. absl::flat_hash_map::at
+  // failures in legalize_scheduling_annotations or LHS) can be
+  // cross-referenced against exactly what this pass wrote.
+  if (VLOG_IS_ON(1)) {
+    int annotated_count = 0;
+    int deps_added_count = 0;
+    for (auto& [computation, batches] : batches_per_comp) {
+      for (auto& [sid, insts] : batches) {
+        for (HloInstruction* instr : insts) {
+          ++annotated_count;
+          const auto& attrs = instr->frontend_attributes().map();
+          auto it = attrs.find("_scheduling_group_id");
+          std::string group_id =
+              (it != attrs.end()) ? it->second : std::string("<unset>");
+          VLOG(1) << "CollectiveHintsAnnotator output: comp='"
+                  << computation->name() << "' instr='" << instr->name()
+                  << "' opcode=" << HloOpcodeString(instr->opcode())
+                  << " sequence_id=" << sid
+                  << " group_id='" << group_id << "'"
+                  << " n_control_pred="
+                  << instr->control_predecessors().size()
+                  << " n_control_succ=" << instr->control_successors().size();
+          deps_added_count += instr->control_successors().size();
+        }
+      }
+    }
+    VLOG(1) << "CollectiveHintsAnnotator output: total annotated="
+            << annotated_count
+            << " (sum of control_successors across annotated instructions="
+            << deps_added_count
+            << "; note that count includes deps not added by this pass)";
+  }
+
   return changed;
 }
 

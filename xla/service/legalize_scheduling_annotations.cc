@@ -578,6 +578,28 @@ absl::StatusOr<bool> LegalizeSchedulingAnnotations::RunImpl(
       annotation_to_instruction;
   if (VLOG_IS_ON(1)) {
     LogConfig(1);
+    // Dump the incoming scheduling-annotation inventory. When a downstream
+    // consumer (or this pass itself) crashes with a bare
+    // absl::flat_hash_map::at() the raw error gives no context; this dump
+    // pins down exactly which instructions were annotated, by which group,
+    // and in which computation before the crash.
+    int annotated_count = 0;
+    for (HloComputation* computation :
+         module->MakeNonfusionComputations(execution_threads)) {
+      for (HloInstruction* instr : computation->instructions()) {
+        auto annotation_or = GetSchedulingAnnotation(instr);
+        if (!annotation_or.ok() || !annotation_or->has_value()) continue;
+        ++annotated_count;
+        VLOG(1) << "LegalizeSchedulingAnnotations input: comp='"
+                << computation->name() << "' instr='" << instr->name()
+                << "' opcode=" << HloOpcodeString(instr->opcode())
+                << " annotation=" << (*annotation_or)->ToString()
+                << " n_control_pred=" << instr->control_predecessors().size()
+                << " n_control_succ=" << instr->control_successors().size();
+      }
+    }
+    VLOG(1) << "LegalizeSchedulingAnnotations input: total annotated="
+            << annotated_count;
   }
   // Run gap checking if requested.
   if (config_.check_gap_only) {
