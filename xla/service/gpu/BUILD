@@ -3518,10 +3518,11 @@ cc_library(
     deps = [
         ":backend_configs_cc",
         ":collective_hints_proto_cc",
+        "//xla:shape_util",
+        "//xla/hlo/analysis:hlo_reachability",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/pass:hlo_pass",
         "//xla/hlo/utils:hlo_query",
-        "//xla:shape_util",
         "//xla/tsl/platform:env",
         "//xla/tsl/platform:statusor",
         "@com_google_absl//absl/container:flat_hash_set",

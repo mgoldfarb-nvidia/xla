@@ -109,6 +109,25 @@ message CollectiveHint {
   //
   // Unset means apply on every match (original behavior).
   optional int32 match_ordinal = 8;
+
+  // Batches the pairings produced by this rule into a sequential group. Rules
+  // with the same sequence_id form a batch whose annotated instructions may
+  // run concurrently (subject to overlap_limit). Rules with different
+  // sequence_ids are sequenced: after the annotator's main rule loop, it adds
+  // HLO control dependencies from every annotated instruction in batch N to
+  // every annotated instruction in batch N+1, N+2, ..., forcing later
+  // batches to start only after earlier batches' windows have closed.
+  //
+  // Intended to work around kExceedsOverlapLimit / kAnnotationNotReady
+  // deadlocks that arise when many scheduling_group_id pairings are applied
+  // simultaneously. Split the pairings into batches of size ≤ overlap_limit
+  // and the scheduler will find a valid placement.
+  //
+  // Unset (or 0) means "no sequencing" — original behaviour, no control deps
+  // added. If the implied control deps introduce a cycle (e.g. a later batch
+  // is a dataflow predecessor of an earlier batch), the pass returns an
+  // error naming the offending instructions.
+  optional int32 sequence_id = 9;
 }
 
 // Top-level config: an ordered list of rules. All matching rules are applied

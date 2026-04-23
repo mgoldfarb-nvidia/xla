@@ -727,6 +727,130 @@ TEST_F(CollectiveHintsAnnotatorTest, MatchOrdinalCountsPerRule) {
 }
 
 // ---------------------------------------------------------------------------
+// sequence_id (cross-batch control dependencies)
+// ---------------------------------------------------------------------------
+
+TEST_F(CollectiveHintsAnnotatorTest, SequenceIdAddsCrossBatchControlDeps) {
+  // Two independent collectives in the same computation, one in batch 1 and
+  // one in batch 2. After the pass, the later batch's instruction must have
+  // the earlier batch's -done (or the instruction itself) as a control
+  // predecessor.
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kThreeAgsHlo));
+  // kThreeAgsHlo declares `is_scheduled=true` with a specific order that
+  // places ag0-done after ag2-start.  In production the annotator runs before
+  // LHS produces a schedule; in this test we clear the parsed schedule so
+  // adding a control dep ag0-done → ag2-start doesn't fail a schedule
+  // consistency check inside the pass.
+  module->clear_schedule();
+
+  CollectiveHintsConfig config;
+  auto* h0 = config.add_hints();
+  h0->set_name("ag0-start");
+  h0->set_sequence_id(1);
+  h0->set_scheduling_group_id("b1");
+  auto* h1 = config.add_hints();
+  h1->set_name("ag2-start");
+  h1->set_sequence_id(2);
+  h1->set_scheduling_group_id("b2");
+
+  CollectiveHintsAnnotatorPass pass(config);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, pass.Run(module.get()));
+  EXPECT_TRUE(changed);
+
+  const HloInstruction* ag2_start =
+      FindInstruction(module.get(), "ag2-start");
+  const HloInstruction* ag0_done =
+      FindInstruction(module.get(), "ag0-done");
+  // ag0-done should be in ag2-start's control predecessors because batch 1's
+  // async completes at its -done, and batch 2 must wait for batch 1.
+  bool found = false;
+  for (const HloInstruction* p : ag2_start->control_predecessors()) {
+    if (p == ag0_done) { found = true; break; }
+  }
+  EXPECT_TRUE(found)
+      << "ag2-start should have ag0-done as a control predecessor";
+}
+
+TEST_F(CollectiveHintsAnnotatorTest, SameSequenceIdNoIntraBatchControlDep) {
+  // Two collectives in the same batch. After the pass, neither should have
+  // acquired a control dep on the other — batches run concurrently.
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kThreeAgsHlo));
+
+  CollectiveHintsConfig config;
+  auto* h0 = config.add_hints();
+  h0->set_name("ag0-start");
+  h0->set_sequence_id(1);
+  h0->set_scheduling_group_id("b1a");
+  auto* h1 = config.add_hints();
+  h1->set_name("ag1-start");
+  h1->set_sequence_id(1);   // same batch
+  h1->set_scheduling_group_id("b1b");
+
+  CollectiveHintsAnnotatorPass pass(config);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, pass.Run(module.get()));
+  EXPECT_TRUE(changed);
+
+  const HloInstruction* ag0_start = FindInstruction(module.get(), "ag0-start");
+  const HloInstruction* ag1_start = FindInstruction(module.get(), "ag1-start");
+  // Neither should have the other in its control predecessors.
+  for (const HloInstruction* p : ag1_start->control_predecessors()) {
+    EXPECT_NE(p, ag0_start) << "unexpected intra-batch control dep";
+  }
+  for (const HloInstruction* p : ag0_start->control_predecessors()) {
+    EXPECT_NE(p, ag1_start) << "unexpected intra-batch control dep";
+  }
+}
+
+TEST_F(CollectiveHintsAnnotatorTest, SequenceIdDetectsCycle) {
+  // Construct a module where the "later" batch's target is a dataflow
+  // *predecessor* of the "earlier" batch's target. The control dep the pass
+  // wants to add (later-batch becomes successor of earlier-batch) closes a
+  // cycle and must be rejected with an error.
+  //
+  // Module: ag1-start consumes ag0-done as its operand (via a bitcast).
+  // So ag0-done ← (bitcast) ← ag1-start is the data flow; ag0 comes before
+  // ag1 naturally. If we assign ag1 to batch 1 (earlier) and ag0 to batch 2
+  // (later), the pass would want to add a control dep from ag1 to ag0
+  // (ag1.done -> ag0.start), which reverses the dataflow and creates a
+  // cycle.
+  constexpr absl::string_view kChainedHlo = R"(
+    HloModule m, is_scheduled=true
+    ENTRY main {
+      p0 = f32[4] parameter(0)
+      ag0-start = (f32[4], f32[8]) all-gather-start(p0), dimensions={0},
+          replica_groups={}
+      ag0-done = f32[8] all-gather-done(ag0-start)
+      reshape = f32[4,2] reshape(ag0-done)
+      ag1-start = (f32[4,2], f32[8,2]) all-gather-start(reshape),
+          dimensions={0}, replica_groups={}
+      ROOT ag1-done = f32[8,2] all-gather-done(ag1-start)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kChainedHlo));
+
+  CollectiveHintsConfig config;
+  auto* h1 = config.add_hints();
+  h1->set_name("ag1-start");
+  h1->set_sequence_id(1);   // earlier batch
+  h1->set_scheduling_group_id("earlier");
+  auto* h0 = config.add_hints();
+  h0->set_name("ag0-start");
+  h0->set_sequence_id(2);   // later batch, but this is the dataflow predecessor
+  h0->set_scheduling_group_id("later");
+
+  CollectiveHintsAnnotatorPass pass(config);
+  auto status_or = pass.Run(module.get());
+  ASSERT_FALSE(status_or.ok());
+  EXPECT_EQ(status_or.status().code(), absl::StatusCode::kFailedPrecondition);
+  EXPECT_THAT(status_or.status().message(),
+              ::testing::HasSubstr("sequence_id ordering would introduce a "
+                                   "cycle"));
+}
+
+// ---------------------------------------------------------------------------
 // All hints applied together on one instruction.
 // ---------------------------------------------------------------------------
 

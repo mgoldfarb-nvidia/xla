@@ -27,6 +27,9 @@ limitations under the License.
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include <map>
+
+#include "xla/hlo/analysis/hlo_reachability.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -294,6 +297,12 @@ absl::StatusOr<bool> CollectiveHintsAnnotatorPass::RunImpl(
   // ordinal criteria so far. Used to implement `match_ordinal`.
   std::vector<int32_t> rule_seen(config_.hints_size(), 0);
 
+  // Sequencing bookkeeping: per-computation, per-sequence_id, list of
+  // annotated instructions. Consulted after the main loop to add control
+  // dependencies between batches (see `sequence_id` in collective_hints.proto).
+  std::map<HloComputation*, std::map<int32_t, std::vector<HloInstruction*>>>
+      batches_per_comp;
+
   for (HloComputation* computation :
        module->MakeNonfusionComputations(execution_threads)) {
     for (HloInstruction* instr : computation->instructions()) {
@@ -346,6 +355,7 @@ absl::StatusOr<bool> CollectiveHintsAnnotatorPass::RunImpl(
         bool force_earliest = false;
         std::string scheduling_group_id;
         int32_t stream_id = 0;
+        int32_t sequence_id = 0;   // 0 = not batched
       } merged;
 
       for (const CollectiveHint* hint : matching) {
@@ -360,6 +370,9 @@ absl::StatusOr<bool> CollectiveHintsAnnotatorPass::RunImpl(
         }
         if (hint->stream_id() != 0) {
           merged.stream_id = hint->stream_id();
+        }
+        if (hint->sequence_id() > 0) {
+          merged.sequence_id = hint->sequence_id();
         }
       }
 
@@ -410,8 +423,84 @@ absl::StatusOr<bool> CollectiveHintsAnnotatorPass::RunImpl(
         any_attr = true;
       }
       if (any_attr) changed = true;
+
+      // Track this instruction's batch membership for post-loop control-dep
+      // insertion. Only record when the instruction was actually annotated.
+      if (any_attr && merged.sequence_id > 0) {
+        batches_per_comp[computation][merged.sequence_id].push_back(instr);
+      }
     }
   }
+
+  // ── Sequencing: add HLO control dependencies between batches ────────────
+  //
+  // For every computation with ≥ 2 sequence_ids, for every ordered pair of
+  // sequence_ids (N, M) with N < M, add a control dep from each instruction
+  // in batch N (or its paired -done, for async starts) to each instruction
+  // in batch M. This forces batch M to schedule strictly after batch N.
+  //
+  // Before adding an edge, check the computation's reachability to guarantee
+  // it would not introduce a cycle with existing dataflow; return an error
+  // naming the offending instructions if so.
+  // Note: kReduceScatter uses the new-style async wrapper pair
+  // (kAsyncStart/kAsyncDone), so there's no kReduceScatterDone opcode.
+  auto paired_done = [](HloInstruction* start) -> HloInstruction* {
+    for (HloInstruction* u : start->users()) {
+      HloOpcode op = u->opcode();
+      if (op == HloOpcode::kAsyncDone ||
+          op == HloOpcode::kAllGatherDone ||
+          op == HloOpcode::kAllReduceDone ||
+          op == HloOpcode::kCollectivePermuteDone) {
+        return u;
+      }
+    }
+    return nullptr;
+  };
+  auto is_async_start_h = [](HloInstruction* i) {
+    return hlo_query::IsAsyncCollectiveStartOp(i, /*include_send_recv=*/true);
+  };
+
+  for (auto& [computation, batches] : batches_per_comp) {
+    if (batches.size() < 2) continue;
+    std::unique_ptr<HloReachabilityMap> reach =
+        HloReachabilityMap::Build(computation);
+    std::vector<int32_t> seq_ids;
+    for (auto& [sid, _] : batches) seq_ids.push_back(sid);
+    // std::map iterates sorted, so seq_ids is already ascending.
+    for (size_t i = 0; i + 1 < seq_ids.size(); ++i) {
+      const auto& prev_batch = batches[seq_ids[i]];
+      for (size_t j = i + 1; j < seq_ids.size(); ++j) {
+        const auto& next_batch = batches[seq_ids[j]];
+        for (HloInstruction* prev : prev_batch) {
+          // For an async-start, the batch completes when its -done is placed.
+          HloInstruction* prev_end =
+              is_async_start_h(prev) ? paired_done(prev) : nullptr;
+          if (prev_end == nullptr) prev_end = prev;
+          for (HloInstruction* next : next_batch) {
+            if (prev_end == next) continue;
+            // Cycle check: if `next` can already reach `prev_end`, the new
+            // `prev_end -> next` edge closes a cycle.
+            if (reach->IsReachable(next, prev_end)) {
+              return absl::FailedPreconditionError(absl::StrCat(
+                  "CollectiveHintsAnnotator: sequence_id ordering would "
+                  "introduce a cycle in computation '", computation->name(),
+                  "'. Adding a control dep from '", prev_end->name(),
+                  "' (sequence_id=", seq_ids[i], ") to '", next->name(),
+                  "' (sequence_id=", seq_ids[j],
+                  ") conflicts with existing dataflow."));
+            }
+            TF_RETURN_IF_ERROR(prev_end->AddControlDependencyTo(next));
+            VLOG(2) << "CollectiveHintsAnnotator: control dep "
+                    << prev_end->name() << " -> " << next->name()
+                    << " (sequence " << seq_ids[i] << " -> " << seq_ids[j]
+                    << ")";
+            changed = true;
+          }
+        }
+      }
+    }
+  }
+
   return changed;
 }
 
