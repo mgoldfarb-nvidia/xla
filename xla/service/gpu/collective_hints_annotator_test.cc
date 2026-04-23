@@ -803,6 +803,100 @@ TEST_F(CollectiveHintsAnnotatorTest, SameSequenceIdNoIntraBatchControlDep) {
   }
 }
 
+TEST_F(CollectiveHintsAnnotatorTest, SequenceIdSkipsComputeOnlyDeps) {
+  // Two collectives in different sequence_id batches, each paired with a
+  // compute-op anchor (a dot). After the pass, async→async, async→compute,
+  // and compute→async cross-batch control deps should all be added, but the
+  // compute→compute dep (dot0 → dot1) must be skipped — those anchors are
+  // already tethered to their collectives via scheduling_group_id, so their
+  // order is implied by the async ordering, and adding the explicit
+  // compute→compute dep has caused post-schedule RET_CHECK failures in
+  // production when LHS's group-id pull flipped the anchors' relative order.
+  constexpr absl::string_view kAgAndTwoDotsHlo = R"(
+    HloModule m
+    ENTRY main {
+      p0 = f32[4] parameter(0)
+      p1 = f32[4,4] parameter(1)
+      p2 = f32[4,4] parameter(2)
+      p3 = f32[4,4] parameter(3)
+      p4 = f32[4,4] parameter(4)
+      ag0-start = (f32[4], f32[8]) all-gather-start(p0), dimensions={0},
+          replica_groups={}
+      dot0 = f32[4,4] dot(p1, p2), lhs_contracting_dims={1},
+                                   rhs_contracting_dims={0}
+      ag0-done = f32[8] all-gather-done(ag0-start)
+      ag1-start = (f32[8], f32[16]) all-gather-start(ag0-done), dimensions={0},
+          replica_groups={}
+      dot1 = f32[4,4] dot(p3, p4), lhs_contracting_dims={1},
+                                   rhs_contracting_dims={0}
+      ag1-done = f32[16] all-gather-done(ag1-start)
+      ROOT _ = (f32[16], f32[4,4], f32[4,4]) tuple(ag1-done, dot0, dot1)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kAgAndTwoDotsHlo));
+
+  CollectiveHintsConfig config;
+  // batch 1: ag0-start + dot0
+  auto* h0_ag = config.add_hints();
+  h0_ag->set_name("ag0-start");
+  h0_ag->set_sequence_id(1);
+  h0_ag->set_scheduling_group_id("b1");
+  auto* h0_dot = config.add_hints();
+  h0_dot->set_name("dot0");
+  h0_dot->set_sequence_id(1);
+  h0_dot->set_scheduling_group_id("b1");
+  // batch 2: ag1-start + dot1
+  auto* h1_ag = config.add_hints();
+  h1_ag->set_name("ag1-start");
+  h1_ag->set_sequence_id(2);
+  h1_ag->set_scheduling_group_id("b2");
+  auto* h1_dot = config.add_hints();
+  h1_dot->set_name("dot1");
+  h1_dot->set_sequence_id(2);
+  h1_dot->set_scheduling_group_id("b2");
+
+  CollectiveHintsAnnotatorPass pass(config);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, pass.Run(module.get()));
+  EXPECT_TRUE(changed);
+
+  const HloInstruction* dot0 = FindInstruction(module.get(), "dot0");
+  const HloInstruction* dot1 = FindInstruction(module.get(), "dot1");
+  const HloInstruction* ag0_done = FindInstruction(module.get(), "ag0-done");
+  const HloInstruction* ag1_start = FindInstruction(module.get(), "ag1-start");
+
+  // compute → compute must NOT be added.
+  for (const HloInstruction* p : dot1->control_predecessors()) {
+    EXPECT_NE(p, dot0)
+        << "compute-anchor → compute-anchor dep should have been skipped";
+  }
+
+  // async → compute should still be added.
+  bool async_to_compute = false;
+  for (const HloInstruction* p : dot1->control_predecessors()) {
+    if (p == ag0_done) { async_to_compute = true; break; }
+  }
+  EXPECT_TRUE(async_to_compute)
+      << "async-done → compute-anchor dep should still be added";
+
+  // compute → async should still be added.
+  bool compute_to_async = false;
+  for (const HloInstruction* p : ag1_start->control_predecessors()) {
+    if (p == dot0) { compute_to_async = true; break; }
+  }
+  EXPECT_TRUE(compute_to_async)
+      << "compute-anchor → async-start dep should still be added";
+
+  // async → async baseline (already exercised by SequenceIdAddsCrossBatchControlDeps,
+  // but re-assert here so the test documents the full behavior matrix).
+  bool async_to_async = false;
+  for (const HloInstruction* p : ag1_start->control_predecessors()) {
+    if (p == ag0_done) { async_to_async = true; break; }
+  }
+  EXPECT_TRUE(async_to_async)
+      << "async-done → async-start dep should still be added";
+}
+
 TEST_F(CollectiveHintsAnnotatorTest, SequenceIdDetectsCycle) {
   // Construct a module where the "later" batch's target is a dataflow
   // *predecessor* of the "earlier" batch's target. The control dep the pass

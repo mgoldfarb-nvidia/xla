@@ -459,6 +459,22 @@ absl::StatusOr<bool> CollectiveHintsAnnotatorPass::RunImpl(
   auto is_async_start_h = [](HloInstruction* i) {
     return hlo_query::IsAsyncCollectiveStartOp(i, /*include_send_recv=*/true);
   };
+  // True if `i` is an async-collective start or done. Used to gate the
+  // compute-anchor→compute-anchor skip below: such deps are redundant
+  // (scheduling_group_id already clusters each anchor with its
+  // collective, so ordering the collectives orders their anchors
+  // implicitly) and have caused post-schedule RET_CHECK failures at
+  // hlo_schedule.cc when LHS's group-id placement flipped the anchors'
+  // relative order (e.g. X vs X.double_buffer_clone in different
+  // sequence_id batches).
+  auto is_async_op = [&](HloInstruction* i) {
+    if (is_async_start_h(i)) return true;
+    HloOpcode op = i->opcode();
+    return op == HloOpcode::kAsyncDone ||
+           op == HloOpcode::kAllGatherDone ||
+           op == HloOpcode::kAllReduceDone ||
+           op == HloOpcode::kCollectivePermuteDone;
+  };
 
   for (auto& [computation, batches] : batches_per_comp) {
     if (batches.size() < 2) continue;
@@ -478,6 +494,8 @@ absl::StatusOr<bool> CollectiveHintsAnnotatorPass::RunImpl(
           if (prev_end == nullptr) prev_end = prev;
           for (HloInstruction* next : next_batch) {
             if (prev_end == next) continue;
+            // Skip compute-anchor → compute-anchor deps (see is_async_op).
+            if (!is_async_op(prev_end) && !is_async_op(next)) continue;
             // Cycle check: if `next` can already reach `prev_end`, the new
             // `prev_end -> next` edge closes a cycle.
             if (reach->IsReachable(next, prev_end)) {
