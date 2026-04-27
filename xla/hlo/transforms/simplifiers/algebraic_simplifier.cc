@@ -1394,8 +1394,13 @@ absl::Status AlgebraicSimplifierVisitor::HandleBitcast(
   // it should remove the op when control deps are present. I.e.
   // control deps might be added to preserve a certain order.
   // It's better to not process in that case.
-  if (!bitcast->control_predecessors().empty()) {
-    VLOG(3) << bitcast->ToString() << " has control predecessors, skipping.";
+  //
+  // HloComputation::ReplaceInstructionWithDifferentShape bails on
+  // HasControlDependencies() (predecessors OR successors), so guarding only on
+  // predecessors here lets a bitcast with control successors slip through and
+  // hit a DCHECK(changed) in dbg builds when the silent skip happens.
+  if (bitcast->HasControlDependencies()) {
+    VLOG(3) << bitcast->ToString() << " has control dependencies, skipping.";
     return absl::OkStatus();
   }
 
