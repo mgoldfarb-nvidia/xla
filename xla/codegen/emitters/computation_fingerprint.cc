@@ -64,9 +64,22 @@ std::string GetComputationFingerprint(
   //
   // It is not a problem to recursively print sub-computations, because we don't
   // have them at this point.
+  //
+  // Frontend attributes are intentionally excluded from the fingerprint:
+  // they are scheduling/metadata sidecars (_scheduling_group_id,
+  // latency_metadata, _xla_force_earliest_schedule, _xla_stream_id, ...) and
+  // must not affect content hashes used to key codegen artifacts. The cuDNN
+  // fusion compiler keys dnn_compiled_graphs by this fingerprint, and
+  // CuDnnThunk::Initialize calls dnn_compiled_graphs.at(fingerprint_) with a
+  // fingerprint recomputed at thunk emission — any annotation pass that
+  // touches a frontend attr inside the fused computation between compile
+  // and emit would otherwise produce different hashes and throw at
+  // runtime. Same exclusion also makes KernelReuseCache lookups stable
+  // across annotation changes (avoids unnecessary kernel recompiles).
   auto print_options = HloPrintOptions::Fingerprint()
                            .set_print_only_essential_constants(false)
-                           .set_print_operand_shape(false);
+                           .set_print_operand_shape(false)
+                           .set_print_frontend_attributes(false);
 
   return absl::StrCat(discriminator, "(",
                       GetArgumentFingerprint(kernel_arguments), ")",
