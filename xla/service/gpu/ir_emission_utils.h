@@ -351,14 +351,26 @@ absl::StatusOr<std::string> GetProtoFingerprint(
 
 // Returns concatenated fingerprint of an HLO instruction without its backend
 // config and its backend config's deterministic fingerprint.
+//
+// Frontend attributes are intentionally excluded from the fingerprint:
+// they are scheduling/metadata sidecars (_scheduling_group_id,
+// latency_metadata, _xla_force_earliest_schedule, _xla_stream_id, ...) and
+// must not affect content hashes used to key cuDNN-graph caches or other
+// codegen artifacts. Otherwise an annotation pass running between
+// RunCudnnCompilerPasses (where dnn_compiled_graphs is populated) and
+// thunk emission (where CuDnnThunk::fingerprint_ is computed) silently
+// changes the fingerprint, causing CuDnnThunk::Initialize to throw on
+// `dnn_compiled_graphs.at(fingerprint_)`.
 template <typename ConfigType>
 absl::StatusOr<std::string> FingerprintWithBackendConfig(
     const HloInstruction& hlo) {
   TF_ASSIGN_OR_RETURN(const auto config, hlo.backend_config<ConfigType>());
   TF_ASSIGN_OR_RETURN(const std::string fingerprint,
                       GetProtoFingerprint(config));
-  return absl::StrCat(hlo.ToString(HloPrintOptions::Fingerprint()),
-                      ", backend_config_fingerprint=", fingerprint);
+  return absl::StrCat(
+      hlo.ToString(HloPrintOptions::Fingerprint()
+                       .set_print_frontend_attributes(false)),
+      ", backend_config_fingerprint=", fingerprint);
 }
 
 struct InductionVariableFunctionalDependency {
