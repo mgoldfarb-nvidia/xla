@@ -110,6 +110,8 @@ absl::Status RunSimulator(const std::string& hlo_input,
                           const std::string& hints_file,
                           const std::string& pgle_profile,
                           float pgle_latency_scaling_factor,
+                          int64_t parallel_collective_overlap_limit,
+                          int64_t parallel_async_compute_limit,
                           const std::string& output_path,
                           const std::string& output_format,
                           int64_t pointer_size,
@@ -142,6 +144,18 @@ absl::Status RunSimulator(const std::string& hlo_input,
         pgle_latency_scaling_factor);
     std::cerr << "Set xla_gpu_pgle_latency_scaling_factor="
               << pgle_latency_scaling_factor << "\n";
+  }
+  if (parallel_collective_overlap_limit > 0) {
+    debug_opts.set_xla_gpu_experimental_parallel_collective_overlap_limit(
+        parallel_collective_overlap_limit);
+    std::cerr << "Set xla_gpu_experimental_parallel_collective_overlap_limit="
+              << parallel_collective_overlap_limit << "\n";
+  }
+  if (parallel_async_compute_limit > 0) {
+    debug_opts.set_xla_gpu_experimental_parallel_async_compute_limit(
+        parallel_async_compute_limit);
+    std::cerr << "Set xla_gpu_experimental_parallel_async_compute_limit="
+              << parallel_async_compute_limit << "\n";
   }
   // Force LHS on; some serialized HLO modules have it disabled.
   debug_opts.set_xla_gpu_enable_latency_hiding_scheduler(true);
@@ -242,6 +256,8 @@ int main(int argc, char** argv) {
   std::string hints_file;
   std::string pgle_profile;
   float pgle_latency_scaling_factor = 1.0f;
+  int64_t parallel_collective_overlap_limit = 0;  // 0 = leave unchanged
+  int64_t parallel_async_compute_limit = 0;       // 0 = leave unchanged
   std::string output_path;
   std::string output_format = "hlo";
   int64_t pointer_size = 8;
@@ -265,6 +281,16 @@ int main(int argc, char** argv) {
                 "Multiplier applied to PGLE-sourced latencies (default 1.0). "
                 "Useful for sweeping how schedule shape changes as the "
                 "estimator weighs collective time more or less heavily."),
+      tsl::Flag("parallel_collective_overlap_limit",
+                &parallel_collective_overlap_limit,
+                "Override xla_gpu_experimental_parallel_collective_overlap_limit "
+                "(default 1). Bumping >1 lets LHS keep more collectives in "
+                "flight concurrently (subject to memory pressure). Also "
+                "switches LHS into prioritize_compute_over_async_start mode."),
+      tsl::Flag("parallel_async_compute_limit",
+                &parallel_async_compute_limit,
+                "Override xla_gpu_experimental_parallel_async_compute_limit "
+                "(default 2). Caps concurrent async-compute slots."),
       tsl::Flag("output", &output_path,
                 "Output path for scheduled HLO (default: stdout)"),
       tsl::Flag("output_format", &output_format,
@@ -289,7 +315,8 @@ int main(int argc, char** argv) {
 
   absl::Status status = xla::gpu::RunSimulator(
       hlo_input, target_config, hints_file, pgle_profile,
-      pgle_latency_scaling_factor, output_path, output_format,
+      pgle_latency_scaling_factor, parallel_collective_overlap_limit,
+      parallel_async_compute_limit, output_path, output_format,
       pointer_size, strip_existing_annotations);
   if (!status.ok()) {
     std::cerr << "ERROR: " << status << "\n";
