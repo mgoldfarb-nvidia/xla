@@ -1024,6 +1024,32 @@ lit_test_suite(
     ],
 )
 
+# Tool that drives ScheduleGpuModule on a previously-dumped HLO so the
+# post-LHS schedule can be inspected without running on a GPU. Useful
+# for fast A/B iteration on collective-hint textprotos.
+xla_cc_binary(
+    name = "lhs_simulator",
+    srcs = ["lhs_simulator.cc"],
+    deps = [
+        ":hlo_module_loader",
+        "//xla:debug_options_flags",
+        "//xla:xla_proto_cc",
+        "//xla/backends/gpu/target_config",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:hlo_module_config",
+        "//xla/service/gpu:alias_info",
+        "//xla/service/gpu:gpu_hlo_schedule",
+        "//xla/service:hlo_proto_cc",
+        "//xla/tsl/util:command_line_flags",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@llvm-project//mlir:IR",
+        "@tsl//tsl/platform:platform_port",
+        "@tsl//tsl/platform:status",
+    ],
+)
+
 xla_cc_binary(
     name = "extract_collective_operations",
     srcs = ["extract_collective_operations.cc"],
