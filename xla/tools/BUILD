@@ -1050,6 +1050,27 @@ xla_cc_binary(
     ],
 )
 
+# Tool that converts an xplane.pb (or a tensorboard logdir containing
+# one) into a ProfiledInstructionsProto suitable for the LHS PGLE
+# estimator. CLI wrapper around the same C++ entry points used by
+# jaxlib's `get_fdo_profile` Python binding — lets you generate PGLE
+# input outside a JAX runtime.
+xla_cc_binary(
+    name = "xplane_to_pgle",
+    srcs = ["xplane_to_pgle.cc"],
+    deps = [
+        "//xla/python:xplane_to_profile_instructions",
+        "//xla/tsl/util:command_line_flags",
+        "@com_google_absl//absl/status",
+        "@tsl//tsl/platform:env",
+        "@tsl//tsl/platform:platform_port",
+        "@tsl//tsl/platform:protobuf",
+        "@tsl//tsl/platform:status",
+        "@tsl//tsl/profiler/protobuf:profiled_instructions_proto_cc",
+        "@tsl//tsl/profiler/protobuf:xplane_proto_cc",
+    ],
+)
+
 xla_cc_binary(
     name = "extract_collective_operations",
     srcs = ["extract_collective_operations.cc"],
