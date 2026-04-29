@@ -76,6 +76,20 @@ Required:
 Optional:
   --hints_file=PATH        Path to CollectiveHintsConfig textproto. Sets
                            --xla_gpu_collective_hints_file in DebugOptions.
+  --pgle_profile=PATH      Path to a ProfiledInstructionsProto file (.pb /
+                           .pbtxt) or a directory containing one named by
+                           module fingerprint. Wires LHS's PGLE estimator
+                           with measured per-instruction cycle counts.
+                           Without this, LHS uses a pessimistic default
+                           (kHighLatency=5000) for every collective and
+                           the resulting schedule order is "valid but
+                           pessimistic" — usable for structural validation
+                           but not as a predictor of runtime overlap.
+  --pgle_latency_scaling_factor=F  Multiplier on PGLE-sourced latencies
+                                   (default 1.0). Useful for sweeping how
+                                   schedule shape changes as the
+                                   estimator weighs collective time more
+                                   or less heavily.
   --output=PATH            Where to write the scheduled HLO (default: stdout).
   --output_format=FMT      "hlo" (text, default) or "pb" (proto).
   --pointer_size=N         Pointer size in bytes (default: 8).
@@ -94,6 +108,8 @@ namespace xla::gpu {
 absl::Status RunSimulator(const std::string& hlo_input,
                           const std::string& target_config_path,
                           const std::string& hints_file,
+                          const std::string& pgle_profile,
+                          float pgle_latency_scaling_factor,
                           const std::string& output_path,
                           const std::string& output_format,
                           int64_t pointer_size,
@@ -110,6 +126,22 @@ absl::Status RunSimulator(const std::string& hlo_input,
   if (!hints_file.empty()) {
     debug_opts.set_xla_gpu_collective_hints_file(hints_file);
     std::cerr << "Set xla_gpu_collective_hints_file=" << hints_file << "\n";
+  }
+  if (!pgle_profile.empty()) {
+    // Wires LHS's ProfileGuidedLatencyEstimator: replaces the pessimistic
+    // kHighLatency=5000 default with measured per-instruction cycle counts.
+    // Format expected by ReadProfileFromSources: a `.pb` (binary) or
+    // `.pbtxt` (text) file containing tensorflow::profiler::ProfiledInstructionsProto,
+    // OR a directory of files named `<module-fingerprint>.{pb,pbtxt}`.
+    debug_opts.set_xla_gpu_pgle_profile_file_or_directory_path(pgle_profile);
+    std::cerr << "Set xla_gpu_pgle_profile_file_or_directory_path="
+              << pgle_profile << "\n";
+  }
+  if (pgle_latency_scaling_factor != 1.0f) {
+    debug_opts.set_xla_gpu_pgle_latency_scaling_factor(
+        pgle_latency_scaling_factor);
+    std::cerr << "Set xla_gpu_pgle_latency_scaling_factor="
+              << pgle_latency_scaling_factor << "\n";
   }
   // Force LHS on; some serialized HLO modules have it disabled.
   debug_opts.set_xla_gpu_enable_latency_hiding_scheduler(true);
@@ -208,6 +240,8 @@ int main(int argc, char** argv) {
   std::string hlo_input;
   std::string target_config;
   std::string hints_file;
+  std::string pgle_profile;
+  float pgle_latency_scaling_factor = 1.0f;
   std::string output_path;
   std::string output_format = "hlo";
   int64_t pointer_size = 8;
@@ -220,6 +254,17 @@ int main(int argc, char** argv) {
                 "Path to gpu_target_config.pbtxt"),
       tsl::Flag("hints_file", &hints_file,
                 "Path to CollectiveHintsConfig textproto (optional)"),
+      tsl::Flag("pgle_profile", &pgle_profile,
+                "Path to a ProfiledInstructionsProto file (.pb binary or "
+                ".pbtxt text), or a directory containing one named by "
+                "module fingerprint. Wires LHS's "
+                "ProfileGuidedLatencyEstimator with measured per-instruction "
+                "cycle counts. Without this, LHS falls back to a flat "
+                "kHighLatency=5000 default for every collective."),
+      tsl::Flag("pgle_latency_scaling_factor", &pgle_latency_scaling_factor,
+                "Multiplier applied to PGLE-sourced latencies (default 1.0). "
+                "Useful for sweeping how schedule shape changes as the "
+                "estimator weighs collective time more or less heavily."),
       tsl::Flag("output", &output_path,
                 "Output path for scheduled HLO (default: stdout)"),
       tsl::Flag("output_format", &output_format,
@@ -243,7 +288,8 @@ int main(int argc, char** argv) {
   }
 
   absl::Status status = xla::gpu::RunSimulator(
-      hlo_input, target_config, hints_file, output_path, output_format,
+      hlo_input, target_config, hints_file, pgle_profile,
+      pgle_latency_scaling_factor, output_path, output_format,
       pointer_size, strip_existing_annotations);
   if (!status.ok()) {
     std::cerr << "ERROR: " << status << "\n";
