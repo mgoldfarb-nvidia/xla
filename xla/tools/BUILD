@@ -1050,6 +1050,23 @@ xla_cc_binary(
     ],
 )
 
+# Per-plane / per-event summary of an xplane.pb. Used to calibrate
+# predict_overlap.py: prints wall span, busy span (sum of durations),
+# and idle so we can see how much measured step time is GPU idle vs
+# kernel work vs host-side overhead.
+xla_cc_binary(
+    name = "xplane_summary",
+    srcs = ["xplane_summary.cc"],
+    deps = [
+        "//xla/tsl/util:command_line_flags",
+        "@com_google_absl//absl/status",
+        "@tsl//tsl/platform:env",
+        "@tsl//tsl/platform:platform_port",
+        "@tsl//tsl/platform:status",
+        "@tsl//tsl/profiler/protobuf:xplane_proto_cc",
+    ],
+)
+
 # Tool that converts an xplane.pb (or a tensorboard logdir containing
 # one) into a ProfiledInstructionsProto suitable for the LHS PGLE
 # estimator. CLI wrapper around the same C++ entry points used by
