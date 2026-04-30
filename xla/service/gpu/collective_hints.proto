@@ -128,6 +128,41 @@ message CollectiveHint {
   // is a dataflow predecessor of an earlier batch), the pass returns an
   // error naming the offending instructions.
   optional int32 sequence_id = 9;
+
+  // Forces a compute instruction to be scheduled *inside* the [start, done]
+  // window of one or more named collectives. Implemented by adding HLO
+  // control dependencies:
+  //
+  //   for each compute C matched by this rule:
+  //     for each target T in window_target:
+  //       add control_pred(T_start, C)        # C runs AFTER T_start
+  //       add control_pred(C,       T_done)   # C runs BEFORE T_done
+  //
+  // Plus an `_xla_window_target=T1,T2,…` frontend attribute for visibility
+  // in HLO dumps.
+  //
+  // Phase 1 (current): exactly ONE target supported via the control-dep
+  // mechanism; multiple targets would require LHS-side state tracking and
+  // are rejected with a log message and skip. The proto is `repeated` to
+  // remain forward-compatible with multi-target support added later.
+  //
+  // Validation: the annotator rejects (logs + skips) rules where:
+  //   - the named target is not found in the module,
+  //   - the target is not an async-collective-start,
+  //   - the matched compute lives in a different HloComputation,
+  //   - the matched compute is in the target's transitive operand-tree
+  //     closure (would create a control-dep cycle),
+  //   - the matched compute is in the target's transitive consumer-tree
+  //     closure (compute depends on the collective's result, can't run
+  //     during it).
+  //
+  // Use case: when LHS would otherwise schedule a dataflow-independent
+  // compute op BEFORE a collective even though it could fit inside the
+  // overlap window, this annotation forces it into the window. Direct
+  // counterpoint to `force_earliest`, which we found unbounded-defers
+  // collectives to the schedule tail (where compute is no longer
+  // available to overlap).
+  repeated string window_target = 10;
 }
 
 // Top-level config: an ordered list of rules. All matching rules are applied

@@ -973,6 +973,283 @@ TEST_F(CollectiveHintsAnnotatorTest, AllHintsAppliedTogether) {
   EXPECT_EQ(GetFrontendAttr(ag, "_xla_stream_annotation"), "5");
 }
 
+// ---------------------------------------------------------------------------
+// window_target — pin compute inside collective [start, done] window via
+// control deps. See comment on `window_target` in collective_hints.proto.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Returns true iff `pred` is one of `succ`'s control predecessors.
+bool HasControlPred(const HloInstruction* succ, const HloInstruction* pred) {
+  for (const HloInstruction* p : succ->control_predecessors()) {
+    if (p == pred) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+// HLO with one collective (ag-start) and a clearly-independent compute op
+// (the dot, which doesn't read or feed the gather). Used as the canonical
+// "compute belongs in window" target for the window_target tests below.
+constexpr absl::string_view kAgIndependentDotHlo = R"(
+  HloModule m, is_scheduled=true
+
+  ENTRY main {
+    p0 = f32[4] parameter(0)
+    p1 = f32[4,4] parameter(1)
+    p2 = f32[4,4] parameter(2)
+    ag-start = (f32[4], f32[8]) all-gather-start(p0), dimensions={0},
+        replica_groups={}
+    dot0 = f32[4,4] dot(p1, p2), lhs_contracting_dims={1},
+                                 rhs_contracting_dims={0}
+    ag-done = f32[8] all-gather-done(ag-start)
+    ROOT _ = (f32[8], f32[4,4]) tuple(ag-done, dot0)
+  }
+)";
+
+// Happy path: compute is dataflow-independent of target; control deps get
+// added to pin it inside [ag-start, ag-done]; visibility FE attribute is set.
+TEST_F(CollectiveHintsAnnotatorTest, WindowTargetSingleHappyPath) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kAgIndependentDotHlo));
+
+  CollectiveHintsConfig config;
+  auto* hint = config.add_hints();
+  hint->set_name("dot0");
+  hint->add_window_target("ag-start");
+
+  CollectiveHintsAnnotatorPass pass(config);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, pass.Run(module.get()));
+  EXPECT_TRUE(changed);
+
+  const HloInstruction* dot = FindInstruction(module.get(), "dot0");
+  const HloInstruction* ag_start = FindInstruction(module.get(), "ag-start");
+  const HloInstruction* ag_done = FindInstruction(module.get(), "ag-done");
+  ASSERT_NE(dot, nullptr);
+  ASSERT_NE(ag_start, nullptr);
+  ASSERT_NE(ag_done, nullptr);
+
+  // ag-start -> dot0 (dot must run AFTER start).
+  EXPECT_TRUE(HasControlPred(dot, ag_start));
+  // dot0 -> ag-done (dot must run BEFORE done).
+  EXPECT_TRUE(HasControlPred(ag_done, dot));
+  // Visibility FE attribute set with the (single) target name.
+  EXPECT_EQ(GetFrontendAttr(dot, "_xla_window_target"), "ag-start");
+}
+
+// Multi-target: rejected with log+skip in Phase 1. No control deps added,
+// no FE attribute set, pass returns changed=false (no other annotations).
+TEST_F(CollectiveHintsAnnotatorTest, WindowTargetMultipleRejectedInPhase1) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kTwoCollectivesHlo));
+
+  CollectiveHintsConfig config;
+  auto* hint = config.add_hints();
+  hint->set_name("add0");
+  hint->add_window_target("ag-start");
+  hint->add_window_target("rs-start");
+
+  CollectiveHintsAnnotatorPass pass(config);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, pass.Run(module.get()));
+  EXPECT_FALSE(changed);  // multi-target ignored, no other hint set
+
+  const HloInstruction* add = FindInstruction(module.get(), "add0");
+  ASSERT_NE(add, nullptr);
+  EXPECT_EQ(GetFrontendAttr(add, "_xla_window_target"), "");
+  EXPECT_EQ(add->control_predecessors().size(), 0);
+  EXPECT_EQ(add->control_successors().size(), 0);
+}
+
+// window_target on an async-collective-start itself — meaningless. Skipped
+// with a log; no FE attr, no control deps.
+TEST_F(CollectiveHintsAnnotatorTest, WindowTargetOnAsyncStartSkipped) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kTwoCollectivesHlo));
+
+  CollectiveHintsConfig config;
+  auto* hint = config.add_hints();
+  hint->set_name("ag-start");
+  hint->add_window_target("rs-start");
+
+  CollectiveHintsAnnotatorPass pass(config);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, pass.Run(module.get()));
+  EXPECT_FALSE(changed);
+
+  const HloInstruction* ag = FindInstruction(module.get(), "ag-start");
+  EXPECT_EQ(GetFrontendAttr(ag, "_xla_window_target"), "");
+  EXPECT_EQ(ag->control_predecessors().size(), 0);
+  EXPECT_EQ(ag->control_successors().size(), 0);
+}
+
+// Target doesn't exist — control deps NOT added, but FE attribute IS set
+// (visibility for downstream debug). Pass returns changed=true because the
+// FE attribute is a real change.
+TEST_F(CollectiveHintsAnnotatorTest, WindowTargetMissingTargetSkipsControlDeps) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kAgIndependentDotHlo));
+
+  CollectiveHintsConfig config;
+  auto* hint = config.add_hints();
+  hint->set_name("dot0");
+  hint->add_window_target("does-not-exist");
+
+  CollectiveHintsAnnotatorPass pass(config);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, pass.Run(module.get()));
+  EXPECT_TRUE(changed);  // FE attribute was set, even though deps were skipped
+
+  const HloInstruction* dot = FindInstruction(module.get(), "dot0");
+  EXPECT_EQ(GetFrontendAttr(dot, "_xla_window_target"), "does-not-exist");
+  EXPECT_EQ(dot->control_predecessors().size(), 0);
+  EXPECT_EQ(dot->control_successors().size(), 0);
+}
+
+// Target is a non-async instruction — skipped (control deps not added).
+TEST_F(CollectiveHintsAnnotatorTest, WindowTargetNonAsyncTargetSkipped) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kAgIndependentDotHlo));
+
+  CollectiveHintsConfig config;
+  auto* hint = config.add_hints();
+  hint->set_name("dot0");
+  hint->add_window_target("ag-done");  // -done isn't async-start
+
+  CollectiveHintsAnnotatorPass pass(config);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, pass.Run(module.get()));
+  EXPECT_TRUE(changed);  // FE attr set; control deps skipped
+
+  const HloInstruction* dot = FindInstruction(module.get(), "dot0");
+  EXPECT_EQ(GetFrontendAttr(dot, "_xla_window_target"), "ag-done");
+  EXPECT_EQ(dot->control_predecessors().size(), 0);
+  EXPECT_EQ(dot->control_successors().size(), 0);
+}
+
+// Compute is in the target's PRED closure — the dot's output feeds (via
+// reshape) the all-gather's input. So pre_dot is a dataflow PREDECESSOR
+// of ag-start. Adding `ag-start -> pre_dot` would close a cycle.
+// Annotator must skip+log.
+constexpr absl::string_view kAgComputeIsPredHlo = R"(
+  HloModule m, is_scheduled=true
+
+  ENTRY main {
+    p0 = f32[4,4] parameter(0)
+    p1 = f32[4,4] parameter(1)
+    pre_dot = f32[4,4] dot(p0, p1), lhs_contracting_dims={1},
+                                    rhs_contracting_dims={0}
+    pre_flat = f32[16] reshape(pre_dot)
+    ag-start = (f32[16], f32[32]) all-gather-start(pre_flat), dimensions={0},
+        replica_groups={}
+    ag-done = f32[32] all-gather-done(ag-start)
+    ROOT _ = f32[32] negate(ag-done)
+  }
+)";
+
+TEST_F(CollectiveHintsAnnotatorTest, WindowTargetCycleViaPredClosureSkipped) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kAgComputeIsPredHlo));
+
+  CollectiveHintsConfig config;
+  auto* hint = config.add_hints();
+  hint->set_name("pre_dot");
+  hint->add_window_target("ag-start");
+
+  CollectiveHintsAnnotatorPass pass(config);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, pass.Run(module.get()));
+  EXPECT_TRUE(changed);  // FE attr set; control deps skipped
+
+  const HloInstruction* pre_dot = FindInstruction(module.get(), "pre_dot");
+  EXPECT_EQ(GetFrontendAttr(pre_dot, "_xla_window_target"), "ag-start");
+  // No control deps added — would have cycled (pre_dot is upstream of
+  // ag-start through reshape).
+  EXPECT_EQ(pre_dot->control_predecessors().size(), 0);
+  EXPECT_EQ(pre_dot->control_successors().size(), 0);
+}
+
+// Compute is in the target's SUCC closure — a dot consumes the gather's
+// result. Annotator must skip+log because adding `compute -> ag-done`
+// would close a cycle (ag-done -> dot via dataflow already).
+constexpr absl::string_view kAgComputeIsSuccHlo = R"(
+  HloModule m, is_scheduled=true
+
+  ENTRY main {
+    p0 = f32[4] parameter(0)
+    p1 = f32[8,4] parameter(1)
+    ag-start = (f32[4], f32[8]) all-gather-start(p0), dimensions={0},
+        replica_groups={}
+    ag-done = f32[8] all-gather-done(ag-start)
+    post_dot = f32[4] dot(ag-done, p1), lhs_contracting_dims={0},
+                                        rhs_contracting_dims={0}
+    ROOT _ = f32[4] add(post_dot, p0)
+  }
+)";
+
+TEST_F(CollectiveHintsAnnotatorTest, WindowTargetCycleViaSuccClosureSkipped) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kAgComputeIsSuccHlo));
+
+  CollectiveHintsConfig config;
+  auto* hint = config.add_hints();
+  hint->set_name("post_dot");
+  hint->add_window_target("ag-start");
+
+  CollectiveHintsAnnotatorPass pass(config);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, pass.Run(module.get()));
+  EXPECT_TRUE(changed);  // FE attr set; control deps skipped
+
+  const HloInstruction* post = FindInstruction(module.get(), "post_dot");
+  EXPECT_EQ(GetFrontendAttr(post, "_xla_window_target"), "ag-start");
+  EXPECT_EQ(post->control_predecessors().size(), 0);
+  EXPECT_EQ(post->control_successors().size(), 0);
+}
+
+// Cross-computation: target lives in a different HloComputation than the
+// matched compute. Treated as "target not found" within the compute's
+// computation (linear scan limited to compute->parent()), so skip+log.
+constexpr absl::string_view kCrossCompHlo = R"(
+  HloModule m, is_scheduled=true
+
+  body {
+    bp0 = f32[4,4] parameter(0)
+    bp1 = f32[4,4] parameter(1)
+    ROOT body_dot = f32[4,4] dot(bp0, bp1), lhs_contracting_dims={1},
+                                            rhs_contracting_dims={0}
+  }
+
+  ENTRY main {
+    p0 = f32[4] parameter(0)
+    p1 = f32[4,4] parameter(1)
+    p2 = f32[4,4] parameter(2)
+    ag-start = (f32[4], f32[8]) all-gather-start(p0), dimensions={0},
+        replica_groups={}
+    main_dot = f32[4,4] call(p1, p2), to_apply=body
+    ag-done = f32[8] all-gather-done(ag-start)
+    ROOT _ = (f32[8], f32[4,4]) tuple(ag-done, main_dot)
+  }
+)";
+
+TEST_F(CollectiveHintsAnnotatorTest, WindowTargetCrossCompSkipped) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kCrossCompHlo));
+
+  // Try to pin body_dot (in the `body` computation) into ag-start's window
+  // (in `main`). Different computations → annotator can't find the target
+  // in body_dot's parent, skip.
+  CollectiveHintsConfig config;
+  auto* hint = config.add_hints();
+  hint->set_name("body_dot");
+  hint->add_window_target("ag-start");
+
+  CollectiveHintsAnnotatorPass pass(config);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, pass.Run(module.get()));
+  EXPECT_TRUE(changed);  // FE attr set; control deps skipped
+
+  const HloInstruction* body_dot = FindInstruction(module.get(), "body_dot");
+  EXPECT_EQ(GetFrontendAttr(body_dot, "_xla_window_target"), "ag-start");
+  EXPECT_EQ(body_dot->control_predecessors().size(), 0);
+  EXPECT_EQ(body_dot->control_successors().size(), 0);
+}
+
 }  // namespace
 }  // namespace gpu
 }  // namespace xla

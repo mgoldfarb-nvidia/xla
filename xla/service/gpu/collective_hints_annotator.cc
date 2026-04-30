@@ -19,6 +19,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -26,6 +27,7 @@ limitations under the License.
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include <map>
 
@@ -303,6 +305,12 @@ absl::StatusOr<bool> CollectiveHintsAnnotatorPass::RunImpl(
   std::map<HloComputation*, std::map<int32_t, std::vector<HloInstruction*>>>
       batches_per_comp;
 
+  // window_target bookkeeping: per matched compute instruction, the list of
+  // collective names that should "contain" it in their [start, done] window.
+  // Consulted after the main loop to add the control deps (see
+  // `window_target` in collective_hints.proto).
+  std::map<HloInstruction*, std::vector<std::string>> window_target_per_instr;
+
   for (HloComputation* computation :
        module->MakeNonfusionComputations(execution_threads)) {
     for (HloInstruction* instr : computation->instructions()) {
@@ -356,6 +364,7 @@ absl::StatusOr<bool> CollectiveHintsAnnotatorPass::RunImpl(
         std::string scheduling_group_id;
         int32_t stream_id = 0;
         int32_t sequence_id = 0;   // 0 = not batched
+        std::vector<std::string> window_target;  // empty = none
       } merged;
 
       for (const CollectiveHint* hint : matching) {
@@ -373,6 +382,12 @@ absl::StatusOr<bool> CollectiveHintsAnnotatorPass::RunImpl(
         }
         if (hint->sequence_id() > 0) {
           merged.sequence_id = hint->sequence_id();
+        }
+        // Higher-priority rule wins for window_target — replace, don't append,
+        // matching the merge semantics of the other singleton-valued fields.
+        if (!hint->window_target().empty()) {
+          merged.window_target.assign(hint->window_target().begin(),
+                                      hint->window_target().end());
         }
       }
 
@@ -421,6 +436,37 @@ absl::StatusOr<bool> CollectiveHintsAnnotatorPass::RunImpl(
                                       absl::StrCat(merged.stream_id));
         VLOG(2) << "  -> _xla_stream_annotation=" << merged.stream_id;
         any_attr = true;
+      }
+      // window_target: only meaningful on compute ops. The matched async-start
+      // case would create a chicken-and-egg dependency (collective C as a
+      // window_target for itself or another collective). Reject (log+skip) if
+      // misapplied.
+      if (!merged.window_target.empty()) {
+        if (is_async_start) {
+          VLOG(1) << "CollectiveHintsAnnotator: skipping window_target on "
+                     "async-collective-start '" << instr->name()
+                  << "' — only compute ops can be placed inside a "
+                     "collective window";
+        } else if (merged.window_target.size() > 1) {
+          VLOG(1) << "CollectiveHintsAnnotator: skipping multi-target "
+                     "window_target on '" << instr->name() << "' (got "
+                  << merged.window_target.size()
+                  << " targets, only 1 supported in Phase 1; multi-target "
+                     "would require LHS-side state tracking and is not yet "
+                     "implemented)";
+        } else {
+          // Defer the actual control-dep insertion + dataflow validation to
+          // the post-loop pass; we need a per-computation reachability map
+          // and a name → instruction lookup, which are cheaper to build once.
+          window_target_per_instr[instr] = merged.window_target;
+          // Visibility attribute (joined with "," for forward compatibility
+          // with multi-target).
+          instr->add_frontend_attribute(
+              "_xla_window_target", absl::StrJoin(merged.window_target, ","));
+          VLOG(2) << "  -> _xla_window_target="
+                  << absl::StrJoin(merged.window_target, ",");
+          any_attr = true;
+        }
       }
       if (any_attr) changed = true;
 
@@ -516,6 +562,103 @@ absl::StatusOr<bool> CollectiveHintsAnnotatorPass::RunImpl(
           }
         }
       }
+    }
+  }
+
+  // ── window_target: add control deps to pin compute inside collective windows
+  //
+  // For each (compute_instr, [target_name]) recorded above (Phase 1: exactly
+  // one target per compute), find the named target in the same computation,
+  // verify it's an async-collective-start, locate its paired -done, validate
+  // dataflow legality (compute must not be in target's pred or succ closure;
+  // adding the control deps must not introduce a cycle), and add:
+  //   target_start  -> compute       (so compute runs AFTER start)
+  //   compute       -> target_done   (so compute runs BEFORE done)
+  //
+  // Any rule that fails validation is logged and skipped (its FE attribute
+  // remains for visibility, but no control deps are added — callers can grep
+  // for `CollectiveHintsAnnotator window_target: skip` in logs to find them).
+  if (!window_target_per_instr.empty()) {
+    // One reachability map per computation, cached for repeated lookups.
+    absl::flat_hash_map<HloComputation*, std::unique_ptr<HloReachabilityMap>>
+        reach_per_comp;
+    auto reach_for = [&](HloComputation* c) -> HloReachabilityMap* {
+      auto it = reach_per_comp.find(c);
+      if (it == reach_per_comp.end()) {
+        it = reach_per_comp
+                 .emplace(c, HloReachabilityMap::Build(c))
+                 .first;
+      }
+      return it->second.get();
+    };
+
+    for (const auto& [compute, targets] : window_target_per_instr) {
+      // Phase 1 invariant — already enforced above, but assert defensively.
+      if (targets.size() != 1) continue;
+      const std::string& target_name = targets.front();
+      HloComputation* comp = compute->parent();
+      // Linear scan of the comp; the cost is O(comp_instrs) per
+      // window_target rule, which is fine for the typical handful of rules
+      // a textproto carries. If this ever becomes hot we can pre-build a
+      // name → instr map per computation alongside reach_per_comp.
+      HloInstruction* target = nullptr;
+      for (HloInstruction* i : comp->instructions()) {
+        if (i->name() == target_name) {
+          target = i;
+          break;
+        }
+      }
+      if (target == nullptr) {
+        VLOG(1) << "CollectiveHintsAnnotator window_target: skip — target '"
+                << target_name << "' not found in computation '"
+                << comp->name() << "' (compute='" << compute->name() << "')";
+        continue;
+      }
+      if (!is_async_start_h(target)) {
+        VLOG(1) << "CollectiveHintsAnnotator window_target: skip — target '"
+                << target_name << "' is not an async-collective-start "
+                << "(opcode=" << HloOpcodeString(target->opcode())
+                << "; compute='" << compute->name() << "')";
+        continue;
+      }
+      HloInstruction* target_done = paired_done(target);
+      if (target_done == nullptr) {
+        VLOG(1) << "CollectiveHintsAnnotator window_target: skip — could "
+                << "not find paired *-done for target '" << target_name
+                << "' (compute='" << compute->name() << "')";
+        continue;
+      }
+      HloReachabilityMap* reach = reach_for(comp);
+      // Cycle check 1: compute already reaches target → compute is a
+      // dataflow predecessor of target. Adding `target -> compute` would
+      // close the cycle. (Equivalent to "target is in compute's succ
+      // closure".)
+      if (reach->IsReachable(compute, target)) {
+        VLOG(1) << "CollectiveHintsAnnotator window_target: skip — compute '"
+                << compute->name() << "' is a dataflow PREDECESSOR of "
+                << "target '" << target_name << "'; pinning compute into "
+                << "target's window would cycle";
+        continue;
+      }
+      // Cycle check 2: target_done already reaches compute → compute is a
+      // dataflow successor of the collective's result. It can't run during
+      // the collective; adding `compute -> target_done` would cycle.
+      if (reach->IsReachable(target_done, compute)) {
+        VLOG(1) << "CollectiveHintsAnnotator window_target: skip — compute '"
+                << compute->name() << "' is a dataflow SUCCESSOR of "
+                << "target_done '" << target_done->name() << "' (compute "
+                << "depends on the collective's result, can't run inside its "
+                << "window)";
+        continue;
+      }
+      TF_RETURN_IF_ERROR(target->AddControlDependencyTo(compute));
+      TF_RETURN_IF_ERROR(compute->AddControlDependencyTo(target_done));
+      VLOG(2) << "CollectiveHintsAnnotator window_target: pinned '"
+              << compute->name() << "' inside ['" << target->name()
+              << "', '" << target_done->name() << "'] (control deps added)";
+      // Reachability map is now stale — invalidate the cache for this comp.
+      reach_per_comp.erase(comp);
+      changed = true;
     }
   }
 
