@@ -63,6 +63,7 @@ limitations under the License.
 #include "xla/service/gpu/gpu_latency_hiding_scheduler.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
 #include "xla/service/gpu/ir_emission_utils.h"
+#include "xla/service/gpu/pgle_force_async.h"
 #include "xla/service/gpu/model/analytical_latency_estimator.h"
 #include "xla/service/gpu/model/gpu_hlo_cost_analysis.h"
 #include "xla/service/gpu/model/sol_latency_estimator.h"
@@ -548,7 +549,18 @@ bool NeedAccuracyChecker(const DebugOptions& options,
 
 // For now, only allow cublas gemm custom calls and triton gemm fusions to
 // be overlapped as the compute ops in the annotated scheduling groups.
-LegalizeSchedulingAnnotations::Config SchedulingAnnotationsConfig() {
+//
+// `drop_singleton_gids` (Proposal A1) flips `keep_trivial_sync_annotation`
+// from the upstream default (HloPredicateTrue, never drops) to
+// HloPredicateFalse (always drops singleton groups). After the strip pass
+// removes ineligible anchors (per `keep_sync_annotation` above), any group
+// that ends up with a single surviving member has no constraint to enforce —
+// its residual `_scheduling_group_id` only confuses the scheduler and can
+// force `is_sync=true` on the surviving collective. See
+// `docs/lhs_pgle_baseline_improvements.md` (Proposal A1) for the full
+// rationale and the v3-stable failure mode that motivated this fix.
+LegalizeSchedulingAnnotations::Config SchedulingAnnotationsConfig(
+    bool drop_singleton_gids) {
   LegalizeSchedulingAnnotations::Config annotation_config;
   annotation_config.keep_sync_annotation = [](const HloInstruction* hlo) {
     if (hlo == nullptr) {
@@ -568,6 +580,14 @@ LegalizeSchedulingAnnotations::Config SchedulingAnnotationsConfig() {
     }
     return false;
   };
+  if (drop_singleton_gids) {
+    // A1: drop singletons. Returning false here means
+    // RemoveTrivialGroups() (in legalize_scheduling_annotations.cc)
+    // will strip the surviving annotation.
+    annotation_config.keep_trivial_sync_annotation = HloPredicateFalse;
+  }
+  // else: leave the default HloPredicateTrue so the legacy behavior is
+  // preserved (singletons survive). This branch exists for bisection.
   return annotation_config;
 }
 
@@ -644,7 +664,33 @@ absl::Status RunLatencyHidingSchedulerPasses(
   }
 
   pipeline.AddPass<LegalizeSchedulingAnnotations>(
-      SchedulingAnnotationsConfig());
+      SchedulingAnnotationsConfig(
+          options.xla_gpu_lhs_drop_singleton_gids()));
+
+  // Proposal B1 (docs/lhs_pgle_baseline_improvements.md):
+  // Pre-pass that flips is_sync=false on collectives whose PGLE-recorded
+  // cost exceeds `xla_gpu_pgle_force_async_threshold_us`. Default 0 = no-op.
+  // Must run after LegalizeSchedulingAnnotations (so A1's singleton drops
+  // have settled) and before the main LHS pass (which consumes is_sync).
+  if (options.xla_gpu_pgle_force_async_threshold_us() > 0.0f) {
+    std::optional<tensorflow::profiler::ProfiledInstructionsProto>
+        force_async_profile = ReadPGLEProfile(module->config(), fingerprint);
+    if (force_async_profile.has_value()) {
+      TF_ASSIGN_OR_RETURN(
+          int n_flipped,
+          ApplyPgleForceAsync(
+              module, *force_async_profile,
+              options.xla_gpu_pgle_force_async_threshold_us()));
+      if (n_flipped > 0) {
+        VLOG(1) << "B1 force-async: flipped " << n_flipped
+                << " collective-start(s) above threshold "
+                << options.xla_gpu_pgle_force_async_threshold_us() << " us";
+      }
+    } else {
+      VLOG(1) << "B1 force-async: threshold > 0 but no PGLE profile; "
+                 "skipping (would otherwise have nothing to look up).";
+    }
+  }
 
   SchedulerConfig config = MakeGPUSchedulerConfig(
       memory_limit,
@@ -652,6 +698,10 @@ absl::Status RunLatencyHidingSchedulerPasses(
       options.xla_gpu_experimental_parallel_async_compute_limit());
   config.pgle_latency_scaling_factor =
       options.xla_gpu_pgle_latency_scaling_factor();
+  // Proposal C1 (docs/lhs_pgle_baseline_improvements.md): wire the
+  // fill-collective-windows flag through to the LHS priority comparator.
+  config.fill_collective_windows =
+      options.xla_gpu_lhs_fill_collective_windows();
 
   auto shape_size_in_bytes = ShapeSizeBytesFunction(pointer_size);
 

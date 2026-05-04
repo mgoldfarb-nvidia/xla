@@ -31,7 +31,9 @@ limitations under the License.
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
 #include "xla/backends/gpu/transforms/collectives/collective_ops_utils.h"
 #include "xla/side_effect_util.h"
+#include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/utils/hlo_query.h"
 #include "xla/service/collective_ops_utils.h"
@@ -225,6 +227,74 @@ HloCostAnalysis::ShapeSizeFunction ShapeSizeBytesFunction(
     return size + metadata_size;
   };
 }
+
+namespace {
+
+// Proposal A2 (docs/lhs_pgle_baseline_improvements.md):
+// When PGLE has no entry for a collective, estimate its latency from
+// shape + bytes + replica-group size instead of falling back to flat
+// kHighLatency=5000 cycles.
+//
+// Returns latency in microseconds (matches ApproximateLatencyEstimator's
+// abstract unit, where CyclesPerMicrosecond() == 1).
+double EstimateCollectiveLatencyFromShapeUs(
+    const HloInstruction& instr, int64_t bytes,
+    HloOpcode async_inner_opcode) {
+  // Mirror of ApproximateLatencyEstimator::{kLowLatency, kHighLatency}
+  // (protected members; can't be accessed directly from a free function).
+  // Keep these in sync with the parent's values.
+  constexpr double kFallbackLowLatencyUs = 1.0;
+  constexpr double kFallbackHighLatencyUs = 5000.0;
+
+  if (bytes <= 0) {
+    return kFallbackHighLatencyUs;
+  }
+
+  // Conservative effective bandwidth (per-direction, GB/s). Tuned for
+  // current targets where collectives may cross node boundaries via IB —
+  // intra-node NVLink is faster but for an unprofiled fallback we err on
+  // the side of "this is not free, schedule overlap." A future per-
+  // architecture / per-replica-locality table is tracked under the same
+  // proposal.
+  constexpr double kEffectiveBandwidthGBps = 12.0;
+
+  // Replica-group size determines the ring-step factor. We assume the
+  // instruction's replica_groups are populated; if not (e.g. bare
+  // collective without explicit groups), assume a moderate group size.
+  int64_t rg_size = 8;
+  const auto* coll = DynCast<HloCollectiveInstruction>(&instr);
+  if (coll != nullptr && !coll->replica_groups().empty()) {
+    rg_size = std::max<int64_t>(2, coll->replica_groups()[0].replica_ids_size());
+  }
+  double ring_factor = static_cast<double>(rg_size - 1) / rg_size;
+
+  // All-reduce performs reduce-scatter + all-gather, so its bandwidth-time
+  // factor is roughly 2x a single-direction collective.
+  if (async_inner_opcode == HloOpcode::kAllReduce) {
+    ring_factor *= 2.0;
+  }
+
+  // bytes / (GB/s * 1e9 bytes-per-GB) = seconds. * 1e6 = microseconds.
+  double us =
+      (static_cast<double>(bytes) * ring_factor) /
+      (kEffectiveBandwidthGBps * 1.0e9) * 1.0e6;
+
+  // Floor at kLowLatency so very small collectives don't return zero.
+  // Cap at 10x kHighLatency so a runaway shape doesn't produce absurd
+  // values.
+  return std::clamp(us, kFallbackLowLatencyUs, 10.0 * kFallbackHighLatencyUs);
+}
+
+}  // namespace
+
+namespace internal {
+double EstimateCollectiveLatencyFromShapeUsForTesting(
+    const HloInstruction& instr, int64_t bytes,
+    HloOpcode async_inner_opcode) {
+  return EstimateCollectiveLatencyFromShapeUs(instr, bytes,
+                                               async_inner_opcode);
+}
+}  // namespace internal
 
 CanonicalAsyncOp GpuGetCanonicalAsyncOp(const HloInstruction& hlo) {
   switch (hlo.opcode()) {
@@ -714,6 +784,30 @@ ApproximateLatencyEstimator::TimeCost GpuLatencyEstimator::GetLatencyBetween(
         collective_size_exceeds_threshold) {
       return ApproximateLatencyEstimator::kHighLatency *
              kCostlyAllReduceMultiplier;
+    }
+
+    // Proposal A2: when enabled, estimate latency from shape rather than
+    // returning the flat kHighLatency fallback. Helps when PGLE has no
+    // entry for the collective (e.g. recently-added or renamed
+    // instructions).
+    if (from.GetInstr()
+            .GetModule()
+            ->config()
+            .debug_options()
+            .xla_gpu_lhs_unprofiled_latency_model()) {
+      const HloInstruction& start = from.GetInstr();
+      const HloInstruction* shape_carrier = &start;
+      // For async-start wrappers, dig into the wrapped op for replica-
+      // group + shape attribution (the wrapper's shape is a tuple; the
+      // wrapped op has the proper collective shape).
+      if (start.opcode() == HloOpcode::kAsyncStart) {
+        shape_carrier = start.async_wrapped_instruction();
+      }
+      int64_t bytes =
+          ShapeSizeBytesFunction(pointer_size_)(shape_carrier->shape());
+      HloOpcode inner = GpuGetCanonicalAsyncOp(start).inner;
+      return EstimateCollectiveLatencyFromShapeUs(*shape_carrier, bytes,
+                                                  inner);
     }
 
     return ApproximateLatencyEstimator::kHighLatency;

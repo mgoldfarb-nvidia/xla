@@ -1305,5 +1305,65 @@ ENTRY entry {
   EXPECT_NEAR(latency, 5000.0, 1e-3);
 }
 
+// Proposal A2 (docs/lhs_pgle_baseline_improvements.md):
+// Verifies the shape-based latency model returns sensible per-architecture
+// values that scale with byte size. These tests pin the formula's behavior
+// without committing to specific magic numbers — they only assert that the
+// estimate (a) is monotonic in bytes, and (b) is positive.
+
+TEST_F(GpuLatencyHidingSchedulerBaseTest, A2_EstimateScalesWithBytes) {
+  constexpr absl::string_view hlo_string = R"(
+    HloModule test
+    ENTRY entry {
+      p0 = f32[1024,1024]{1,0} parameter(0)
+      ag_small = (f32[1024,1024]{1,0}, f32[2048,1024]{1,0})
+          all-gather-start(p0), replica_groups={{0,1}}, dimensions={0}
+      ROOT done = f32[2048,1024]{1,0} all-gather-done(ag_small)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto hlo_module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  HloInstruction* ag = FindInstruction(hlo_module.get(), "ag_small");
+  ASSERT_NE(ag, nullptr);
+
+  double small =
+      internal::EstimateCollectiveLatencyFromShapeUsForTesting(
+          *ag, /*bytes=*/1 << 20, HloOpcode::kAllGather);  // 1 MB
+  double large =
+      internal::EstimateCollectiveLatencyFromShapeUsForTesting(
+          *ag, /*bytes=*/1 << 30, HloOpcode::kAllGather);  // 1 GB
+  EXPECT_GT(small, 0.0);
+  EXPECT_GT(large, small);
+}
+
+TEST_F(GpuLatencyHidingSchedulerBaseTest, A2_AllReduceCostsMoreThanAllGather) {
+  constexpr absl::string_view hlo_string = R"(
+    HloModule test
+    reduce {
+      a = f32[] parameter(0)
+      b = f32[] parameter(1)
+      ROOT add = f32[] add(a, b)
+    }
+    ENTRY entry {
+      p0 = f32[1024,1024]{1,0} parameter(0)
+      ag = (f32[1024,1024]{1,0}, f32[2048,1024]{1,0})
+          all-gather-start(p0), replica_groups={{0,1}}, dimensions={0}
+      ROOT done = f32[2048,1024]{1,0} all-gather-done(ag)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto hlo_module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  HloInstruction* ag = FindInstruction(hlo_module.get(), "ag");
+  ASSERT_NE(ag, nullptr);
+
+  // For the same shape and replica group, all-reduce should cost ~2x an
+  // all-gather (reduce-scatter + all-gather phases).
+  double ar = internal::EstimateCollectiveLatencyFromShapeUsForTesting(
+      *ag, /*bytes=*/1 << 20, HloOpcode::kAllReduce);
+  double ag_us = internal::EstimateCollectiveLatencyFromShapeUsForTesting(
+      *ag, /*bytes=*/1 << 20, HloOpcode::kAllGather);
+  EXPECT_GT(ar, ag_us);
+}
+
 }  // namespace
 }  // namespace xla::gpu

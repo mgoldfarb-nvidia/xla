@@ -1543,6 +1543,43 @@ message DebugOptions {
   // async-start instructions before running the latency hiding scheduler.
   optional string xla_gpu_collective_hints_file = 503;
 
+  // PGLE-informed force-async pre-pass (Proposal B1). Threshold (in
+  // microseconds) above which a collective is forced async before LHS sees it.
+  // 0 (default) disables the pass — preserves today's behavior.
+  // Typical opt-in value: 100 (anything with profiled latency > 100 us is
+  // worth overlapping).
+  optional float xla_gpu_pgle_force_async_threshold_us = 505;
+
+  // Field 506 reserved for a future "multi-stream comm awareness" knob
+  // (Proposal A3 in docs/lhs_pgle_baseline_improvements.md). Not yet
+  // implemented in this batch.
+
+  // Auto-drop residual scheduling-group ids on singletons (Proposal A1).
+  // After LegalizeSchedulingAnnotations strips ineligible anchors, any
+  // _scheduling_group_id surviving on a single instruction (group of size 1)
+  // is also stripped — a singleton group has no constraint to enforce.
+  // Default true: this is a bug fix for the v3-stable failure mode where a
+  // residual gid forced is_sync=true on the surviving collective.
+  optional bool xla_gpu_lhs_drop_singleton_gids = 508;
+
+  // Better defaults for un-profiled instructions (Proposal A2).
+  // When enabled, GpuLatencyEstimator estimates collective latencies from
+  // shape + bytes + replica-group size when PGLE has no entry, instead of
+  // falling back to flat kHighLatency=5000 cycles. Default false (off).
+  optional bool xla_gpu_lhs_unprofiled_latency_model = 509;
+
+  // Fill collective windows priority adjustment (Proposal C1).
+  // When enabled, LHS biases its priority comparator to prefer scheduling
+  // independent compute when an async collective is currently in flight,
+  // approximating the manual window_target effect. Default false (off).
+  optional bool xla_gpu_lhs_fill_collective_windows = 510;
+
+  // Field 507 was previously reserved for a compute-time scaling factor
+  // (proposal A4). Investigation showed PGLE per-instance cost is accurate;
+  // the empirical 1.66x undercount was a per-step aggregation issue in the
+  // out-of-tree predict_overlap.py tool, not in XLA's cost model. Field is
+  // free for future use.
+
   reserved "xla_gpu_enable_ag_rs_split_streams";
 
   reserved "hlo_reduce_precision_options";

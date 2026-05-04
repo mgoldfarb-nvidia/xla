@@ -32,6 +32,17 @@ namespace gpu {
 // E.g. AllReduceStart is broken down into Reduce + AsyncStart.
 CanonicalAsyncOp GpuGetCanonicalAsyncOp(const HloInstruction& hlo);
 
+namespace internal {
+// VisibleForTesting: Proposal A2's shape-based latency estimate.
+// Returns latency in microseconds for the given collective instruction
+// with the given total byte size. `async_inner_opcode` is the canonical
+// inner opcode (e.g., kAllReduce, kAllGather, kReduceScatter) used to
+// pick the ring-step factor.
+double EstimateCollectiveLatencyFromShapeUsForTesting(
+    const HloInstruction& instr, int64_t bytes,
+    HloOpcode async_inner_opcode);
+}  // namespace internal
+
 // The shape size function depending on the pointer size and
 // memory space.
 HloCostAnalysis::ShapeSizeFunction ShapeSizeBytesFunction(

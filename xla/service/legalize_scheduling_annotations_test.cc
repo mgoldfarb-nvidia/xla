@@ -426,6 +426,125 @@ TEST_F(LegalizeSchedulingAnnotationsTest,
                              "_scheduling_group_id", "1"))));
 }
 
+// Proposal A1 (docs/lhs_pgle_baseline_improvements.md):
+// Reproduces the v3-stable failure mode: a 2-member scheduling group whose
+// non-Triton-GEMM fusion anchor gets stripped by `keep_sync_annotation` (the
+// GPU eligibility predicate). Without A1, the surviving collective-start
+// retains `_scheduling_group_id` as a singleton, which the LHS scheduler
+// interprets as a constraint forcing `is_sync=true`. With A1
+// (`keep_trivial_sync_annotation = HloPredicateFalse`), the singleton's
+// residual annotation is stripped too, restoring async behavior.
+TEST_F(LegalizeSchedulingAnnotationsTest, A1_DropSingletonAfterAnchorStripped) {
+  constexpr absl::string_view hlo_string = R"(
+  HloModule test
+
+  add_fn {
+    a = f32[1024,1024]{1,0} parameter(0)
+    b = f32[1024,1024]{1,0} parameter(1)
+    ROOT add = f32[1024,1024]{1,0} add(a, b)
+  }
+
+  ENTRY entry {
+    p0 = f32[1024,1024]{1,0} parameter(0)
+    p1 = f32[1024,1024]{1,0} parameter(1)
+    ags0 = (f32[1024,1024]{1,0}, f32[2048,1024]{1,0}) all-gather-start(p0), replica_groups={{0,1}}, dimensions={0}, frontend_attributes={_scheduling_group_id="42"}
+    wrapped_add = f32[1024,1024]{1,0} fusion(p0, p1), kind=kLoop, calls=add_fn, frontend_attributes={_scheduling_group_id="42"}
+    agd0 = f32[2048,1024]{1,0} all-gather-done(ags0), frontend_attributes={_scheduling_group_id="42"}
+    ROOT tuple = (f32[1024,1024]{1,0}, f32[2048,1024]{1,0}) tuple(wrapped_add, agd0)
+  }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> hlo_module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+
+  // Match the GPU pipeline's `keep_sync_annotation` predicate (kLoop fusions
+  // are not eligible anchors — only Triton-GEMM kFusion is, plus kCustomCall
+  // / kDot / kConvolution).
+  LegalizeSchedulingAnnotations::Config config;
+  config.keep_sync_annotation = [](const HloInstruction* hlo) {
+    if (hlo == nullptr) return false;
+    return hlo->opcode() == HloOpcode::kCustomCall ||
+           hlo->opcode() == HloOpcode::kDot ||
+           hlo->opcode() == HloOpcode::kConvolution;
+  };
+  // A1 setting:
+  config.keep_trivial_sync_annotation = HloPredicateFalse;
+
+  EXPECT_IS_OK(
+      LegalizeSchedulingAnnotations(config).Run(hlo_module.get()).status());
+
+  // Both the fusion (stripped first by `keep_sync_annotation`) AND the
+  // surviving async-start/done pair (stripped by RemoveTrivialGroups via
+  // `keep_trivial_sync_annotation = HloPredicateFalse`) should now have NO
+  // _scheduling_group_id annotation.
+  for (HloInstruction* instr :
+       hlo_module->entry_computation()->instructions()) {
+    EXPECT_FALSE(instr->frontend_attributes().map().contains(
+        kXlaSchedulingGroupIdAttr))
+        << "Instruction '" << instr->name()
+        << "' unexpectedly retained _scheduling_group_id after A1 strip "
+           "of singleton group 42.";
+  }
+}
+
+// Negative case for A1: when `keep_trivial_sync_annotation` is left at its
+// default (HloPredicateTrue), the surviving collective-start RETAINS its
+// residual annotation — reproducing the v3-stable failure mode that A1
+// fixes. This test exists to lock in that the legacy behavior is preserved
+// when the A1 flag is disabled.
+TEST_F(LegalizeSchedulingAnnotationsTest,
+       A1_LegacyKeepsSingletonAnnotation) {
+  constexpr absl::string_view hlo_string = R"(
+  HloModule test
+
+  add_fn {
+    a = f32[1024,1024]{1,0} parameter(0)
+    b = f32[1024,1024]{1,0} parameter(1)
+    ROOT add = f32[1024,1024]{1,0} add(a, b)
+  }
+
+  ENTRY entry {
+    p0 = f32[1024,1024]{1,0} parameter(0)
+    p1 = f32[1024,1024]{1,0} parameter(1)
+    ags0 = (f32[1024,1024]{1,0}, f32[2048,1024]{1,0}) all-gather-start(p0), replica_groups={{0,1}}, dimensions={0}, frontend_attributes={_scheduling_group_id="42"}
+    wrapped_add = f32[1024,1024]{1,0} fusion(p0, p1), kind=kLoop, calls=add_fn, frontend_attributes={_scheduling_group_id="42"}
+    agd0 = f32[2048,1024]{1,0} all-gather-done(ags0), frontend_attributes={_scheduling_group_id="42"}
+    ROOT tuple = (f32[1024,1024]{1,0}, f32[2048,1024]{1,0}) tuple(wrapped_add, agd0)
+  }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> hlo_module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+
+  LegalizeSchedulingAnnotations::Config config;
+  config.keep_sync_annotation = [](const HloInstruction* hlo) {
+    if (hlo == nullptr) return false;
+    return hlo->opcode() == HloOpcode::kCustomCall ||
+           hlo->opcode() == HloOpcode::kDot ||
+           hlo->opcode() == HloOpcode::kConvolution;
+  };
+  // Legacy setting (A1 disabled):
+  config.keep_trivial_sync_annotation = HloPredicateTrue;
+
+  EXPECT_IS_OK(
+      LegalizeSchedulingAnnotations(config).Run(hlo_module.get()).status());
+
+  // Fusion side stripped (it's not an eligible anchor):
+  HloInstruction* fusion = nullptr;
+  HloInstruction* ags = nullptr;
+  for (HloInstruction* instr :
+       hlo_module->entry_computation()->instructions()) {
+    if (instr->name() == "wrapped_add") fusion = instr;
+    if (instr->name() == "ags0") ags = instr;
+  }
+  ASSERT_NE(fusion, nullptr);
+  ASSERT_NE(ags, nullptr);
+  EXPECT_FALSE(
+      fusion->frontend_attributes().map().contains(kXlaSchedulingGroupIdAttr));
+  // But the collective-start RETAINS the singleton annotation under legacy
+  // behavior — this is the bug A1 fixes:
+  EXPECT_TRUE(
+      ags->frontend_attributes().map().contains(kXlaSchedulingGroupIdAttr));
+}
+
 TEST_F(LegalizeSchedulingAnnotationsTest, OpsWithControlDependencies) {
   constexpr absl::string_view hlo_string = R"(
   HloModule module, is_scheduled=true

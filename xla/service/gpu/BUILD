@@ -2693,6 +2693,7 @@ cc_library(
         ":gpu_latency_hiding_scheduler",
         ":hlo_fusion_analysis",
         ":ir_emission_utils",
+        ":pgle_force_async",
         "//xla:shape_util",
         "//xla:util",
         "//xla/backends/gpu/transforms:pgle_accuracy_checker",
@@ -3509,6 +3510,40 @@ cc_library(
 tf_proto_library(
     name = "collective_hints_proto",
     srcs = ["collective_hints.proto"],
+)
+
+cc_library(
+    name = "pgle_force_async",
+    srcs = ["pgle_force_async.cc"],
+    hdrs = ["pgle_force_async.h"],
+    deps = [
+        ":backend_configs_cc",
+        "//xla:side_effect_util",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/utils:hlo_query",
+        "//xla/service:scheduling_annotations_util",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@tsl//tsl/profiler/protobuf:profiled_instructions_proto_cc",
+    ],
+)
+
+xla_cc_test(
+    name = "pgle_force_async_test",
+    srcs = ["pgle_force_async_test.cc"],
+    deps = [
+        ":backend_configs_cc",
+        ":pgle_force_async",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+        "@tsl//tsl/profiler/protobuf:profiled_instructions_proto_cc",
+    ],
 )
 
 cc_library(

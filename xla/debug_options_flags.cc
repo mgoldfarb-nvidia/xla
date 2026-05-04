@@ -280,6 +280,11 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_gpu_pgle_latency_scaling_factor(1.0f);
   opts.set_xla_gpu_collective_hints_file("");
   opts.set_xla_gpu_experimental_enable_collective_multi_streaming(false);
+  // Baseline LHS / PGLE improvements (docs/lhs_pgle_baseline_improvements.md):
+  opts.set_xla_gpu_pgle_force_async_threshold_us(0.0f);  // B1: off by default
+  opts.set_xla_gpu_lhs_drop_singleton_gids(true);        // A1: bug-fix; on
+  opts.set_xla_gpu_lhs_unprofiled_latency_model(false);  // A2: off by default
+  opts.set_xla_gpu_lhs_fill_collective_windows(false);   // C1: off by default
 
   opts.set_xla_gpu_enable_reassociation_for_converted_ar(true);
 
@@ -1787,6 +1792,42 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       "inject scheduling hints (latency_metadata, force_earliest, "
       "scheduling_group_id) onto matching collective async-start instructions "
       "before running the latency hiding scheduler."));
+  // Baseline LHS / PGLE improvements (docs/lhs_pgle_baseline_improvements.md).
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_pgle_force_async_threshold_us",
+      float_setter_for(
+          &DebugOptions::set_xla_gpu_pgle_force_async_threshold_us),
+      debug_options->xla_gpu_pgle_force_async_threshold_us(),
+      "Proposal B1. PGLE-informed force-async pre-pass threshold (us). "
+      "Collectives with PGLE-recorded latency above this value are forced "
+      "is_sync=false before LHS sees them, and any residual scheduling-group "
+      "annotation is cleared. 0 disables the pass (default; preserves today's "
+      "behavior). Typical opt-in: 100."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_lhs_drop_singleton_gids",
+      bool_setter_for(&DebugOptions::set_xla_gpu_lhs_drop_singleton_gids),
+      debug_options->xla_gpu_lhs_drop_singleton_gids(),
+      "Proposal A1. After LegalizeSchedulingAnnotations strips ineligible "
+      "anchors, also strip _scheduling_group_id from any single-instruction "
+      "(singleton) group. Default true: a singleton group has no constraint "
+      "to enforce, and its residual annotation can perversely force "
+      "is_sync=true on the surviving collective."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_lhs_unprofiled_latency_model",
+      bool_setter_for(
+          &DebugOptions::set_xla_gpu_lhs_unprofiled_latency_model),
+      debug_options->xla_gpu_lhs_unprofiled_latency_model(),
+      "Proposal A2. When PGLE has no entry for a collective, estimate its "
+      "latency from shape + bytes + replica-group size instead of falling "
+      "back to flat kHighLatency=5000 cycles. Default false (off)."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_lhs_fill_collective_windows",
+      bool_setter_for(
+          &DebugOptions::set_xla_gpu_lhs_fill_collective_windows),
+      debug_options->xla_gpu_lhs_fill_collective_windows(),
+      "Proposal C1. Bias LHS's priority comparator to prefer scheduling "
+      "independent compute when an async collective is currently in flight. "
+      "Default false (off)."));
   flag_list->push_back(tsl::Flag(
       "xla_gpu_experimental_enable_collective_multi_streaming",
       bool_setter_for(
