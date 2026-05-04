@@ -434,6 +434,12 @@ TEST_F(LegalizeSchedulingAnnotationsTest,
 // interprets as a constraint forcing `is_sync=true`. With A1
 // (`keep_trivial_sync_annotation = HloPredicateFalse`), the singleton's
 // residual annotation is stripped too, restoring async behavior.
+//
+// Note: only the `*-start` carries the gid in this setup (matching how
+// real hint textprotos like hybridep_zero_sum_steal_serial_v3_stable
+// annotate just the start side; the done is not separately annotated).
+// After `wrapped_add` is stripped, gid 42 has exactly one annotated
+// member (`ags0`) — a singleton.
 TEST_F(LegalizeSchedulingAnnotationsTest, A1_DropSingletonAfterAnchorStripped) {
   constexpr absl::string_view hlo_string = R"(
   HloModule test
@@ -449,7 +455,7 @@ TEST_F(LegalizeSchedulingAnnotationsTest, A1_DropSingletonAfterAnchorStripped) {
     p1 = f32[1024,1024]{1,0} parameter(1)
     ags0 = (f32[1024,1024]{1,0}, f32[2048,1024]{1,0}) all-gather-start(p0), replica_groups={{0,1}}, dimensions={0}, frontend_attributes={_scheduling_group_id="42"}
     wrapped_add = f32[1024,1024]{1,0} fusion(p0, p1), kind=kLoop, calls=add_fn, frontend_attributes={_scheduling_group_id="42"}
-    agd0 = f32[2048,1024]{1,0} all-gather-done(ags0), frontend_attributes={_scheduling_group_id="42"}
+    agd0 = f32[2048,1024]{1,0} all-gather-done(ags0)
     ROOT tuple = (f32[1024,1024]{1,0}, f32[2048,1024]{1,0}) tuple(wrapped_add, agd0)
   }
   )";
@@ -473,7 +479,7 @@ TEST_F(LegalizeSchedulingAnnotationsTest, A1_DropSingletonAfterAnchorStripped) {
       LegalizeSchedulingAnnotations(config).Run(hlo_module.get()).status());
 
   // Both the fusion (stripped first by `keep_sync_annotation`) AND the
-  // surviving async-start/done pair (stripped by RemoveTrivialGroups via
+  // surviving collective-start (stripped by RemoveTrivialGroups via
   // `keep_trivial_sync_annotation = HloPredicateFalse`) should now have NO
   // _scheduling_group_id annotation.
   for (HloInstruction* instr :
@@ -507,7 +513,7 @@ TEST_F(LegalizeSchedulingAnnotationsTest,
     p1 = f32[1024,1024]{1,0} parameter(1)
     ags0 = (f32[1024,1024]{1,0}, f32[2048,1024]{1,0}) all-gather-start(p0), replica_groups={{0,1}}, dimensions={0}, frontend_attributes={_scheduling_group_id="42"}
     wrapped_add = f32[1024,1024]{1,0} fusion(p0, p1), kind=kLoop, calls=add_fn, frontend_attributes={_scheduling_group_id="42"}
-    agd0 = f32[2048,1024]{1,0} all-gather-done(ags0), frontend_attributes={_scheduling_group_id="42"}
+    agd0 = f32[2048,1024]{1,0} all-gather-done(ags0)
     ROOT tuple = (f32[1024,1024]{1,0}, f32[2048,1024]{1,0}) tuple(wrapped_add, agd0)
   }
   )";
