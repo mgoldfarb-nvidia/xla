@@ -168,12 +168,6 @@ struct SchedulerConfig {
   // pressure, aggressive_flexible_annotation_scheduling is not respected.
   bool force_delay_over_memory_pressure = false;
   float pgle_latency_scaling_factor = 1.0f;
-  // Proposal C1 (docs/lhs_pgle_baseline_improvements.md): when true, the
-  // priority comparator prefers scheduling independent compute candidates
-  // over starting another async collective whenever an async collective is
-  // currently in flight. Approximates the manual `window_target` effect
-  // without requiring per-workload textproto authoring.
-  bool fill_collective_windows = false;
   // If true, estimate the fragmentation size of the module by running the heap
   // simulator.
   bool estimate_fragmentation_size = false;

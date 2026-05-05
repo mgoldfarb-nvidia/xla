@@ -62,6 +62,7 @@ limitations under the License.
 #include "xla/service/gpu/flag_utils.h"
 #include "xla/service/gpu/gpu_latency_hiding_scheduler.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
+#include "xla/service/gpu/auto_window_target.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/gpu/pgle_force_async.h"
 #include "xla/service/gpu/model/analytical_latency_estimator.h"
@@ -672,14 +673,18 @@ absl::Status RunLatencyHidingSchedulerPasses(
   // cost exceeds `xla_gpu_pgle_force_async_threshold_us`. Default 0 = no-op.
   // Must run after LegalizeSchedulingAnnotations (so A1's singleton drops
   // have settled) and before the main LHS pass (which consumes is_sync).
+  std::optional<tensorflow::profiler::ProfiledInstructionsProto>
+      lhs_pre_pass_profile;
+  if (options.xla_gpu_pgle_force_async_threshold_us() > 0.0f ||
+      options.xla_gpu_lhs_auto_window_target_threshold_us() > 0.0f) {
+    lhs_pre_pass_profile = ReadPGLEProfile(module->config(), fingerprint);
+  }
   if (options.xla_gpu_pgle_force_async_threshold_us() > 0.0f) {
-    std::optional<tensorflow::profiler::ProfiledInstructionsProto>
-        force_async_profile = ReadPGLEProfile(module->config(), fingerprint);
-    if (force_async_profile.has_value()) {
+    if (lhs_pre_pass_profile.has_value()) {
       TF_ASSIGN_OR_RETURN(
           int n_flipped,
           ApplyPgleForceAsync(
-              module, *force_async_profile,
+              module, *lhs_pre_pass_profile,
               options.xla_gpu_pgle_force_async_threshold_us()));
       if (n_flipped > 0) {
         VLOG(1) << "B1 force-async: flipped " << n_flipped
@@ -692,16 +697,31 @@ absl::Status RunLatencyHidingSchedulerPasses(
     }
   }
 
+  // Proposal C3 (docs/lhs_pgle_baseline_improvements.md):
+  // Auto-window-target pass. For each high-cost async collective, picks
+  // safe-anchor compute ops and inserts control deps `start -> anchor ->
+  // done` via the existing CollectiveHintsAnnotatorPass. Default
+  // threshold = 0 (no-op).
+  if (options.xla_gpu_lhs_auto_window_target_threshold_us() > 0.0f) {
+    if (lhs_pre_pass_profile.has_value()) {
+      pipeline.AddPass<AutoWindowTargetPass>(
+          *lhs_pre_pass_profile,
+          options.xla_gpu_lhs_auto_window_target_threshold_us(),
+          options.xla_gpu_lhs_auto_window_target_min_compute_us(),
+          options.xla_gpu_lhs_auto_window_target_max_per_collective());
+    } else {
+      VLOG(1) << "C3 auto-window-target: threshold > 0 but no PGLE "
+                 "profile; skipping (would otherwise have no costs to "
+                 "rank by).";
+    }
+  }
+
   SchedulerConfig config = MakeGPUSchedulerConfig(
       memory_limit,
       options.xla_gpu_experimental_parallel_collective_overlap_limit(),
       options.xla_gpu_experimental_parallel_async_compute_limit());
   config.pgle_latency_scaling_factor =
       options.xla_gpu_pgle_latency_scaling_factor();
-  // Proposal C1 (docs/lhs_pgle_baseline_improvements.md): wire the
-  // fill-collective-windows flag through to the LHS priority comparator.
-  config.fill_collective_windows =
-      options.xla_gpu_lhs_fill_collective_windows();
 
   auto shape_size_in_bytes = ShapeSizeBytesFunction(pointer_size);
 

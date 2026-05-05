@@ -2687,6 +2687,7 @@ cc_library(
     hdrs = ["gpu_hlo_schedule.h"],
     deps = [
         ":alias_info",
+        ":auto_window_target",
         ":backend_configs_cc",
         ":collective_hints_annotator",
         ":flag_utils",
@@ -3510,6 +3511,46 @@ cc_library(
 tf_proto_library(
     name = "collective_hints_proto",
     srcs = ["collective_hints.proto"],
+)
+
+cc_library(
+    name = "auto_window_target",
+    srcs = ["auto_window_target.cc"],
+    hdrs = ["auto_window_target.h"],
+    deps = [
+        ":collective_hints_annotator",
+        ":collective_hints_proto_cc",
+        ":hlo_fusion_analysis",
+        ":ir_emission_utils",
+        "//xla/hlo/analysis:hlo_reachability",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass",
+        "//xla/hlo/utils:hlo_query",
+        "//xla/service:scheduling_annotations_util",
+        "//xla:side_effect_util",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@tsl//tsl/profiler/protobuf:profiled_instructions_proto_cc",
+    ],
+)
+
+xla_cc_test(
+    name = "auto_window_target_test",
+    srcs = ["auto_window_target_test.cc"],
+    deps = [
+        ":auto_window_target",
+        ":collective_hints_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+        "@tsl//tsl/profiler/protobuf:profiled_instructions_proto_cc",
+    ],
 )
 
 cc_library(

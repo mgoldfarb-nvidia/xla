@@ -1439,38 +1439,6 @@ class ReadySetLt {
     return true;
   }
 
-  // Proposal C1 (docs/lhs_pgle_baseline_improvements.md):
-  // Returns true if any async-collective resource currently has at least
-  // one occupier in flight (i.e., we are inside an async collective's
-  // start->done window). Used by the priority comparator to bias toward
-  // scheduling independent compute when something is already overlapping.
-  // The set of resources tracked in `resource_occupiers_in_flight` is
-  // populated by the async tracker and is dominated by comm resources in
-  // practice; treating any non-empty entry as "in flight" is a safe
-  // approximation (and the C1 flag is off by default, opt-in).
-  inline bool AnyAsyncCollectiveInFlight() const {
-    for (const auto& [resource, occupiers] :
-         sched_state_.resource_occupiers_in_flight) {
-      if (!occupiers.empty()) return true;
-    }
-    return false;
-  }
-
-  // Proposal C1: returns 1 for "compute" candidates (not async-start, not
-  // async-done) and 0 for collective-start/done candidates. Higher value
-  // wins in CMP_EXPLICIT.
-  static inline int FillWindowPreference(const HloGraphNode* node) {
-    HloOpcode op = node->GetInstr().opcode();
-    // De-prefer scheduling another collective-start when one is in flight;
-    // prefer compute. We treat async-start as "not preferred".
-    if (op == HloOpcode::kAsyncStart || op == HloOpcode::kAllReduceStart ||
-        op == HloOpcode::kAllGatherStart ||
-        op == HloOpcode::kCollectivePermuteStart ||
-        op == HloOpcode::kSend || op == HloOpcode::kRecv) {
-      return 0;
-    }
-    return 1;
-  }
 
   inline std::optional<bool> IsValuableForSelectiveOverlap(
       DefaultSchedulerCore::ScheduleCandidate& a,
@@ -1588,20 +1556,6 @@ class ReadySetLt {
       // early target scheduling rule.
       CMP_EXPLICIT(!an->GetForceDelayAfterTarget(),
                    !bn->GetForceDelayAfterTarget(), "kForceDelayAfterTarget");
-    }
-
-    // Proposal C1 (docs/lhs_pgle_baseline_improvements.md):
-    // When fill_collective_windows is enabled and a collective is already
-    // in flight, prefer compute candidates over starting another
-    // collective. This approximates the manual `window_target` effect
-    // (controlling where compute lands relative to in-flight collectives)
-    // without per-workload textproto authoring. Pure tie-breaker: only
-    // affects priority among instructions whose dependencies are already
-    // satisfied; never changes ordering legality.
-    if (ABSL_PREDICT_FALSE(config.fill_collective_windows) &&
-        AnyAsyncCollectiveInFlight()) {
-      CMP_EXPLICIT(FillWindowPreference(an), FillWindowPreference(bn),
-                   "kFillCollectiveWindow");
     }
 
     // Some heuristic that try to prioritize unlocking "done" instructions

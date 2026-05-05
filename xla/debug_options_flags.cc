@@ -284,7 +284,9 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_gpu_pgle_force_async_threshold_us(0.0f);  // B1: off by default
   opts.set_xla_gpu_lhs_drop_singleton_gids(true);        // A1: bug-fix; on
   opts.set_xla_gpu_lhs_unprofiled_latency_model(false);  // A2: off by default
-  opts.set_xla_gpu_lhs_fill_collective_windows(false);   // C1: off by default
+  opts.set_xla_gpu_lhs_auto_window_target_threshold_us(0.0f);  // C3: off
+  opts.set_xla_gpu_lhs_auto_window_target_min_compute_us(50.0f);
+  opts.set_xla_gpu_lhs_auto_window_target_max_per_collective(4);
 
   opts.set_xla_gpu_enable_reassociation_for_converted_ar(true);
 
@@ -1821,13 +1823,33 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       "latency from shape + bytes + replica-group size instead of falling "
       "back to flat kHighLatency=5000 cycles. Default false (off)."));
   flag_list->push_back(tsl::Flag(
-      "xla_gpu_lhs_fill_collective_windows",
-      bool_setter_for(
-          &DebugOptions::set_xla_gpu_lhs_fill_collective_windows),
-      debug_options->xla_gpu_lhs_fill_collective_windows(),
-      "Proposal C1. Bias LHS's priority comparator to prefer scheduling "
-      "independent compute when an async collective is currently in flight. "
-      "Default false (off)."));
+      "xla_gpu_lhs_auto_window_target_threshold_us",
+      float_setter_for(
+          &DebugOptions::set_xla_gpu_lhs_auto_window_target_threshold_us),
+      debug_options->xla_gpu_lhs_auto_window_target_threshold_us(),
+      "Proposal C3. Programmatic version of `_xla_window_target` rules. "
+      "Collectives with PGLE-recorded cost above this threshold (us) become "
+      "candidates for auto-pinning: a pre-pass picks safe-anchor compute ops "
+      "(eligible opcode + same computation + operand-tree independent + "
+      "after the start in schedule order) and inserts control deps "
+      "`start -> anchor -> done` via the existing CollectiveHintsAnnotatorPass. "
+      "0 disables the pass (default). Suggested opt-in: 100."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_lhs_auto_window_target_min_compute_us",
+      float_setter_for(
+          &DebugOptions::set_xla_gpu_lhs_auto_window_target_min_compute_us),
+      debug_options->xla_gpu_lhs_auto_window_target_min_compute_us(),
+      "Proposal C3. Minimum PGLE cost (us) for a compute op to be considered "
+      "as an auto-window-target anchor. Below this, the anchor is too small "
+      "to usefully fill a collective window. Default 50."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_lhs_auto_window_target_max_per_collective",
+      int32_setter_for(
+          &DebugOptions::set_xla_gpu_lhs_auto_window_target_max_per_collective),
+      debug_options->xla_gpu_lhs_auto_window_target_max_per_collective(),
+      "Proposal C3. Cap on anchors pinned per collective by the auto-"
+      "window-target pass. Limits dependency-graph blowup when a collective "
+      "has many eligible candidates. Default 4."));
   flag_list->push_back(tsl::Flag(
       "xla_gpu_experimental_enable_collective_multi_streaming",
       bool_setter_for(

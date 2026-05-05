@@ -112,6 +112,10 @@ absl::Status RunSimulator(const std::string& hlo_input,
                           float pgle_latency_scaling_factor,
                           int64_t parallel_collective_overlap_limit,
                           int64_t parallel_async_compute_limit,
+                          float pgle_force_async_threshold_us,
+                          float auto_window_target_threshold_us,
+                          float auto_window_target_min_compute_us,
+                          int32_t auto_window_target_max_per_collective,
                           const std::string& output_path,
                           const std::string& output_format,
                           int64_t pointer_size,
@@ -156,6 +160,25 @@ absl::Status RunSimulator(const std::string& hlo_input,
         parallel_async_compute_limit);
     std::cerr << "Set xla_gpu_experimental_parallel_async_compute_limit="
               << parallel_async_compute_limit << "\n";
+  }
+  if (pgle_force_async_threshold_us > 0.0f) {
+    debug_opts.set_xla_gpu_pgle_force_async_threshold_us(
+        pgle_force_async_threshold_us);
+    std::cerr << "Set xla_gpu_pgle_force_async_threshold_us="
+              << pgle_force_async_threshold_us << "\n";
+  }
+  if (auto_window_target_threshold_us > 0.0f) {
+    debug_opts.set_xla_gpu_lhs_auto_window_target_threshold_us(
+        auto_window_target_threshold_us);
+    debug_opts.set_xla_gpu_lhs_auto_window_target_min_compute_us(
+        auto_window_target_min_compute_us);
+    debug_opts.set_xla_gpu_lhs_auto_window_target_max_per_collective(
+        auto_window_target_max_per_collective);
+    std::cerr << "Set xla_gpu_lhs_auto_window_target_threshold_us="
+              << auto_window_target_threshold_us
+              << " min_compute=" << auto_window_target_min_compute_us
+              << " max_per_collective="
+              << auto_window_target_max_per_collective << "\n";
   }
   // Force LHS on; some serialized HLO modules have it disabled.
   debug_opts.set_xla_gpu_enable_latency_hiding_scheduler(true);
@@ -258,6 +281,10 @@ int main(int argc, char** argv) {
   float pgle_latency_scaling_factor = 1.0f;
   int64_t parallel_collective_overlap_limit = 0;  // 0 = leave unchanged
   int64_t parallel_async_compute_limit = 0;       // 0 = leave unchanged
+  float pgle_force_async_threshold_us = 0.0f;     // 0 = B1 disabled
+  float auto_window_target_threshold_us = 0.0f;   // 0 = C3 disabled
+  float auto_window_target_min_compute_us = 50.0f;
+  int32_t auto_window_target_max_per_collective = 4;
   std::string output_path;
   std::string output_format = "hlo";
   int64_t pointer_size = 8;
@@ -291,6 +318,25 @@ int main(int argc, char** argv) {
                 &parallel_async_compute_limit,
                 "Override xla_gpu_experimental_parallel_async_compute_limit "
                 "(default 2). Caps concurrent async-compute slots."),
+      tsl::Flag("pgle_force_async_threshold_us",
+                &pgle_force_async_threshold_us,
+                "Proposal B1: PGLE-informed force-async threshold (us). "
+                "Collectives with PGLE cost above this value have is_sync "
+                "flipped to false before LHS runs. 0 (default) disables. "
+                "Suggested opt-in: 100."),
+      tsl::Flag("auto_window_target_threshold_us",
+                &auto_window_target_threshold_us,
+                "Proposal C3: auto-window-target threshold (us). Collectives "
+                "with PGLE cost above this value get safe-anchor compute ops "
+                "auto-pinned into their window via control deps. 0 (default) "
+                "disables. Suggested opt-in: 100."),
+      tsl::Flag("auto_window_target_min_compute_us",
+                &auto_window_target_min_compute_us,
+                "Proposal C3: minimum PGLE cost (us) for a compute op to be "
+                "considered as an auto-pinned anchor. Default 50."),
+      tsl::Flag("auto_window_target_max_per_collective",
+                &auto_window_target_max_per_collective,
+                "Proposal C3: max anchors pinned per collective. Default 4."),
       tsl::Flag("output", &output_path,
                 "Output path for scheduled HLO (default: stdout)"),
       tsl::Flag("output_format", &output_format,
@@ -316,7 +362,9 @@ int main(int argc, char** argv) {
   absl::Status status = xla::gpu::RunSimulator(
       hlo_input, target_config, hints_file, pgle_profile,
       pgle_latency_scaling_factor, parallel_collective_overlap_limit,
-      parallel_async_compute_limit, output_path, output_format,
+      parallel_async_compute_limit, pgle_force_async_threshold_us,
+      auto_window_target_threshold_us, auto_window_target_min_compute_us,
+      auto_window_target_max_per_collective, output_path, output_format,
       pointer_size, strip_existing_annotations);
   if (!status.ok()) {
     std::cerr << "ERROR: " << status << "\n";
