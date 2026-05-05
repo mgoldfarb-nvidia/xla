@@ -287,6 +287,7 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_gpu_lhs_auto_window_target_threshold_us(0.0f);  // C3: off
   opts.set_xla_gpu_lhs_auto_window_target_min_compute_us(50.0f);
   opts.set_xla_gpu_lhs_auto_window_target_max_per_collective(4);
+  opts.set_xla_gpu_lhs_auto_window_target_max_total_rules(16);  // safety cap
 
   opts.set_xla_gpu_enable_reassociation_for_converted_ar(true);
 
@@ -1850,6 +1851,17 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       "Proposal C3. Cap on anchors pinned per collective by the auto-"
       "window-target pass. Limits dependency-graph blowup when a collective "
       "has many eligible candidates. Default 4."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_lhs_auto_window_target_max_total_rules",
+      int32_setter_for(
+          &DebugOptions::set_xla_gpu_lhs_auto_window_target_max_total_rules),
+      debug_options->xla_gpu_lhs_auto_window_target_max_total_rules(),
+      "Proposal C3 (Option 1 safety cap). Maximum number of anchor rules "
+      "C3 emits per compile. Beyond this cap, lower-priority rules (lower "
+      "PGLE cost) are dropped. Acts as a coarse safety guard against the "
+      "LHS `kExceedsOverlapLimit` failure mode that can occur when many "
+      "control deps over-constrain LHS's overlap_limit. Default 16. If "
+      "LHS still fails, lower this cap or raise threshold_us."));
   flag_list->push_back(tsl::Flag(
       "xla_gpu_experimental_enable_collective_multi_streaming",
       bool_setter_for(

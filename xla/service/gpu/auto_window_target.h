@@ -62,20 +62,29 @@ namespace xla::gpu {
 // PGLE profile. Exposed for direct unit testing of the selection logic.
 // The returned config has zero rules if `threshold_us <= 0` or no
 // candidates qualify.
+//
+// `max_total_rules`: safety cap on total rules emitted (across all
+// collectives in the module). Rules are emitted in priority order
+// (PGLE-cost-descending across collectives, then within each collective
+// the highest-cost anchors first); the lowest-priority rules are dropped
+// when the cap is hit. Set to <=0 to disable the cap.
 absl::StatusOr<CollectiveHintsConfig> BuildAutoWindowTargetConfig(
     const HloModule& module,
     const tensorflow::profiler::ProfiledInstructionsProto& profile,
-    float threshold_us, float min_compute_us, int max_per_collective);
+    float threshold_us, float min_compute_us, int max_per_collective,
+    int max_total_rules);
 
 class AutoWindowTargetPass : public HloModulePass {
  public:
   AutoWindowTargetPass(
       tensorflow::profiler::ProfiledInstructionsProto profile,
-      float threshold_us, float min_compute_us, int max_per_collective)
+      float threshold_us, float min_compute_us, int max_per_collective,
+      int max_total_rules)
       : profile_(std::move(profile)),
         threshold_us_(threshold_us),
         min_compute_us_(min_compute_us),
-        max_per_collective_(max_per_collective) {}
+        max_per_collective_(max_per_collective),
+        max_total_rules_(max_total_rules) {}
 
   absl::string_view name() const override { return "auto-window-target"; }
 
@@ -89,6 +98,7 @@ class AutoWindowTargetPass : public HloModulePass {
   float threshold_us_;
   float min_compute_us_;
   int max_per_collective_;
+  int max_total_rules_;
 };
 
 }  // namespace xla::gpu

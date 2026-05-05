@@ -83,11 +83,15 @@ const HloInstruction* FindMatchingDone(const HloInstruction* start) {
 absl::StatusOr<CollectiveHintsConfig> BuildAutoWindowTargetConfig(
     const HloModule& module,
     const tensorflow::profiler::ProfiledInstructionsProto& profile,
-    float threshold_us, float min_compute_us, int max_per_collective) {
+    float threshold_us, float min_compute_us, int max_per_collective,
+    int max_total_rules) {
   CollectiveHintsConfig config;
   if (threshold_us <= 0.0f) {
     return config;  // Disabled.
   }
+  // Track total rule count for the safety cap. <=0 means no cap.
+  int total_rules_emitted = 0;
+  const bool cap_active = max_total_rules > 0;
 
   // Build PGLE name -> cost map.
   absl::flat_hash_map<std::string, double> cost_by_name;
@@ -228,9 +232,14 @@ absl::StatusOr<CollectiveHintsConfig> BuildAutoWindowTargetConfig(
       // Greedy fill until cumulative >= collective cost OR cap.
       double cumulative = 0.0;
       int picked = 0;
+      bool hit_total_cap = false;
       for (const Cand& c : candidates) {
         if (picked >= max_per_collective) break;
         if (cumulative >= coll_cost) break;
+        if (cap_active && total_rules_emitted >= max_total_rules) {
+          hit_total_cap = true;
+          break;
+        }
         // Emit a window_target rule into the auto-config.
         CollectiveHint* h_anchor = config.add_hints();
         h_anchor->set_name(c.instr->name());
@@ -239,16 +248,28 @@ absl::StatusOr<CollectiveHintsConfig> BuildAutoWindowTargetConfig(
         claimed.insert(c.instr);
         cumulative += c.cost_us;
         ++picked;
+        ++total_rules_emitted;
 
         VLOG(2) << "AutoWindowTarget: pinned '" << c.instr->name()
                 << "' (" << c.cost_us << " us) into '" << coll->name()
                 << "'s window (cumulative " << cumulative << "/"
                 << coll_cost << " us)";
       }
+      if (hit_total_cap) {
+        LOG(INFO) << "AutoWindowTarget: hit max_total_rules cap of "
+                  << max_total_rules << "; stopping rule emission. Lower-"
+                  << "priority candidates dropped. Raise the cap with "
+                  << "`--xla_gpu_lhs_auto_window_target_max_total_rules` "
+                  << "if you have headroom against LHS overlap_limit.";
+        break;  // out of the per-computation collective loop
+      }
       if (picked == 0) {
         VLOG(1) << "AutoWindowTarget: no eligible anchors found for '"
                 << coll->name() << "' (cost " << coll_cost << " us)";
       }
+    }
+    if (cap_active && total_rules_emitted >= max_total_rules) {
+      break;  // out of the computation loop
     }
   }
 
@@ -265,7 +286,8 @@ absl::StatusOr<bool> AutoWindowTargetPass::RunImpl(
   TF_ASSIGN_OR_RETURN(
       CollectiveHintsConfig auto_config,
       BuildAutoWindowTargetConfig(*module, profile_, threshold_us_,
-                                   min_compute_us_, max_per_collective_));
+                                   min_compute_us_, max_per_collective_,
+                                   max_total_rules_));
 
   if (auto_config.hints_size() == 0) {
     VLOG(1) << "AutoWindowTargetPass: no auto-pin opportunities found "

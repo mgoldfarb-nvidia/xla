@@ -59,7 +59,8 @@ TEST_F(AutoWindowTargetTest, ThresholdZeroIsNoOp) {
       BuildAutoWindowTargetConfig(*hlo_module, profile,
                                    /*threshold_us=*/0.0f,
                                    /*min_compute_us=*/50.0f,
-                                   /*max_per_collective=*/4));
+                                   /*max_per_collective=*/4,
+                                   /*max_total_rules=*/0));
   EXPECT_EQ(cfg.hints_size(), 0);
 }
 
@@ -86,7 +87,8 @@ TEST_F(AutoWindowTargetTest, EmitsRuleForEligibleAnchor) {
       BuildAutoWindowTargetConfig(*hlo_module, profile,
                                    /*threshold_us=*/100.0f,
                                    /*min_compute_us=*/50.0f,
-                                   /*max_per_collective=*/4));
+                                   /*max_per_collective=*/4,
+                                   /*max_total_rules=*/0));
   ASSERT_EQ(cfg.hints_size(), 1);
   EXPECT_EQ(cfg.hints(0).name(), "cc");
   ASSERT_EQ(cfg.hints(0).window_target_size(), 1);
@@ -120,7 +122,8 @@ TEST_F(AutoWindowTargetTest, AcceptsIndependentAnchorRegardlessOfPosition) {
       BuildAutoWindowTargetConfig(*hlo_module, profile,
                                    /*threshold_us=*/100.0f,
                                    /*min_compute_us=*/50.0f,
-                                   /*max_per_collective=*/4));
+                                   /*max_per_collective=*/4,
+                                   /*max_total_rules=*/0));
   ASSERT_EQ(cfg.hints_size(), 1);
   EXPECT_EQ(cfg.hints(0).name(), "cc");
   EXPECT_EQ(cfg.hints(0).window_target(0), "ag");
@@ -149,7 +152,8 @@ TEST_F(AutoWindowTargetTest, RejectsDataflowDescendant) {
       BuildAutoWindowTargetConfig(*hlo_module, profile,
                                    /*threshold_us=*/100.0f,
                                    /*min_compute_us=*/50.0f,
-                                   /*max_per_collective=*/4));
+                                   /*max_per_collective=*/4,
+                                   /*max_total_rules=*/0));
   EXPECT_EQ(cfg.hints_size(), 0);
 }
 
@@ -181,7 +185,8 @@ TEST_F(AutoWindowTargetTest, RejectsIneligibleOpcode) {
       BuildAutoWindowTargetConfig(*hlo_module, profile,
                                    /*threshold_us=*/100.0f,
                                    /*min_compute_us=*/50.0f,
-                                   /*max_per_collective=*/4));
+                                   /*max_per_collective=*/4,
+                                   /*max_total_rules=*/0));
   EXPECT_EQ(cfg.hints_size(), 0);
 }
 
@@ -208,7 +213,8 @@ TEST_F(AutoWindowTargetTest, RejectsTooSmallAnchor) {
       BuildAutoWindowTargetConfig(*hlo_module, profile,
                                    /*threshold_us=*/100.0f,
                                    /*min_compute_us=*/50.0f,
-                                   /*max_per_collective=*/4));
+                                   /*max_per_collective=*/4,
+                                   /*max_total_rules=*/0));
   EXPECT_EQ(cfg.hints_size(), 0);
 }
 
@@ -248,7 +254,8 @@ TEST_F(AutoWindowTargetTest, GreedyFillStopsAtCumulativeCost) {
       BuildAutoWindowTargetConfig(*hlo_module, profile,
                                    /*threshold_us=*/40.0f,
                                    /*min_compute_us=*/10.0f,
-                                   /*max_per_collective=*/10));
+                                   /*max_per_collective=*/10,
+                                   /*max_total_rules=*/0));
   // Picks 2 because 30 + 30 = 60 >= 50 (cumulative >= collective).
   EXPECT_EQ(cfg.hints_size(), 2);
 }
@@ -289,7 +296,8 @@ TEST_F(AutoWindowTargetTest, MaxPerCollectiveCaps) {
       BuildAutoWindowTargetConfig(*hlo_module, profile,
                                    /*threshold_us=*/100.0f,
                                    /*min_compute_us=*/40.0f,
-                                   /*max_per_collective=*/3));
+                                   /*max_per_collective=*/3,
+                                   /*max_total_rules=*/0));
   EXPECT_EQ(cfg.hints_size(), 3);
 }
 
@@ -318,7 +326,8 @@ TEST_F(AutoWindowTargetTest, SkipsAlreadyClaimedAnchor) {
       BuildAutoWindowTargetConfig(*hlo_module, profile,
                                    /*threshold_us=*/100.0f,
                                    /*min_compute_us=*/50.0f,
-                                   /*max_per_collective=*/4));
+                                   /*max_per_collective=*/4,
+                                   /*max_total_rules=*/0));
   EXPECT_EQ(cfg.hints_size(), 0);
 }
 
@@ -347,7 +356,8 @@ TEST_F(AutoWindowTargetTest, SkipsAlreadyPairedCollective) {
       BuildAutoWindowTargetConfig(*hlo_module, profile,
                                    /*threshold_us=*/100.0f,
                                    /*min_compute_us=*/50.0f,
-                                   /*max_per_collective=*/4));
+                                   /*max_per_collective=*/4,
+                                   /*max_total_rules=*/0));
   EXPECT_EQ(cfg.hints_size(), 0);
 }
 
@@ -379,14 +389,86 @@ TEST_F(AutoWindowTargetTest, DeterministicTieBreak) {
 
   TF_ASSERT_OK_AND_ASSIGN(
       CollectiveHintsConfig c1,
-      BuildAutoWindowTargetConfig(*m1, profile, 100.0f, 50.0f, 1));
+      BuildAutoWindowTargetConfig(*m1, profile, 100.0f, 50.0f, 1,
+                                   /*max_total_rules=*/0));
   TF_ASSERT_OK_AND_ASSIGN(
       CollectiveHintsConfig c2,
-      BuildAutoWindowTargetConfig(*m2, profile, 100.0f, 50.0f, 1));
+      BuildAutoWindowTargetConfig(*m2, profile, 100.0f, 50.0f, 1,
+                                   /*max_total_rules=*/0));
   ASSERT_EQ(c1.hints_size(), 1);
   ASSERT_EQ(c2.hints_size(), 1);
   EXPECT_EQ(c1.hints(0).name(), "cc1");
   EXPECT_EQ(c2.hints(0).name(), "cc1");
+}
+
+// Option 1 safety cap: max_total_rules limits the total number of
+// window_target rules emitted across all collectives. Highest-priority
+// (cost-descending) collectives keep their rules; lower-priority ones
+// get dropped.
+TEST_F(AutoWindowTargetTest, MaxTotalRulesCapsAcrossCollectives) {
+  constexpr absl::string_view hlo_string = R"(
+    HloModule test
+    ENTRY entry {
+      p0 = f32[1024,1024]{1,0} parameter(0)
+      p1 = f32[2048]{0} parameter(1)
+      // Three independent collectives. ag_big (1000us) is the priority
+      // pick because it has the largest PGLE cost.
+      ag_big = (f32[1024,1024]{1,0}, f32[2048,1024]{1,0})
+          all-gather-start(p0), replica_groups={{0,1}}, dimensions={0}
+      ag_mid = (f32[1024,1024]{1,0}, f32[2048,1024]{1,0})
+          all-gather-start(p0), replica_groups={{0,1}}, dimensions={0}
+      ag_small = (f32[1024,1024]{1,0}, f32[2048,1024]{1,0})
+          all-gather-start(p0), replica_groups={{0,1}}, dimensions={0}
+      cc1 = f32[2048]{0} custom-call(p1), custom_call_target="op1"
+      cc2 = f32[2048]{0} custom-call(p1), custom_call_target="op2"
+      cc3 = f32[2048]{0} custom-call(p1), custom_call_target="op3"
+      d_big = f32[2048,1024]{1,0} all-gather-done(ag_big)
+      d_mid = f32[2048,1024]{1,0} all-gather-done(ag_mid)
+      d_small = f32[2048,1024]{1,0} all-gather-done(ag_small)
+      ROOT t = (f32[2048,1024]{1,0}, f32[2048,1024]{1,0},
+                f32[2048,1024]{1,0}, f32[2048]{0}, f32[2048]{0},
+                f32[2048]{0})
+          tuple(d_big, d_mid, d_small, cc1, cc2, cc3)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> hlo_module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  auto profile = MakeProfile({
+      {"ag_big", 1000.0}, {"ag_mid", 800.0}, {"ag_small", 600.0},
+      {"cc1", 100.0}, {"cc2", 100.0}, {"cc3", 100.0},
+  });
+
+  // Without cap: each collective gets 1 anchor (max_per_collective=1) =>
+  // 3 rules total.
+  TF_ASSERT_OK_AND_ASSIGN(
+      CollectiveHintsConfig uncapped,
+      BuildAutoWindowTargetConfig(*hlo_module, profile,
+                                   /*threshold_us=*/100.0f,
+                                   /*min_compute_us=*/50.0f,
+                                   /*max_per_collective=*/1,
+                                   /*max_total_rules=*/0));
+  EXPECT_EQ(uncapped.hints_size(), 3);
+
+  // With cap=2: only the two heaviest collectives (ag_big, ag_mid) get
+  // rules; ag_small (lowest priority) is dropped.
+  TF_ASSERT_OK_AND_ASSIGN(
+      CollectiveHintsConfig capped,
+      BuildAutoWindowTargetConfig(*hlo_module, profile,
+                                   /*threshold_us=*/100.0f,
+                                   /*min_compute_us=*/50.0f,
+                                   /*max_per_collective=*/1,
+                                   /*max_total_rules=*/2));
+  EXPECT_EQ(capped.hints_size(), 2);
+
+  // Negative cap disables it (same as 0).
+  TF_ASSERT_OK_AND_ASSIGN(
+      CollectiveHintsConfig disabled_cap,
+      BuildAutoWindowTargetConfig(*hlo_module, profile,
+                                   /*threshold_us=*/100.0f,
+                                   /*min_compute_us=*/50.0f,
+                                   /*max_per_collective=*/1,
+                                   /*max_total_rules=*/-1));
+  EXPECT_EQ(disabled_cap.hints_size(), 3);
 }
 
 }  // namespace

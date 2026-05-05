@@ -708,7 +708,8 @@ absl::Status RunLatencyHidingSchedulerPasses(
           *lhs_pre_pass_profile,
           options.xla_gpu_lhs_auto_window_target_threshold_us(),
           options.xla_gpu_lhs_auto_window_target_min_compute_us(),
-          options.xla_gpu_lhs_auto_window_target_max_per_collective());
+          options.xla_gpu_lhs_auto_window_target_max_per_collective(),
+          options.xla_gpu_lhs_auto_window_target_max_total_rules());
     } else {
       VLOG(1) << "C3 auto-window-target: threshold > 0 but no PGLE "
                  "profile; skipping (would otherwise have no costs to "

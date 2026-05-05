@@ -116,6 +116,7 @@ absl::Status RunSimulator(const std::string& hlo_input,
                           float auto_window_target_threshold_us,
                           float auto_window_target_min_compute_us,
                           int32_t auto_window_target_max_per_collective,
+                          int32_t auto_window_target_max_total_rules,
                           const std::string& output_path,
                           const std::string& output_format,
                           int64_t pointer_size,
@@ -174,11 +175,15 @@ absl::Status RunSimulator(const std::string& hlo_input,
         auto_window_target_min_compute_us);
     debug_opts.set_xla_gpu_lhs_auto_window_target_max_per_collective(
         auto_window_target_max_per_collective);
+    debug_opts.set_xla_gpu_lhs_auto_window_target_max_total_rules(
+        auto_window_target_max_total_rules);
     std::cerr << "Set xla_gpu_lhs_auto_window_target_threshold_us="
               << auto_window_target_threshold_us
               << " min_compute=" << auto_window_target_min_compute_us
               << " max_per_collective="
-              << auto_window_target_max_per_collective << "\n";
+              << auto_window_target_max_per_collective
+              << " max_total_rules="
+              << auto_window_target_max_total_rules << "\n";
   }
   // Force LHS on; some serialized HLO modules have it disabled.
   debug_opts.set_xla_gpu_enable_latency_hiding_scheduler(true);
@@ -285,6 +290,7 @@ int main(int argc, char** argv) {
   float auto_window_target_threshold_us = 0.0f;   // 0 = C3 disabled
   float auto_window_target_min_compute_us = 50.0f;
   int32_t auto_window_target_max_per_collective = 4;
+  int32_t auto_window_target_max_total_rules = 16;  // safety cap
   std::string output_path;
   std::string output_format = "hlo";
   int64_t pointer_size = 8;
@@ -337,6 +343,16 @@ int main(int argc, char** argv) {
       tsl::Flag("auto_window_target_max_per_collective",
                 &auto_window_target_max_per_collective,
                 "Proposal C3: max anchors pinned per collective. Default 4."),
+      tsl::Flag("auto_window_target_max_total_rules",
+                &auto_window_target_max_total_rules,
+                "Proposal C3 safety cap: maximum total window_target rules "
+                "emitted per pass invocation (across all collectives). Rules "
+                "are emitted in priority order (heaviest collective first); "
+                "lower-priority rules are dropped when the cap is hit. Use "
+                "this to keep the resulting concurrent-collective count below "
+                "LHS's parallel_collective_overlap_limit and avoid "
+                "kExceedsOverlapLimit deadlock. Default 16; set <=0 to "
+                "disable. Tune jointly with overlap_limit."),
       tsl::Flag("output", &output_path,
                 "Output path for scheduled HLO (default: stdout)"),
       tsl::Flag("output_format", &output_format,
@@ -364,7 +380,8 @@ int main(int argc, char** argv) {
       pgle_latency_scaling_factor, parallel_collective_overlap_limit,
       parallel_async_compute_limit, pgle_force_async_threshold_us,
       auto_window_target_threshold_us, auto_window_target_min_compute_us,
-      auto_window_target_max_per_collective, output_path, output_format,
+      auto_window_target_max_per_collective,
+      auto_window_target_max_total_rules, output_path, output_format,
       pointer_size, strip_existing_annotations);
   if (!status.ok()) {
     std::cerr << "ERROR: " << status << "\n";

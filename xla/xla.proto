@@ -1585,6 +1585,18 @@ message DebugOptions {
   // blowup when a collective has many eligible candidates.
   optional int32 xla_gpu_lhs_auto_window_target_max_per_collective = 513;
 
+  // Cap on TOTAL anchor rules emitted per pass invocation. Safety guard
+  // for the LHS overlap_limit interaction: with many control deps across
+  // many collectives, LHS's `FindAndExtractBestNodeAvailable` can fail
+  // with `kExceedsOverlapLimit`. C3 has no way to detect this at rule-
+  // emission time, so this cap acts as a coarse upper bound. Emit
+  // collectives in PGLE-cost-descending order so the highest-impact
+  // rules are kept; lower-priority rules are dropped at the cap.
+  // Empirically on `module_43775`, ~13 rules at threshold=8000us is
+  // safe; 21+ rules at threshold=5000us has been observed to deadlock.
+  // Default 16 (defensively below the empirical safe ceiling).
+  optional int32 xla_gpu_lhs_auto_window_target_max_total_rules = 514;
+
   // Fields 507 (formerly A4 - compute_scaling_factor; investigation showed
   // PGLE per-instance cost is accurate) and 510 (formerly C1 -
   // xla_gpu_lhs_fill_collective_windows; priority bias is structurally
