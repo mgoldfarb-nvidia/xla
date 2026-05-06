@@ -362,7 +362,6 @@ absl::StatusOr<bool> CollectiveHintsAnnotatorPass::RunImpl(
         std::string latency_metadata;
         bool force_earliest = false;
         std::string scheduling_group_id;
-        int32_t stream_id = 0;
         int32_t sequence_id = 0;   // 0 = not batched
         std::vector<std::string> window_target;  // empty = none
       } merged;
@@ -377,9 +376,10 @@ absl::StatusOr<bool> CollectiveHintsAnnotatorPass::RunImpl(
         if (!hint->scheduling_group_id().empty()) {
           merged.scheduling_group_id = hint->scheduling_group_id();
         }
-        if (hint->stream_id() != 0) {
-          merged.stream_id = hint->stream_id();
-        }
+        // stream_id (proto field 6) is deprecated and the producer was
+        // removed when kGpuAsyncStreamCollectives0/1 was retired. The
+        // proto field is kept for back-compat textproto parsing; setting
+        // it now is a no-op.
         if (hint->sequence_id() > 0) {
           merged.sequence_id = hint->sequence_id();
         }
@@ -429,12 +429,6 @@ absl::StatusOr<bool> CollectiveHintsAnnotatorPass::RunImpl(
         instr->add_frontend_attribute("_scheduling_group_id",
                                       merged.scheduling_group_id);
         VLOG(2) << "  -> _scheduling_group_id=" << merged.scheduling_group_id;
-        any_attr = true;
-      }
-      if (merged.stream_id != 0) {
-        instr->add_frontend_attribute("_xla_stream_annotation",
-                                      absl::StrCat(merged.stream_id));
-        VLOG(2) << "  -> _xla_stream_annotation=" << merged.stream_id;
         any_attr = true;
       }
       // window_target: only meaningful on compute ops. The matched async-start

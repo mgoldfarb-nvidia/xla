@@ -482,28 +482,6 @@ void GpuAsyncTrackerBase::PostProcessScheduleGraph(
 GpuAsyncTracker::GpuAsyncTracker(const SchedulerConfig& config)
     : GpuAsyncTrackerBase(config) {}
 
-// Returns the per-stream resource for a collective with _xla_stream_annotation
-// pointing to one of the collective multi-streams, or nullopt if not annotated
-// or the annotation is out of range.
-static std::optional<GpuResourceType> GetAnnotatedCollectiveStreamResource(
-    const HloInstruction& instr) {
-  const HloInstruction& start_instr =
-      GpuGetCanonicalAsyncOp(instr).outer == HloOpcode::kAsyncDone
-          ? *instr.operand(0)
-          : instr;
-  auto& attrs = start_instr.frontend_attributes().map();
-  auto it = attrs.find(kXlaStreamAnnotationAttr);
-  if (it == attrs.end()) return std::nullopt;
-  int32_t stream_id;
-  if (!absl::SimpleAtoi(it->second, &stream_id)) return std::nullopt;
-  // Collective streams begin at kNumComputeStreams+1 (e.g. 5 and 6 when
-  // kNumComputeStreams=4).
-  int idx = stream_id - (static_cast<int>(kNumComputeStreams) + 1);
-  if (idx == 0) return GpuResourceType::kGpuAsyncStreamCollectives0;
-  if (idx == 1) return GpuResourceType::kGpuAsyncStreamCollectives1;
-  return std::nullopt;
-}
-
 static bool IsAnnotatedForGpuAsyncStreamCollectivesP2P(
     const HloInstruction& instr) {
   const HloInstruction& start_instr =
@@ -545,15 +523,20 @@ ResourcesVector GpuAsyncTracker::GetResourcesFromInstructionImpl(
   // collective stream resource for one scheduling step. This blocks LHS
   // from co-scheduling them with another collective at the same dispatch
   // tick and forces them to serialize against in-flight async collectives
-  // through the overlap-limit counter.
+  // through the overlap-limit counter. Emits occupy+release for both the
+  // generic collective stream and the P2P collective stream so the
+  // marker competes with any native collective regardless of which
+  // bucket LHS routes it to.
   if (IsKnownCollectiveCustomCall(instr)) {
     ResourcesVector r;
-    r.push_back(std::make_pair(
-        ResourceTypeToIndex(GpuResourceType::kGpuAsyncStreamCollectives),
-        ResourceUsageType::kResourceOccupy));
-    r.push_back(std::make_pair(
-        ResourceTypeToIndex(GpuResourceType::kGpuAsyncStreamCollectives),
-        ResourceUsageType::kResourceRelease));
+    auto add_bucket = [&](GpuResourceType t) {
+      r.push_back(std::make_pair(ResourceTypeToIndex(t),
+                                 ResourceUsageType::kResourceOccupy));
+      r.push_back(std::make_pair(ResourceTypeToIndex(t),
+                                 ResourceUsageType::kResourceRelease));
+    };
+    add_bucket(GpuResourceType::kGpuAsyncStreamCollectives);
+    add_bucket(GpuResourceType::kGpuAsyncStreamCollectivesP2P);
     return r;
   }
   CanonicalAsyncOp op = GetCanonicalAsyncOp(instr);
@@ -573,14 +556,7 @@ ResourcesVector GpuAsyncTracker::GetResourcesFromInstructionImpl(
                   ? ResourceUsageType::kResourceRelease
                   : ResourceUsageType::kResourceOccupy;
       if (hlo_query::IsCollectiveCommunicationOp(op.inner)) {
-        // If pinned to a specific collective multi-stream via
-        // _xla_stream_annotation, use its dedicated resource so the scheduler
-        // knows it can overlap with collectives on the other stream.
-        if (auto per_stream = GetAnnotatedCollectiveStreamResource(instr)) {
-          resource = *per_stream;
-        } else {
-          resource = GpuResourceType::kGpuAsyncStreamCollectives;
-        }
+        resource = GpuResourceType::kGpuAsyncStreamCollectives;
       } else {
         resource = GpuResourceType::kGpuAsyncStreamComputes;
       }
@@ -628,13 +604,6 @@ int64_t GpuAsyncTracker::GetNumAvailableResources(int64_t resource_type) const {
   }
 
   if (resource_type ==
-          ResourceTypeToIndex(GpuResourceType::kGpuAsyncStreamCollectives0) ||
-      resource_type ==
-          ResourceTypeToIndex(GpuResourceType::kGpuAsyncStreamCollectives1)) {
-    return 1;
-  }
-
-  if (resource_type ==
           ResourceTypeToIndex(GpuResourceType::kGpuAsyncStreamCollectivesP2P) ||
       resource_type ==
           ResourceTypeToIndex(GpuResourceType::kGpuAsyncStreamSend0) ||
@@ -676,10 +645,6 @@ absl::string_view GpuAsyncTracker::GetResourceName(
       return "kGpuAsyncStreamRecv1";
     case GpuResourceType::kGpuAsyncStreamCollectives:
       return "kGpuAsyncStreamCollectives";
-    case GpuResourceType::kGpuAsyncStreamCollectives0:
-      return "kGpuAsyncStreamCollectives0";
-    case GpuResourceType::kGpuAsyncStreamCollectives1:
-      return "kGpuAsyncStreamCollectives1";
     case GpuResourceType::kGpuAsyncStreamComputes:
       return "kGpuAsyncStreamComputes";
     default:

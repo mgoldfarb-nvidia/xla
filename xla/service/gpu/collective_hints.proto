@@ -67,20 +67,13 @@ message CollectiveHint {
   // collective to compute ops that share the same scheduling group ID.
   string scheduling_group_id = 5;
 
-  // If non-zero, pins this collective to a specific execution stream by setting
-  // `_xla_stream_annotation` on the async-start instruction.  This overrides
-  // the default round-robin assignment that XLA uses when
-  // xla_gpu_experimental_enable_collective_multi_streaming is enabled.
-  //
-  // Stream IDs with kNumComputeStreams=4 and kNumCollectiveStreams=2:
-  //   0  — main/host stream (do not use)
-  //   1–4 — compute streams (for async compute ops)
-  //   5  — first collective stream  (default for odd-numbered collectives)
-  //   6  — second collective stream (default for even-numbered collectives)
-  //
-  // Example: set stream_id=5 to force all matching collectives onto stream 5,
-  // effectively serialising them onto one stream.
-  int32 stream_id = 6;
+  // DEPRECATED — no-op. Used to set `_xla_stream_annotation` on the
+  // async-start to pin a collective to a specific multi-stream resource
+  // (kGpuAsyncStreamCollectives0/1). Those resources were removed; the
+  // proto field is retained only so existing textprotos that set it
+  // continue to parse without error. Setting this value has no effect
+  // on the schedule. Will be marked `reserved` in a future cleanup.
+  int32 stream_id = 6 [deprecated = true];
 
   // Priority for conflict resolution when multiple rules match the same
   // instruction. Higher values win. Rules with equal priority are resolved
