@@ -3526,6 +3526,7 @@ cc_library(
         "//xla/hlo/ir:hlo",
         "//xla/hlo/pass:hlo_pass",
         "//xla/hlo/utils:hlo_query",
+        "//xla/service:latency_hiding_scheduler",
         "//xla/service:scheduling_annotations_util",
         "//xla:side_effect_util",
         "//xla/tsl/platform:statusor",

@@ -404,15 +404,93 @@ TEST_F(AutoWindowTargetTest, DeterministicTieBreak) {
 // Option 1 safety cap: max_total_rules limits the total number of
 // window_target rules emitted across all collectives. Highest-priority
 // (cost-descending) collectives keep their rules; lower-priority ones
-// get dropped.
+// get dropped. Uses 3 *different-type* collectives to isolate cap
+// behavior from the same-type-collision skip (Option A).
 TEST_F(AutoWindowTargetTest, MaxTotalRulesCapsAcrossCollectives) {
+  constexpr absl::string_view hlo_string = R"(
+    HloModule test
+    add {
+      lhs = f32[] parameter(0)
+      rhs = f32[] parameter(1)
+      ROOT result = f32[] add(lhs, rhs)
+    }
+    ENTRY entry {
+      p0 = f32[1024,1024]{1,0} parameter(0)
+      p1 = f32[2048]{0} parameter(1)
+      // Three different-type collectives. ag_big (1000us) is the priority
+      // pick because it has the largest PGLE cost.
+      ag_big = (f32[1024,1024]{1,0}, f32[2048,1024]{1,0})
+          all-gather-start(p0), replica_groups={{0,1}}, dimensions={0}
+      ar_mid = f32[2048]{0} all-reduce-start(p1),
+          replica_groups={{0,1}}, to_apply=add
+      cp_small = (f32[2048]{0}, f32[2048]{0}, u32[], u32[])
+          collective-permute-start(p1),
+          source_target_pairs={{0,1},{1,0}}
+      cc1 = f32[2048]{0} custom-call(p1), custom_call_target="op1"
+      cc2 = f32[2048]{0} custom-call(p1), custom_call_target="op2"
+      cc3 = f32[2048]{0} custom-call(p1), custom_call_target="op3"
+      d_big = f32[2048,1024]{1,0} all-gather-done(ag_big)
+      d_mid = f32[2048]{0} all-reduce-done(ar_mid)
+      d_small = f32[2048]{0} collective-permute-done(cp_small)
+      ROOT t = (f32[2048,1024]{1,0}, f32[2048]{0}, f32[2048]{0},
+                f32[2048]{0}, f32[2048]{0}, f32[2048]{0})
+          tuple(d_big, d_mid, d_small, cc1, cc2, cc3)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> hlo_module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  auto profile = MakeProfile({
+      {"ag_big", 1000.0}, {"ar_mid", 800.0}, {"cp_small", 600.0},
+      {"cc1", 100.0}, {"cc2", 100.0}, {"cc3", 100.0},
+  });
+
+  // Without cap: each collective gets 1 anchor (max_per_collective=1) =>
+  // 3 rules total. (Different types, so the type-collision skip does
+  // not engage.)
+  TF_ASSERT_OK_AND_ASSIGN(
+      CollectiveHintsConfig uncapped,
+      BuildAutoWindowTargetConfig(*hlo_module, profile,
+                                   /*threshold_us=*/100.0f,
+                                   /*min_compute_us=*/50.0f,
+                                   /*max_per_collective=*/1,
+                                   /*max_total_rules=*/0));
+  EXPECT_EQ(uncapped.hints_size(), 3);
+
+  // With cap=2: only the two heaviest collectives (ag_big, ar_mid) get
+  // rules; cp_small (lowest priority) is dropped.
+  TF_ASSERT_OK_AND_ASSIGN(
+      CollectiveHintsConfig capped,
+      BuildAutoWindowTargetConfig(*hlo_module, profile,
+                                   /*threshold_us=*/100.0f,
+                                   /*min_compute_us=*/50.0f,
+                                   /*max_per_collective=*/1,
+                                   /*max_total_rules=*/2));
+  EXPECT_EQ(capped.hints_size(), 2);
+
+  // Negative cap disables it (same as 0).
+  TF_ASSERT_OK_AND_ASSIGN(
+      CollectiveHintsConfig disabled_cap,
+      BuildAutoWindowTargetConfig(*hlo_module, profile,
+                                   /*threshold_us=*/100.0f,
+                                   /*min_compute_us=*/50.0f,
+                                   /*max_per_collective=*/1,
+                                   /*max_total_rules=*/-1));
+  EXPECT_EQ(disabled_cap.hints_size(), 3);
+}
+
+// Option A: same-type-collision skip. The GPU LHS pipeline hardcodes
+// per-collective-type overlap_limit = 1, so two same-type collectives
+// cannot be in flight simultaneously. C3 must therefore avoid pinning
+// anchors into more than one collective per type — otherwise LHS
+// rejects the schedule with kExceedsOverlapLimit. This test verifies
+// that with three same-type all-gathers, only the highest-priority one
+// (ag_big) gets a rule.
+TEST_F(AutoWindowTargetTest, SkipsSameTypePeerCollective) {
   constexpr absl::string_view hlo_string = R"(
     HloModule test
     ENTRY entry {
       p0 = f32[1024,1024]{1,0} parameter(0)
       p1 = f32[2048]{0} parameter(1)
-      // Three independent collectives. ag_big (1000us) is the priority
-      // pick because it has the largest PGLE cost.
       ag_big = (f32[1024,1024]{1,0}, f32[2048,1024]{1,0})
           all-gather-start(p0), replica_groups={{0,1}}, dimensions={0}
       ag_mid = (f32[1024,1024]{1,0}, f32[2048,1024]{1,0})
@@ -438,37 +516,18 @@ TEST_F(AutoWindowTargetTest, MaxTotalRulesCapsAcrossCollectives) {
       {"cc1", 100.0}, {"cc2", 100.0}, {"cc3", 100.0},
   });
 
-  // Without cap: each collective gets 1 anchor (max_per_collective=1) =>
-  // 3 rules total.
   TF_ASSERT_OK_AND_ASSIGN(
-      CollectiveHintsConfig uncapped,
+      CollectiveHintsConfig cfg,
       BuildAutoWindowTargetConfig(*hlo_module, profile,
                                    /*threshold_us=*/100.0f,
                                    /*min_compute_us=*/50.0f,
                                    /*max_per_collective=*/1,
                                    /*max_total_rules=*/0));
-  EXPECT_EQ(uncapped.hints_size(), 3);
-
-  // With cap=2: only the two heaviest collectives (ag_big, ag_mid) get
-  // rules; ag_small (lowest priority) is dropped.
-  TF_ASSERT_OK_AND_ASSIGN(
-      CollectiveHintsConfig capped,
-      BuildAutoWindowTargetConfig(*hlo_module, profile,
-                                   /*threshold_us=*/100.0f,
-                                   /*min_compute_us=*/50.0f,
-                                   /*max_per_collective=*/1,
-                                   /*max_total_rules=*/2));
-  EXPECT_EQ(capped.hints_size(), 2);
-
-  // Negative cap disables it (same as 0).
-  TF_ASSERT_OK_AND_ASSIGN(
-      CollectiveHintsConfig disabled_cap,
-      BuildAutoWindowTargetConfig(*hlo_module, profile,
-                                   /*threshold_us=*/100.0f,
-                                   /*min_compute_us=*/50.0f,
-                                   /*max_per_collective=*/1,
-                                   /*max_total_rules=*/-1));
-  EXPECT_EQ(disabled_cap.hints_size(), 3);
+  // Only ag_big (highest priority) gets a rule; ag_mid and ag_small
+  // are skipped by the type-collision check.
+  ASSERT_EQ(cfg.hints_size(), 1);
+  ASSERT_EQ(cfg.hints(0).window_target_size(), 1);
+  EXPECT_EQ(cfg.hints(0).window_target(0), "ag_big");
 }
 
 }  // namespace

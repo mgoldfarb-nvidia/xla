@@ -26,6 +26,7 @@ You may obtain a copy of the License at
 #include "xla/service/gpu/collective_hints_annotator.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
 #include "xla/service/gpu/ir_emission_utils.h"
+#include "xla/service/latency_hiding_scheduler.h"
 #include "xla/service/scheduling_annotations_util.h"
 #include "xla/side_effect_util.h"
 #include "xla/tsl/platform/statusor.h"
@@ -61,6 +62,19 @@ double LookupPgleCostUs(
     if (it2 != cost_by_name.end()) return it2->second;
   }
   return -1.0;
+}
+
+// Canonical inner opcode of an async-collective-start, used as the key
+// for the same-type-collision check. For both async-wrapped collectives
+// (kAsyncStart) and legacy *-Start opcodes (kAllReduceStart, etc.),
+// returns the underlying collective opcode (kAllReduce, kAllGather,
+// kReduceScatter, kAllToAll, kRaggedAllToAll, kCollectivePermute,
+// kCollectiveBroadcast). Mirrors LHS's resource-type bucketing — see
+// `AsyncTracker::GetResourceTypeForOp` and `DefaultGetCanonicalAsyncOp`
+// in latency_hiding_scheduler.cc.
+HloOpcode CollectiveTypeKey(const HloInstruction& start) {
+  CanonicalAsyncOp canonical = DefaultGetCanonicalAsyncOp(start);
+  return canonical.inner;
 }
 
 // Returns the `*-done` instruction matching `start`, or nullptr.
@@ -116,6 +130,19 @@ absl::StatusOr<CollectiveHintsConfig> BuildAutoWindowTargetConfig(
     }
   }
 
+  // Same-type-collision avoidance. The GPU LHS pipeline hardcodes
+  // per-collective-type overlap limits to 1 (see `MakeGPUSchedulerConfig`
+  // and the SchedulerConfig defaults in `latency_hiding_scheduler.h`):
+  // only one all-reduce, one reduce-scatter, etc. may be in flight at a
+  // time, regardless of `parallel_collective_overlap_limit`. If C3 emits
+  // window_target rules across N collectives of the same type, anchors
+  // force their respective windows to overlap and LHS rejects the
+  // schedule with kExceedsOverlapLimit. Skip a collective if its type
+  // already has rules emitted by an earlier (higher-priority) selection.
+  // Tracked module-wide rather than per-computation so one collective in
+  // a while-body and one in entry don't both pin same-type rules.
+  absl::flat_hash_set<HloOpcode> claimed_types;
+
   // Walk each computation independently.
   for (HloComputation* comp : module.MakeNonfusionComputations()) {
     // Build reachability map once per computation.
@@ -170,6 +197,18 @@ absl::StatusOr<CollectiveHintsConfig> BuildAutoWindowTargetConfig(
       if (done == nullptr) {
         VLOG(2) << "AutoWindowTarget: no matching *-done for "
                 << coll->name() << "; skipping";
+        continue;
+      }
+      // Same-type-collision skip: per-type overlap_limit is hardcoded to 1
+      // in MakeGPUSchedulerConfig. Pinning anchors into a second collective
+      // of the same type would force two same-type collectives to overlap
+      // and LHS would reject the schedule.
+      HloOpcode coll_type = CollectiveTypeKey(*coll);
+      if (claimed_types.contains(coll_type)) {
+        VLOG(1) << "AutoWindowTarget: skipping '" << coll->name()
+                << "' (type " << HloOpcodeString(coll_type)
+                << " already pinned by a higher-priority collective; "
+                   "per-type overlap_limit=1 would reject overlap)";
         continue;
       }
       double coll_cost = LookupPgleCostUs(*coll, cost_by_name);
@@ -254,6 +293,12 @@ absl::StatusOr<CollectiveHintsConfig> BuildAutoWindowTargetConfig(
                 << "' (" << c.cost_us << " us) into '" << coll->name()
                 << "'s window (cumulative " << cumulative << "/"
                 << coll_cost << " us)";
+      }
+      if (picked > 0) {
+        // Reserve this collective type so peer collectives of the same
+        // type don't get pinned (per-type overlap_limit=1 in
+        // MakeGPUSchedulerConfig).
+        claimed_types.insert(coll_type);
       }
       if (hit_total_cap) {
         LOG(INFO) << "AutoWindowTarget: hit max_total_rules cap of "
