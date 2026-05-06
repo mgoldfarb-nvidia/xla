@@ -516,8 +516,46 @@ static bool IsAnnotatedForGpuAsyncStreamCollectivesP2P(
   return it->second == kCollectiveStreamP2P;
 }
 
+// Hardcoded list of sync custom-call targets that internally use NCCL.
+// LHS doesn't see their internal collective machinery, so it can pipeline
+// XLA-emitted async collectives across them on different streams, leading
+// to NCCL state / shared-buffer contention (Xid faults at high
+// overlap_limit + multi_streaming=true). Listing the target name here
+// causes GpuAsyncTracker to emit a kGpuAsyncStreamCollectives resource
+// pair (occupy + release at the same scheduling step) for the custom
+// call, which makes LHS's overlap-limit accounting count it against the
+// global collective concurrency limit.
+//
+// Sync emission only — this is a temporary hypothesis-test mechanism
+// pending the proper async-wrap pass + frontend-attribute label
+// described in docs/lhs_pgle_baseline_improvements.md (follow-up work).
+// If the test confirms the hypothesis, generalize to a frontend-attr
+// driven mechanism so users can opt in their own custom calls without
+// editing this list.
+bool IsKnownCollectiveCustomCall(const HloInstruction& instr) {
+  if (instr.opcode() != HloOpcode::kCustomCall) return false;
+  const absl::string_view target =
+      Cast<HloCustomCallInstruction>(&instr)->custom_call_target();
+  return target == "hybrid_ep_dispatch" || target == "hybrid_ep_combine";
+}
+
 ResourcesVector GpuAsyncTracker::GetResourcesFromInstructionImpl(
     const HloInstruction& instr) const {
+  // Treat known sync collective custom calls as occupying the GPU
+  // collective stream resource for one scheduling step. This blocks LHS
+  // from co-scheduling them with another collective at the same dispatch
+  // tick and forces them to serialize against in-flight async collectives
+  // through the overlap-limit counter.
+  if (IsKnownCollectiveCustomCall(instr)) {
+    ResourcesVector r;
+    r.push_back(std::make_pair(
+        ResourceTypeToIndex(GpuResourceType::kGpuAsyncStreamCollectives),
+        ResourceUsageType::kResourceOccupy));
+    r.push_back(std::make_pair(
+        ResourceTypeToIndex(GpuResourceType::kGpuAsyncStreamCollectives),
+        ResourceUsageType::kResourceRelease));
+    return r;
+  }
   CanonicalAsyncOp op = GetCanonicalAsyncOp(instr);
   if (op.outer == HloOpcode::kAsyncStart || op.outer == HloOpcode::kAsyncDone) {
     ResourceUsageType usage;
