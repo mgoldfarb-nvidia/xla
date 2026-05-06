@@ -282,7 +282,7 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_gpu_experimental_enable_collective_multi_streaming(false);
   // Baseline LHS / PGLE improvements (docs/lhs_pgle_baseline_improvements.md):
   opts.set_xla_gpu_pgle_force_async_threshold_us(0.0f);  // B1: off by default
-  opts.set_xla_gpu_lhs_drop_singleton_gids(true);        // A1: bug-fix; on
+  opts.set_xla_gpu_lhs_drop_singleton_gids(false);       // A1: gated on hint-file presence
   opts.set_xla_gpu_lhs_unprofiled_latency_model(false);  // A2: off by default
   opts.set_xla_gpu_lhs_auto_window_target_threshold_us(0.0f);  // C3: off
   opts.set_xla_gpu_lhs_auto_window_target_min_compute_us(50.0f);
@@ -1812,9 +1812,13 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       debug_options->xla_gpu_lhs_drop_singleton_gids(),
       "Proposal A1. After LegalizeSchedulingAnnotations strips ineligible "
       "anchors, also strip _scheduling_group_id from any single-instruction "
-      "(singleton) group. Default true: a singleton group has no constraint "
-      "to enforce, and its residual annotation can perversely force "
-      "is_sync=true on the surviving collective."));
+      "(singleton) group. A singleton group has no constraint to enforce, "
+      "and its residual annotation can perversely force is_sync=true on "
+      "the surviving collective. Auto-enabled in the GPU pipeline whenever "
+      "--xla_gpu_collective_hints_file (deprecated path) is set, since "
+      "hint files are the only producer of _scheduling_group_id "
+      "annotations. Default false; set true to force-on without a hint "
+      "file (e.g., when injecting _scheduling_group_id onto raw HLO)."));
   flag_list->push_back(tsl::Flag(
       "xla_gpu_lhs_unprofiled_latency_model",
       bool_setter_for(

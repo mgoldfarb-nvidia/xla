@@ -557,8 +557,13 @@ bool NeedAccuracyChecker(const DebugOptions& options,
 // removes ineligible anchors (per `keep_sync_annotation` above), any group
 // that ends up with a single surviving member has no constraint to enforce —
 // its residual `_scheduling_group_id` only confuses the scheduler and can
-// force `is_sync=true` on the surviving collective. See
-// `docs/lhs_pgle_baseline_improvements.md` (Proposal A1) for the full
+// force `is_sync=true` on the surviving collective. Scoped to the
+// deprecated hint-file path: the GPU schedule pass auto-enables A1 when
+// `--xla_gpu_collective_hints_file` is set (the only producer of
+// `_scheduling_group_id` annotations in this fork), and leaves it dormant
+// otherwise. C3 (`AutoWindowTargetPass`) emits `_xla_window_target` rules
+// instead of group ids, so it never produces singletons for A1 to fix.
+// See `docs/lhs_pgle_baseline_improvements.md` (Proposal A1) for the
 // rationale and the v3-stable failure mode that motivated this fix.
 LegalizeSchedulingAnnotations::Config SchedulingAnnotationsConfig(
     bool drop_singleton_gids) {
@@ -664,9 +669,20 @@ absl::Status RunLatencyHidingSchedulerPasses(
     pipeline.AddPass<CollectiveHintsAnnotatorPass>(std::move(hints_pass));
   }
 
+  // A1 (drop singleton scheduling-group ids) only has work to do when
+  // something has actually placed `_scheduling_group_id` annotations on
+  // the module. The hint-file path (deprecated) is the only producer of
+  // those annotations in this fork — C3 emits `_xla_window_target` rules
+  // (control deps), not scheduling-group ids. Auto-enable A1 whenever a
+  // hint file is loaded so users don't need to remember a separate flag;
+  // leave it dormant in C3-only configurations. The explicit flag is
+  // retained as an override for the rare case where someone manually
+  // injects `_scheduling_group_id` onto raw HLO without a hint file.
+  bool drop_singleton_gids =
+      options.xla_gpu_lhs_drop_singleton_gids() ||
+      !options.xla_gpu_collective_hints_file().empty();
   pipeline.AddPass<LegalizeSchedulingAnnotations>(
-      SchedulingAnnotationsConfig(
-          options.xla_gpu_lhs_drop_singleton_gids()));
+      SchedulingAnnotationsConfig(drop_singleton_gids));
 
   // Proposal B1 (docs/lhs_pgle_baseline_improvements.md):
   // Pre-pass that flips is_sync=false on collectives whose PGLE-recorded
