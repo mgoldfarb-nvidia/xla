@@ -28,14 +28,17 @@ package(
 # other libraries, because it allows external FFI users to simply copy the headers to their project
 # and do not worry about build configuration or dependencies.
 
-# A user of the FFI interface will only need the three headers included in the `all_headers`
-# filegroup: `api.h`, `c_api.h`, and `ffi.h`.
+# A user of the FFI interface will only need the headers included in the
+# `all_headers` filegroup.
 filegroup(
     name = "all_headers",
     srcs = [
         "api.h",
         "c_api.h",
+        "c_api_gpu_collectives.h",
+        "c_api_gpu_collectives_nccl.h",
         "ffi.h",
+        "gpu_collectives.h",
     ],
 )
 
@@ -62,6 +65,17 @@ cc_library(
 )
 
 cc_library(
+    name = "c_api_gpu_collectives",
+    hdrs = ["c_api_gpu_collectives.h"],
+    deps = [":c_api"],
+)
+
+cc_library(
+    name = "c_api_gpu_collectives_nccl",
+    hdrs = ["c_api_gpu_collectives_nccl.h"],
+)
+
+cc_library(
     name = "c_api_internal",
     hdrs = ["c_api_internal.h"],
     deps = [":c_api"],
@@ -73,6 +87,31 @@ cc_library(
     deps = [
         ":api",
         ":c_api",
+    ],
+)
+
+cc_library(
+    name = "gpu_collectives",
+    hdrs = ["gpu_collectives.h"],
+    deps = [
+        ":c_api",
+        ":c_api_gpu_collectives",
+        ":ffi",
+    ],
+)
+
+xla_cc_test(
+    name = "gpu_collectives_test",
+    srcs = ["gpu_collectives_test.cc"],
+    deps = [
+        ":c_api",
+        ":c_api_gpu_collectives",
+        ":c_api_gpu_collectives_nccl",
+        ":ffi",
+        ":gpu_collectives",
+        "//xla/ffi:ffi_api",
+        "//xla/tsl/platform:test_main",
+        "@com_google_googletest//:gtest",
     ],
 )
 

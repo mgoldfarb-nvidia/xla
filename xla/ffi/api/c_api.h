@@ -47,6 +47,7 @@ typedef struct XLA_FFI_InternalApi XLA_FFI_InternalApi;  // Forward declare
 
 typedef enum {
   XLA_FFI_Extension_Metadata = 1,
+  XLA_FFI_Extension_GpuCollectives = 2,
 } XLA_FFI_Extension_Type;
 
 typedef struct XLA_FFI_Extension_Base {
@@ -91,7 +92,7 @@ XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_Extension_Base, next);
 // Minor changes include:
 // * Adding a new field to the XLA_FFI_Api or argument structs
 // * Renaming a method or argument (doesn't affect ABI)
-#define XLA_FFI_API_MINOR 3
+#define XLA_FFI_API_MINOR 5
 
 struct XLA_FFI_Api_Version {
   size_t struct_size;
@@ -168,6 +169,17 @@ struct XLA_FFI_Error_GetMessage_Args {
 XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_Error_GetMessage_Args, message);
 
 typedef void XLA_FFI_Error_GetMessage(XLA_FFI_Error_GetMessage_Args* args);
+
+struct XLA_FFI_Error_GetCode_Args {
+  size_t struct_size;
+  XLA_FFI_Extension_Base* extension_start;
+  XLA_FFI_Error* error;
+  XLA_FFI_Error_Code errc;  // out
+};
+
+XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_Error_GetCode_Args, errc);
+
+typedef void XLA_FFI_Error_GetCode(XLA_FFI_Error_GetCode_Args* args);
 
 struct XLA_FFI_Error_Destroy_Args {
   size_t struct_size;
@@ -475,6 +487,21 @@ enum XLA_FFI_Handler_TraitsBits {
   // that calls to FFI handler always launch exactly the same device operations
   // (can depend on attribute values) that can be captured and then replayed.
   XLA_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE = 1u << 0,
+
+  // A GPU handler can initiate device-side communication. XLA prepares one
+  // load/store-accessible synchronization slot and registers tagged buffers.
+  // The device communication team is the full execution group (all replicas
+  // and partitions, ordered by flattened ID).
+  // Handlers with this trait execute outside command buffers because device
+  // communication resource identity is not yet part of trace-cache keys.
+  // The handler must collectively quiesce remote accesses before its device
+  // work returns; XLA then keeps the resources alive until that local work has
+  // completed. This is an allocation and lifetime capability only: remotely
+  // written storage must still be declared as an FFI result (and aliased to an
+  // operand for in-place updates). Frontends tag participating custom-call
+  // buffers with memory space 1 using the operands_memory_spaces and
+  // results_memory_spaces frontend attributes.
+  XLA_FFI_HANDLER_TRAITS_USES_DEVICE_COMMUNICATION = 1u << 1,
 };
 
 typedef uint32_t XLA_FFI_Handler_Traits;
@@ -773,11 +800,12 @@ struct XLA_FFI_Api {
   _XLA_FFI_API_STRUCT_FIELD(XLA_FFI_Future_SetError);
   _XLA_FFI_API_STRUCT_FIELD(XLA_FFI_RunId_Get);
   _XLA_FFI_API_STRUCT_FIELD(XLA_FFI_DeviceOrdinal_Get);
+  _XLA_FFI_API_STRUCT_FIELD(XLA_FFI_Error_GetCode);
 };
 
 #undef _XLA_FFI_API_STRUCT_FIELD
 
-XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_Api, XLA_FFI_DeviceOrdinal_Get);
+XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_Api, XLA_FFI_Error_GetCode);
 
 const XLA_FFI_Api* XLA_FFI_GetApi();
 

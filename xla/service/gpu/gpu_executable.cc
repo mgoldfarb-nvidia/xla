@@ -81,6 +81,7 @@ limitations under the License.
 #include "xla/service/gpu/buffer_allocations.h"
 #include "xla/service/gpu/gpu_executable.pb.h"
 #include "xla/service/gpu/gpu_executable_buffer_allocator.h"
+#include "xla/service/gpu/gpu_executable_completion_barrier.h"
 #include "xla/service/gpu/gpu_executable_run_options.h"
 #include "xla/service/gpu/gpu_module_globals.h"
 #include "xla/service/gpu/ir_emission_utils.h"
@@ -542,8 +543,22 @@ absl::Status RendezvousAfterInitialization(
 
 absl::Status BarrierAfterExecutable(
     const ServiceExecutableRunOptions& run_options,
-    const DebugOptions* absl_nullable debug_options, se::Stream& stream_to_sync,
-    size_t num_participants);
+    const DebugOptions* absl_nullable debug_options,
+    absl::Span<se::Stream* const> streams_to_sync, size_t num_participants);
+
+absl::Status SynchronizeExecutionStreams(
+    absl::Span<se::Stream* const> streams) {
+  return SynchronizeGpuExecutableStreams(
+      streams, [](se::Stream* stream) -> absl::Status {
+        absl::Status status = stream->BlockHostUntilDone();
+        if (!status.ok()) {
+          return Internal(
+              "Failed to complete all kernels launched on stream %p: %s",
+              stream, status.message());
+        }
+        return absl::OkStatus();
+      });
+}
 
 absl::Status GpuExecutable::ExecuteThunksImpl(
     const DebugOptions* debug_options, const std::string& module_name,
@@ -805,11 +820,32 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
       &collective_memory, std::move(compute_streams.streams),
       &execution_scoped_state, persistent_alloc_indices);
 
+  std::vector<se::Stream*> completion_streams = {
+      main_stream, execute_params.command_buffer_trace_stream,
+      execute_params.device_to_host_stream,
+      execute_params.host_to_device_stream};
+  completion_streams.insert(completion_streams.end(),
+                            collective_params.async_streams.begin(),
+                            collective_params.async_streams.end());
+  completion_streams.insert(completion_streams.end(),
+                            execute_params.additional_compute_streams.begin(),
+                            execute_params.additional_compute_streams.end());
+
   XLA_VLOG_DEVICE(1, run_options->device_ordinal())
       << "Start GpuExecutable::ExecuteOnStream module: " << module_name;
-  RETURN_IF_ERROR(thunk_executor.ExecuteOnStream(execute_params));
+  absl::Status execute_status = thunk_executor.ExecuteOnStream(execute_params);
   XLA_VLOG_DEVICE(1, run_options->device_ordinal())
       << "End GpuExecutable::ExecuteOnStream module: " << module_name;
+
+  // An execution error can skip async-done thunks, leaving device work and
+  // AsyncExecution host state outstanding. Drain every stream before closing
+  // those scopes so buffers, collective memory, and clique resources cannot be
+  // released while an asynchronous kernel is still using them.
+  if (!execute_status.ok()) {
+    execute_status.Update(SynchronizeExecutionStreams(completion_streams));
+    execute_status.Update(
+        thunk_executor.FinalizeOnError(&execution_scoped_state));
+  }
 
   // Collective kernel thunks may request a barrier after the module execution.
   // This might be needed for several reasons:
@@ -820,15 +856,19 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
   //    Otherwise module unloading can cause a deadlock.
   absl::flat_hash_set<GlobalDeviceId> requested_barrier_devices =
       collective_clique_requests.GetDevicesRequiringBarrier();
-  if (absl::c_linear_search(requested_barrier_devices,
-                            collective_params.global_device_id.value())) {
-    XLA_VLOG_DEVICE(1, collective_params.global_device_id.value())
-        << "Barrier after executable required by participants: ("
-        << absl::StrJoin(requested_barrier_devices, ", ") << ")";
-    RETURN_IF_ERROR(BarrierAfterExecutable(*run_options, debug_options,
-                                           *main_stream,
-                                           requested_barrier_devices.size()));
-  }
+  execute_status = MaybeRunGpuExecutableCompletionBarrier(
+      requested_barrier_devices, collective_params.global_device_id,
+      collective_params.global_device_id_map, std::move(execute_status),
+      [&](size_t num_local_barrier_participants) {
+        XLA_VLOG_DEVICE(1, collective_params.global_device_id.value())
+            << "Barrier after executable required by participants: ("
+            << absl::StrJoin(requested_barrier_devices, ", ") << ")";
+        return BarrierAfterExecutable(*run_options, debug_options,
+                                      completion_streams,
+                                      num_local_barrier_participants);
+      });
+
+  RETURN_IF_ERROR(execute_status);
 
   return MaybeSyncAndProfile(run_options, execution_timer.get(),
                              block_host_until_done ? main_stream : nullptr);
@@ -950,9 +990,9 @@ absl::Status MaybeSyncAndProfile(const ServiceExecutableRunOptions* run_options,
 
 absl::Status BarrierAfterExecutable(
     const ServiceExecutableRunOptions& run_options,
-    const DebugOptions* absl_nullable debug_options, se::Stream& stream,
-    const size_t num_participants) {
-  RETURN_IF_ERROR(stream.BlockHostUntilDone());
+    const DebugOptions* absl_nullable debug_options,
+    absl::Span<se::Stream* const> streams, const size_t num_participants) {
+  absl::Status status = SynchronizeExecutionStreams(streams);
 
   XLA_VLOG_DEVICE(1, run_options.device_ordinal()) << absl::StreamFormat(
       "Join thunks in barrier after module execution rendezvous with %d "
@@ -973,7 +1013,7 @@ absl::Status BarrierAfterExecutable(
       "%d; run_id=%d",
       run_options.device_ordinal(), run_options.run_options().run_id().ToInt());
 
-  return Rendezvous(
+  status.Update(Rendezvous(
       rendezvous_name, rendezvous_key, num_participants,
       absl::Seconds(
           debug_options
@@ -982,7 +1022,8 @@ absl::Status BarrierAfterExecutable(
       absl::Seconds(
           debug_options
               ? debug_options->xla_gpu_executable_terminate_timeout_seconds()
-              : 30));
+              : 30)));
+  return status;
 }
 
 absl::StatusOr<const GpuExecutable::BufferAllocToDeviceMemoryMap*>

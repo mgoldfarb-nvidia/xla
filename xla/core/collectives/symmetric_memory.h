@@ -16,6 +16,8 @@ limitations under the License.
 #ifndef XLA_CORE_COLLECTIVES_SYMMETRIC_MEMORY_H_
 #define XLA_CORE_COLLECTIVES_SYMMETRIC_MEMORY_H_
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
 
 #include "absl/status/status.h"
@@ -32,6 +34,18 @@ namespace xla {
 // clique can access peer memory through the symmetric memory handle.
 class SymmetricMemory {
  public:
+  // Describes the provider ABI for the opaque value returned by
+  // PackKernelArg. Schema and version checks are required because device code
+  // interprets the concrete provider type hidden behind this interface.
+  struct PackedKernelArgMetadata {
+    uint64_t device_abi_schema = 0;
+    // The provider ABI version after the compile-time and runtime versions have
+    // been validated for exact compatibility.
+    uint64_t device_abi_version = 0;
+    size_t size_bytes = 0;
+    size_t alignment = 1;
+  };
+
   virtual ~SymmetricMemory() = default;
 
   // Device address on the local device backing the symmetric memory.
@@ -64,6 +78,17 @@ class SymmetricMemory {
   // A packed kernel argument type for passing symmetric memory to device
   // kernels (a platform-specific POD data type, happens to be a pointer).
   using PackedKernelArg = void*;
+
+  // Returns metadata required to safely interpret the opaque value returned by
+  // PackKernelArg. Backends that do not expose a stable device ABI return a
+  // zero schema and version by default.
+  virtual PackedKernelArgMetadata GetKernelArgMetadata() const {
+    return {/*device_abi_schema=*/0,
+            /*device_abi_version=*/0,
+            /*size_bytes=*/sizeof(PackedKernelArg),
+            /*alignment=*/alignof(PackedKernelArg)};
+  }
+
   virtual PackedKernelArg PackKernelArg() const = 0;
 
   template <typename Sink>

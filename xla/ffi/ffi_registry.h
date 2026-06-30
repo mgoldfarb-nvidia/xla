@@ -82,12 +82,16 @@ HandlerRegistrationMap& StaticHandlerRegistrationMap();
 //===----------------------------------------------------------------------===//
 
 bool IsCommandBufferCompatible(const XLA_FFI_Metadata& metadata);
+bool UsesDeviceCommunication(const XLA_FFI_Metadata& metadata);
 
 // Decodes XLA FFI traits packed into a 32-bit integer into a vector of traits.
 inline std::vector<Traits> DecodeTraits(XLA_FFI_Handler_Traits traits) {
   std::vector<Traits> result;
   if (traits & XLA_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE) {
     result.push_back(Traits::kCmdBufferCompatible);
+  }
+  if (traits & XLA_FFI_HANDLER_TRAITS_USES_DEVICE_COMMUNICATION) {
+    result.push_back(Traits::kUsesDeviceCommunication);
   }
   return result;
 }
@@ -101,6 +105,9 @@ static void AbslStringify(Sink& sink, Traits traits) {
   switch (traits) {
     case Traits::kCmdBufferCompatible:
       absl::Format(&sink, "cmd_buffer_compatible");
+      break;
+    case Traits::kUsesDeviceCommunication:
+      absl::Format(&sink, "uses_device_communication");
       break;
   }
 }

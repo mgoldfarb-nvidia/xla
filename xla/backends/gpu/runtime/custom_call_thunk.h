@@ -31,6 +31,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/collective_cliques.h"
 #include "xla/backends/gpu/runtime/collective_memory.h"
 #include "xla/backends/gpu/runtime/command.h"
+#include "xla/backends/gpu/runtime/ffi_collective_resources.h"
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/backends/gpu/runtime/thunk.pb.h"
 #include "xla/backends/gpu/runtime/traced_command.h"
@@ -86,8 +87,19 @@ class CustomCallThunk : public TracedCommand {
 
   // A per-execution state that holds state for prepare and initialize stages.
   struct PrepareAndInitState {
+    PrepareAndInitState(const CustomCallThunk* owner,
+                        absl::string_view target_name,
+                        absl::string_view profile_annotation, ThunkId thunk_id,
+                        absl::Span<const NullableShapedSlice> operands,
+                        absl::Span<const NullableShapedSlice> results)
+        : owner(owner),
+          collective_resources(target_name, profile_annotation, thunk_id,
+                               operands, results) {}
+
+    const CustomCallThunk* owner;
     ffi::ExecutionState prepare;
     ffi::ExecutionState init;
+    FfiCollectiveResources collective_resources;
   };
 
   // Creates a serializable custom call thunk. The callback is resolved using
@@ -115,7 +127,8 @@ class CustomCallThunk : public TracedCommand {
       const se::GpuComputeCapability& gpu_compute_capability,
       std::unique_ptr<xla::ffi::ExecutionState> execution_state = nullptr,
       std::optional<xla::cpu::TargetMachineOptions> cpu_target_machine_options =
-          std::nullopt);
+          std::nullopt,
+      XLA_FFI_Handler_Traits traits = 0);
 
   // Creates a custom call thunk from a bundle of handlers created with
   // xla::ffi::Bind(). Any pointer or reference lambda captures must be valid
@@ -128,7 +141,8 @@ class CustomCallThunk : public TracedCommand {
       const HloComputation* called_computation,
       const se::GpuComputeCapability& gpu_compute_capability,
       std::optional<xla::cpu::TargetMachineOptions> cpu_target_machine_options =
-          std::nullopt);
+          std::nullopt,
+      XLA_FFI_Handler_Traits traits = 0);
 
   absl::Status Prepare(const PrepareParams& params) override;
   absl::Status Initialize(const InitializeParams& params) override;
@@ -192,13 +206,18 @@ class CustomCallThunk : public TracedCommand {
       xla::ffi::AttributesMap attributes,
       std::unique_ptr<ffi::ExecutionState> execution_state,
       const HloComputation* called_computation,
-      std::optional<xla::cpu::TargetMachineOptions> cpu_target_machine_options);
+      std::optional<xla::cpu::TargetMachineOptions> cpu_target_machine_options,
+      XLA_FFI_Handler_Traits traits);
+
+  absl::StatusOr<PrepareAndInitState*> GetOrCreatePrepareAndInitState(
+      Thunk::ExecutionScopedState* execution_scoped_state);
 
   absl::StatusOr<ObjectPool<xla::ffi::CallFrame>::BorrowedObject>
   BuildCallFrame(const BufferAllocations* absl_nullable buffer_allocations);
 
-  xla::ffi::InvokeContext BuildInvokeContext(
-      RunId run_id, se::Stream* absl_nullable stream,
+  absl::StatusOr<xla::ffi::InvokeContext> BuildInvokeContext(
+      RunId run_id, XLA_FFI_ExecutionStage stage,
+      se::Stream* absl_nullable stream,
       Thunk::ExecutionScopedState* absl_nullable execution_scoped_state,
       const BufferAllocations* absl_nullable buffer_allocations,
       const CollectiveParams* absl_nullable collective_params,
@@ -253,6 +272,10 @@ class CustomCallThunk : public TracedCommand {
 
   // Execution state bound to the FFI handler instance. Optional.
   std::shared_ptr<ffi::ExecutionState> execution_state_;
+
+  // Device-communication handlers declaratively ask XLA to acquire a default
+  // communication team and register all collective-memory operands/results.
+  bool uses_device_communication_ = false;
 
   // TODO(ezhulenev): Currently we assume that HloModule that owns this
   // computation is owned by a GpuExecutable and stays alive for as long as

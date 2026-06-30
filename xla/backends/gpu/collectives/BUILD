@@ -448,7 +448,19 @@ cc_library(
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/types:span",
+    ],
+)
+
+xla_cc_test(
+    name = "gpu_communicator_test",
+    srcs = ["gpu_communicator_test.cc"],
+    deps = [
+        ":gpu_communicator",
+        "@com_google_absl//absl/container:btree",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
     ],
 )
 
@@ -933,6 +945,27 @@ cc_library(
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
+        "@local_config_cuda//cuda:cuda_headers",
+    ],
+)
+
+xla_cc_test(
+    name = "nccl_device_requirements_test",
+    srcs = ["nccl_device_requirements_test.cc"],
+    tags = [
+        "cuda-only",
+        "no-oneapi",
+    ],
+    deps = [
+        ":gpu_communicator",
+        ":nccl_communicator",
+        ":nccl_symmetric_memory",
+        "//xla/ffi/api:c_api_gpu_collectives_nccl",
+        "//xla/tsl/lib/core:status_test_util",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
         "@local_config_cuda//cuda:cuda_headers",
     ],
 )

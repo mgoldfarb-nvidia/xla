@@ -32,6 +32,7 @@ namespace xla::gpu {
 
 namespace {
 
+using ::testing::ElementsAre;
 using ::testing::UnorderedElementsAre;
 
 TEST(CollectiveCliqueRequestsTest, OrderedRequests) {
@@ -82,8 +83,7 @@ TEST(CollectiveCliqueRequestsTest, RequestDevComms) {
   ASSERT_EQ(ordered_requests.size(), 1);
   EXPECT_EQ(ordered_requests[0].key, k0);
   ASSERT_EQ(ordered_requests[0].dev_comms.size(), 2);
-  EXPECT_TRUE(ordered_requests[0].dev_comms.contains(dev_comm0));
-  EXPECT_TRUE(ordered_requests[0].dev_comms.contains(dev_comm1));
+  EXPECT_THAT(ordered_requests[0].dev_comms, ElementsAre(dev_comm1, dev_comm0));
 
   EXPECT_THAT(requests.GetDevicesRequiringBarrier(), UnorderedElementsAre());
 }

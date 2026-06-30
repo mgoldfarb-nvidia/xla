@@ -63,6 +63,7 @@ struct BackendVisitor {
         gpu.collective_memory_requests,
         gpu.collective_cliques,
         gpu.collective_memory,
+        gpu.gpu_collectives,
         gpu.compute_capability,
         gpu.cpu_target_machine_options,
         gpu.computation_streams,
@@ -73,10 +74,11 @@ struct BackendVisitor {
 }  // namespace
 
 static XLA_FFI_ExecutionContext CreateExecutionContext(
-    const InvokeContext& context) {
+    const InvokeContext& context, XLA_FFI_ExecutionStage stage) {
   return XLA_FFI_ExecutionContext{
       context.run_id,
       context.device_ordinal,
+      stage,
       std::visit(BackendVisitor{}, context.backend_context),
       XLA_FFI_ExecutionContext::StateContext{context.state_context.instantiate,
                                              context.state_context.prepare,
@@ -91,9 +93,9 @@ static absl::StatusOr<XLA_FFI_Future*> Invoke(const XLA_FFI_Api* api,
                                               CallFrame& call_frame,
                                               const InvokeContext& context,
                                               ExecutionStage stage) {
-  XLA_FFI_ExecutionContext ctx = CreateExecutionContext(context);
-  XLA_FFI_CallFrame ffi_call_frame =
-      call_frame.Build(api, &ctx, static_cast<XLA_FFI_ExecutionStage>(stage));
+  XLA_FFI_ExecutionStage ffi_stage = static_cast<XLA_FFI_ExecutionStage>(stage);
+  XLA_FFI_ExecutionContext ctx = CreateExecutionContext(context, ffi_stage);
+  XLA_FFI_CallFrame ffi_call_frame = call_frame.Build(api, &ctx, ffi_stage);
 
   XLA_FFI_Error* error = nullptr;
 

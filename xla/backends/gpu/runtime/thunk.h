@@ -411,6 +411,13 @@ class Thunk {
   // Precondition: Initialize(initialize_params) has been called.
   virtual absl::Status ExecuteOnStream(const ExecuteParams& params) = 0;
 
+  // Finalizes per-execution host state after ExecuteOnStream returns an error.
+  // The caller must first synchronize every stream that could have received
+  // work from this execution. Implementations must not launch new device work.
+  virtual absl::Status FinalizeOnError(ExecutionScopedState* state) {
+    return absl::OkStatus();
+  }
+
   // Returns device buffers used by the thunk.
   //
   // The order of the buffers in returned vector is consistent across calls.

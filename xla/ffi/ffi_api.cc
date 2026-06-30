@@ -32,6 +32,7 @@ limitations under the License.
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "xla/ffi/api/c_api.h"
+#include "xla/ffi/api/c_api_gpu_collectives.h"
 #include "xla/ffi/api/c_api_internal.h"  // IWYU pragma: keep
 #include "xla/ffi/execution_context.h"
 #include "xla/ffi/execution_state.h"
@@ -39,6 +40,7 @@ limitations under the License.
 #include "xla/ffi/ffi_interop.h"
 #include "xla/ffi/ffi_registry.h"
 #include "xla/ffi/ffi_structs.h"
+#include "xla/ffi/gpu_collectives_api.h"
 #include "xla/ffi/invoke.h"
 #include "xla/ffi/type_registry.h"
 #include "xla/stream_executor/device_address.h"
@@ -134,6 +136,47 @@ static absl::StatusCode ToStatusCode(XLA_FFI_Error_Code errc) {
   }
 }
 
+static XLA_FFI_Error_Code ToErrorCode(absl::StatusCode code) {
+  switch (code) {
+    case absl::StatusCode::kOk:
+      return XLA_FFI_Error_Code_OK;
+    case absl::StatusCode::kCancelled:
+      return XLA_FFI_Error_Code_CANCELLED;
+    case absl::StatusCode::kUnknown:
+      return XLA_FFI_Error_Code_UNKNOWN;
+    case absl::StatusCode::kInvalidArgument:
+      return XLA_FFI_Error_Code_INVALID_ARGUMENT;
+    case absl::StatusCode::kDeadlineExceeded:
+      return XLA_FFI_Error_Code_DEADLINE_EXCEEDED;
+    case absl::StatusCode::kNotFound:
+      return XLA_FFI_Error_Code_NOT_FOUND;
+    case absl::StatusCode::kAlreadyExists:
+      return XLA_FFI_Error_Code_ALREADY_EXISTS;
+    case absl::StatusCode::kPermissionDenied:
+      return XLA_FFI_Error_Code_PERMISSION_DENIED;
+    case absl::StatusCode::kResourceExhausted:
+      return XLA_FFI_Error_Code_RESOURCE_EXHAUSTED;
+    case absl::StatusCode::kFailedPrecondition:
+      return XLA_FFI_Error_Code_FAILED_PRECONDITION;
+    case absl::StatusCode::kAborted:
+      return XLA_FFI_Error_Code_ABORTED;
+    case absl::StatusCode::kOutOfRange:
+      return XLA_FFI_Error_Code_OUT_OF_RANGE;
+    case absl::StatusCode::kUnimplemented:
+      return XLA_FFI_Error_Code_UNIMPLEMENTED;
+    case absl::StatusCode::kInternal:
+      return XLA_FFI_Error_Code_INTERNAL;
+    case absl::StatusCode::kUnavailable:
+      return XLA_FFI_Error_Code_UNAVAILABLE;
+    case absl::StatusCode::kDataLoss:
+      return XLA_FFI_Error_Code_DATA_LOSS;
+    case absl::StatusCode::kUnauthenticated:
+      return XLA_FFI_Error_Code_UNAUTHENTICATED;
+    default:
+      return XLA_FFI_Error_Code_UNKNOWN;
+  }
+}
+
 #define XLA_FFI_RETURN_IF_ERROR(expr)                                   \
   do {                                                                  \
     absl::Status _status = (expr);                                      \
@@ -162,6 +205,17 @@ static void XLA_FFI_Error_GetMessage(XLA_FFI_Error_GetMessage_Args* args) {
   // absl::Status owns error message in a std::string which guarantees that
   // we'll get a null terminated string.
   args->message = args->error->status.message().data();
+}
+
+static void XLA_FFI_Error_GetCode(XLA_FFI_Error_GetCode_Args* args) {
+  absl::Status struct_size_check = ActualStructSizeIsGreaterOrEqual(
+      "XLA_FFI_Error_GetCode", XLA_FFI_Error_GetCode_Args_STRUCT_SIZE,
+      args->struct_size);
+  if (!struct_size_check.ok()) {
+    LOG(ERROR) << struct_size_check.message();
+    return;
+  }
+  args->errc = ToErrorCode(args->error->status.code());
 }
 
 static void XLA_FFI_Error_Destroy(XLA_FFI_Error_Destroy_Args* args) {
@@ -552,13 +606,105 @@ static XLA_FFI_Error* XLA_FFI_ThreadPool_NumThreads(
 }
 
 //===----------------------------------------------------------------------===//
+// XLA FFI GPU device-communication extension implementation
+//===----------------------------------------------------------------------===//
+
+static XLA_FFI_Error* ToFfiError(absl::Status status) {
+  if (status.ok()) return nullptr;
+  return new XLA_FFI_Error{std::move(status)};
+}
+
+static absl::StatusOr<GpuCollectivesApi*> GetGpuCollectivesApi(
+    XLA_FFI_ExecutionContext* ctx) {
+  if (ctx == nullptr) {
+    return InvalidArgument(
+        "GPU device-communication execution context is null");
+  }
+
+  auto* gpu =
+      std::get_if<XLA_FFI_ExecutionContext::GpuContext>(&ctx->backend_context);
+  if (gpu == nullptr) {
+    return Unimplemented(
+        "GPU device communication is not implemented for this backend");
+  }
+  if (gpu->gpu_collectives == nullptr) {
+    return FailedPrecondition(
+        "GPU device-communication adapter is not available in this execution "
+        "stage");
+  }
+  return gpu->gpu_collectives;
+}
+
+static absl::Status ValidateDeviceCommunicationStage(
+    XLA_FFI_ExecutionContext* ctx, absl::string_view operation) {
+  if (ctx == nullptr) {
+    return InvalidArgument(
+        "GPU device-communication execution context is null");
+  }
+  if (ctx->stage != XLA_FFI_ExecutionStage_INITIALIZE &&
+      ctx->stage != XLA_FFI_ExecutionStage_EXECUTE) {
+    return FailedPrecondition("%s is only valid during Initialize or Execute",
+                              operation);
+  }
+  return absl::OkStatus();
+}
+
+static XLA_FFI_Error* GpuCollectivesGetDeviceComm(
+    XLA_FFI_GpuCollectives_GetDeviceComm_Args* args) {
+  if (args == nullptr) {
+    return ToFfiError(InvalidArgument("GetDeviceComm args are null"));
+  }
+  XLA_FFI_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
+      "XLA_FFI_GpuCollectives_GetDeviceComm_Args",
+      XLA_FFI_GpuCollectives_GetDeviceComm_Args_STRUCT_SIZE,
+      args->struct_size));
+  absl::Status stage =
+      ValidateDeviceCommunicationStage(args->ctx, "GetDeviceComm");
+  if (!stage.ok()) return ToFfiError(std::move(stage));
+
+  absl::StatusOr<GpuCollectivesApi*> api = GetGpuCollectivesApi(args->ctx);
+  if (!api.ok()) return ToFfiError(api.status());
+  return ToFfiError((*api)->GetDeviceComm(args));
+}
+
+static XLA_FFI_Error* GpuCollectivesGetDeviceMemory(
+    XLA_FFI_GpuCollectives_GetDeviceMemory_Args* args) {
+  if (args == nullptr) {
+    return ToFfiError(InvalidArgument("GetDeviceMemory args are null"));
+  }
+  XLA_FFI_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
+      "XLA_FFI_GpuCollectives_GetDeviceMemory_Args",
+      XLA_FFI_GpuCollectives_GetDeviceMemory_Args_STRUCT_SIZE,
+      args->struct_size));
+  absl::Status stage =
+      ValidateDeviceCommunicationStage(args->ctx, "GetDeviceMemory");
+  if (!stage.ok()) return ToFfiError(std::move(stage));
+
+  absl::StatusOr<GpuCollectivesApi*> api = GetGpuCollectivesApi(args->ctx);
+  if (!api.ok()) return ToFfiError(api.status());
+  return ToFfiError((*api)->GetDeviceMemory(args));
+}
+
+//===----------------------------------------------------------------------===//
 // XLA FFI Api access
 //===----------------------------------------------------------------------===//
 
 const XLA_FFI_Api* GetXlaFfiApi() {
-  static XLA_FFI_Api api = {
+  static XLA_FFI_GpuCollectives_Extension gpu_collectives = {
+      XLA_FFI_Extension_Base{
+          XLA_FFI_GpuCollectives_Extension_STRUCT_SIZE,
+          XLA_FFI_Extension_GpuCollectives,
+          /*next=*/nullptr,
+      },
+      XLA_FFI_GPU_COLLECTIVES_API_MAJOR,
+      XLA_FFI_GPU_COLLECTIVES_API_MINOR,
+      GpuCollectivesGetDeviceComm,
+      GpuCollectivesGetDeviceMemory,
+  };
+
+  static const XLA_FFI_Api api = {
       XLA_FFI_Api_STRUCT_SIZE,
-      /*extension_start=*/nullptr,
+      /*extension_start=*/&gpu_collectives.extension_base,
 
       XLA_FFI_Api_Version{
           XLA_FFI_Api_Version_STRUCT_SIZE,
@@ -587,6 +733,7 @@ const XLA_FFI_Api* GetXlaFfiApi() {
       XLA_FFI_Future_SetError,
       XLA_FFI_RunId_Get,
       XLA_FFI_DeviceOrdinal_Get,
+      XLA_FFI_Error_GetCode,
   };
 
   return &api;

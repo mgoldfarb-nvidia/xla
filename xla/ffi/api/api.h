@@ -262,6 +262,17 @@ enum class Traits : uint32_t {
   //      allocations);
   //   3. the FFI handler may not query the execution status of the stream.
   kCmdBufferCompatible = XLA_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE,
+
+  // Indicates that a GPU handler can initiate device-side communication. XLA
+  // prepares one load/store-accessible synchronization slot and tagged device
+  // memory for the full execution group (all replicas and partitions, ordered
+  // by flattened ID). Such handlers execute outside command buffers because
+  // resource identity is not yet part of trace-cache keys. The handler must
+  // collectively quiesce remote accesses before its device work returns; XLA
+  // preserves resource lifetime until that local work completes. The trait
+  // does not relax FFI access semantics: remotely written storage must be a
+  // result, with output aliasing used for in-place updates.
+  kUsesDeviceCommunication = XLA_FFI_HANDLER_TRAITS_USES_DEVICE_COMMUNICATION,
 };
 
 // Forward declare template defined below.

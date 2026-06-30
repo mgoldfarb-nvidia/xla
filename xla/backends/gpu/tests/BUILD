@@ -1,7 +1,7 @@
 # Description: GPU-specific XLA tests. For example, codegen tests that
 # verify the IR emitted.
 
-load("@local_config_cuda//cuda:build_defs.bzl", "cuda_library")
+load("@local_config_cuda//cuda:build_defs.bzl", "cuda_library", "if_cuda")
 load(
     "@local_config_rocm//rocm:build_defs.bzl",
     "if_rocm_is_configured",
@@ -1208,6 +1208,107 @@ cc_library(
         # third_party/tensorflow/compiler/xla/xla.default.bzl.
         "//xla/tsl/framework:allocator",
     ]),
+)
+
+# CUDA/NCCL-only launcher for the real LSA collective kernel. This deliberately
+# has no dependency on StreamExecutor or any other XLA implementation target.
+cuda_library(
+    name = "gpu_collectives_ffi_plugin_kernel",
+    testonly = True,
+    srcs = ["gpu_collectives_ffi_plugin_kernel.cu.cc"],
+    hdrs = ["gpu_collectives_ffi_plugin_kernel.h"],
+    copts = ["-fvisibility=hidden"],
+    tags = [
+        "cuda-only",
+        "gpu",
+        "no_mac",
+    ],
+    target_compatible_with = if_cuda(
+        ["@platforms//os:linux"],
+        ["@platforms//:incompatible"],
+    ),
+    deps = [
+        "@local_config_cuda//cuda:cuda_headers",
+        "@local_config_cuda//cuda:cuda_runtime",
+    ] + if_cuda_is_configured([
+        "@local_config_nccl//:nccl_headers",
+    ]),
+    alwayslink = True,
+)
+
+# A real external FFI plugin whose only XLA library dependency is the public,
+# header-only API. Keep symbol visibility private except for the explicit C
+# registration entry point to catch accidental runtime implementation deps.
+cc_binary(
+    name = "gpu_collectives_ffi_plugin.so",
+    testonly = True,
+    srcs = ["gpu_collectives_ffi_plugin.cc"],
+    additional_linker_inputs = [":gpu_collectives_ffi_plugin.lds"],
+    copts = ["-fvisibility=hidden"],
+    linkopts = [
+        "-Wl,--no-undefined",
+        "-Wl,--version-script,$(location :gpu_collectives_ffi_plugin.lds)",
+    ],
+    linkshared = True,
+    tags = [
+        "cuda-only",
+        "gpu",
+        "no_mac",
+    ],
+    target_compatible_with = if_cuda(
+        ["@platforms//os:linux"],
+        ["@platforms//:incompatible"],
+    ),
+    deps = [
+        "//xla/ffi/api:c_api_gpu_collectives_nccl",
+        "//xla/ffi/api:gpu_collectives",
+    ] + if_cuda_is_configured([
+        ":gpu_collectives_ffi_plugin_kernel",
+        "@local_config_nccl//:nccl_headers",
+    ]),
+)
+
+xla_cc_test(
+    name = "gpu_collectives_ffi_dso_test",
+    srcs = ["gpu_collectives_ffi_dso_test.cc"],
+    data = [":gpu_collectives_ffi_plugin.so"],
+    env = {
+        "XLA_GPU_COLLECTIVES_FFI_PLUGIN_PATH": "$(rlocationpath :gpu_collectives_ffi_plugin.so)",
+    },
+    tags = [
+        "cuda-only",
+        "gpu",
+        "multi_gpu",
+        "no_mac",
+        "requires-gpu-nvidia:2",
+    ],
+    target_compatible_with = if_cuda(
+        ["@platforms//os:linux"],
+        ["@platforms//:incompatible"],
+    ),
+    deps = [
+        ":collective_ops_e2e_test_base",
+        "//xla:literal",
+        "//xla:literal_util",
+        "//xla/ffi",
+        "//xla/ffi:ffi_api",
+        "//xla/ffi:ffi_registry",
+        "//xla/ffi/api:c_api",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:gpu_plugin",
+        "//xla/stream_executor/cuda:all_runtime",
+        "//xla/stream_executor/cuda:gpu_test_kernels_cuda",
+        "//xla/stream_executor/cuda:stream_executor_cuda",
+        "//xla/tests:literal_test_util",
+        "//xla/tests:pjrt_gpu_client_registry",
+        "//xla/tests:xla_internal_test_main",
+        "//xla/tsl/lib/core:status_test_util",
+        "//xla/tsl/platform:statusor",
+        "//xla/tsl/platform:test",
+        "@com_google_googletest//:gtest",
+        "@tsl//tsl/platform:load_library",
+        "@tsl//tsl/platform:path",
+    ],
 )
 
 xla_test(

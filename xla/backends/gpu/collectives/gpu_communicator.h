@@ -27,6 +27,7 @@ limitations under the License.
 #include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
 #include "absl/types/span.h"
 #include "xla/core/collectives/communicator.h"
 #include "xla/core/collectives/rank_id.h"
@@ -80,6 +81,17 @@ class GpuDeviceCommunicator {
  public:
   virtual ~GpuDeviceCommunicator() = default;
 
+  // Describes the opaque bytes returned by PackKernelArg together with the
+  // concrete provider ABI that interprets them.
+  struct PackedKernelArgMetadata {
+    uint64_t device_abi_schema = 0;
+    // The provider ABI version after the compile-time and runtime versions have
+    // been validated for exact compatibility.
+    uint64_t device_abi_version = 0;
+    size_t size_bytes = 0;
+    size_t alignment = 1;
+  };
+
   // Requirements for constructing a device communicator object.
   struct Requirements {
     template <typename Sink>
@@ -109,6 +121,10 @@ class GpuDeviceCommunicator {
   virtual int64_t lsa_size() const = 0;
 
   virtual std::string ToString() const = 0;
+
+  // Returns metadata required to safely interpret the opaque bytes returned by
+  // PackKernelArg.
+  virtual const PackedKernelArgMetadata& GetKernelArgMetadata() const = 0;
 
   // Packs device communicator as a device kernel argument.
   virtual se::PackedKernelArg PackKernelArg() const = 0;

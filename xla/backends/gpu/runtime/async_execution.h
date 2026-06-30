@@ -118,6 +118,11 @@ class AsyncExecution {
   // recorded by the corresponding Start call.
   absl::Status Done(Thunk::ExecutionScopedState* state, se::Stream* stream);
 
+  // Closes an open execution scope after all streams have been synchronized on
+  // an error path. This only repairs host lifecycle state; it does not wait for
+  // or launch device work.
+  absl::Status FinalizeOnError(Thunk::ExecutionScopedState* state);
+
  private:
   // Returns or creates an event pool for the given executor.
   EventPool& GetOrCreatePool(se::StreamExecutor* executor);

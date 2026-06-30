@@ -55,6 +55,27 @@ namespace xla::gpu {
 
 using NcclSignalDesc = GpuSignalDesc;
 
+// Stable schema identifier for a packed ncclDevComm kernel argument. The
+// provider ABI version is reported separately and must match exactly.
+inline constexpr uint64_t kNcclDeviceCommAbiSchema =
+    uint64_t{0x4e43434c44433031};  // "NCCLDC01"
+
+// Validates and converts XLA's LSA barrier requirement to the compile-time NCCL
+// device API. This function does not access a GPU or an NCCL communicator.
+absl::StatusOr<ncclDevCommRequirements> BuildNcclDeviceCommRequirements(
+    const GpuDeviceCommunicator::Requirements& requirements);
+
+// Builds metadata for an NCCL ABI version that has already passed exact
+// compile-time/runtime validation.
+GpuDeviceCommunicator::PackedKernelArgMetadata
+BuildNcclDeviceCommKernelArgMetadata(uint64_t validated_device_abi_version);
+
+// Validates exact compatibility between the NCCL ABI used to compile XLA and
+// the loaded NCCL runtime. This function does not access a GPU and is exposed
+// for focused unit testing.
+absl::Status ValidateNcclDeviceAbi(uint64_t compile_time_version,
+                                   uint64_t runtime_version);
+
 struct NcclCapabilities {
   bool supports_device_comm;
   bool supports_one_sided_comm;
@@ -313,18 +334,24 @@ class NcclDeviceCommunicator : public GpuDeviceCommunicator {
 
   std::string ToString() const final;
 
+  const PackedKernelArgMetadata& GetKernelArgMetadata() const final {
+    return kernel_arg_metadata_;
+  }
+
   se::PackedKernelArg PackKernelArg() const final;
 
  private:
   NcclDeviceCommunicator(std::shared_ptr<NcclCommState> parent_comm,
                          se::StreamExecutor* stream_executor,
                          std::shared_ptr<tsl::Executor> executor,
+                         uint64_t validated_device_abi_version,
                          ncclDevComm dev_comm);
 
   std::shared_ptr<NcclCommState> parent_comm_;
   se::StreamExecutor* stream_executor_;
   std::shared_ptr<tsl::Executor> executor_;
   ncclDevComm dev_comm_;
+  PackedKernelArgMetadata kernel_arg_metadata_;
 };
 
 }  // namespace xla::gpu

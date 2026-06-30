@@ -36,6 +36,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/command_buffer_thunk.h"
 #include "xla/backends/gpu/runtime/conditional_thunk.h"
 #include "xla/backends/gpu/runtime/convolution_thunk.h"
+#include "xla/backends/gpu/runtime/custom_call_thunk.h"
 #include "xla/backends/gpu/runtime/cudnn_thunk.h"
 #include "xla/backends/gpu/runtime/device_to_device_copy_thunk.h"
 #include "xla/backends/gpu/runtime/dynamic_slice_fusion_v2_thunk.h"
@@ -49,6 +50,8 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/while_thunk.h"
 #include "xla/backends/gpu/transforms/dynamic_slice_fusion.h"
 #include "xla/debug_options_flags.h"
+#include "xla/ffi/ffi.h"
+#include "xla/ffi/ffi_registry.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
@@ -354,6 +357,62 @@ class FakeErrorAllocator : public ThunkPassBufferAllocator {
     return absl::InternalError("FakeErrorAllocator: Allocation failed");
   }
 };
+
+absl::Status CommandBufferDeviceCommunicationNoOp() {
+  return absl::OkStatus();
+}
+
+XLA_FFI_DEFINE_HANDLER(kCommandBufferDeviceCommunicationNoOp,
+                       CommandBufferDeviceCommunicationNoOp,
+                       ffi::Ffi::Bind());
+
+constexpr char kCommandBufferDeviceCommunicationNoOpName[] =
+    "__xla_test$$command_buffer_device_communication_noop";
+constexpr XLA_FFI_Handler_Traits kCommandBufferDeviceCommunicationTraits =
+    static_cast<XLA_FFI_Handler_Traits>(
+        ffi::Traits::kCmdBufferCompatible) |
+    static_cast<XLA_FFI_Handler_Traits>(
+        ffi::Traits::kUsesDeviceCommunication);
+
+XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(),
+                         kCommandBufferDeviceCommunicationNoOpName, "gpu",
+                         kCommandBufferDeviceCommunicationNoOp,
+                         kCommandBufferDeviceCommunicationTraits);
+
+TEST(CommandBufferConversionPassTest,
+     DoesNotCaptureDeviceCommunicationHandler) {
+  absl::StatusOr<ffi::HandlerRegistration> registration = ffi::FindHandler(
+      kCommandBufferDeviceCommunicationNoOpName, "gpu");
+  ASSERT_TRUE(registration.ok()) << registration.status();
+  EXPECT_TRUE(ffi::IsCommandBufferCompatible(registration->metadata));
+  EXPECT_TRUE(ffi::UsesDeviceCommunication(registration->metadata));
+
+  se::DeviceDescription device_info =
+      TestGpuDeviceInfo::CudaOrRocmDeviceInfo();
+  absl::StatusOr<std::unique_ptr<CustomCallThunk>> custom_call =
+      CustomCallThunk::Create(
+          Thunk::ThunkInfo(),
+          std::string(kCommandBufferDeviceCommunicationNoOpName),
+          /*operands=*/{}, /*results=*/{}, /*attributes=*/{},
+          /*called_computation=*/nullptr,
+          /*platform_name=*/"gpu",
+          device_info.gpu_compute_capability());
+  ASSERT_TRUE(custom_call.ok()) << custom_call.status();
+  ThunkSequence thunks;
+  thunks.push_back(std::move(*custom_call));
+
+  DebugOptions debug_options = xla::GetDebugOptionsFromFlags();
+  debug_options.set_xla_gpu_graph_min_graph_size(1);
+  debug_options.clear_xla_gpu_enable_command_buffer();
+  debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::CUSTOM_CALL);
+
+  FakeErrorAllocator allocator;
+  CommandBufferConversionPass pass{"test"};
+  ASSERT_THAT(pass.Run(&thunks, debug_options, /*hlo_module=*/nullptr,
+                       device_info, allocator),
+              IsOkAndHolds(false));
+  EXPECT_THAT(thunks, ThunkKindsAre(Thunk::kCustomCall));
+}
 
 TEST(CommandBufferConversionPassTest, ConvertsToCommandBufferThunk) {
   ThunkSequence thunks;

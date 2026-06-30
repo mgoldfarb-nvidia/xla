@@ -126,11 +126,11 @@ absl::StatusOr<AsyncExecution::ExecutionGuard> AsyncExecution::Start(
   ASSIGN_OR_RETURN(ExecutionState * es,
                    GetExecutionState(state, start_thunk_info_.thunk_id));
 
-  if (++es->counter > 1) {
+  if (es->counter != 0) {
     return Internal(
         "Async execution for `%s` already started (counter=%d). Async "
         "execution must be completed by Done before it can be started again.",
-        start_thunk_info_.profile_annotation, es->counter - 1);
+        start_thunk_info_.profile_annotation, es->counter);
   }
 
   se::Event* event = es->event->get();
@@ -142,6 +142,7 @@ absl::StatusOr<AsyncExecution::ExecutionGuard> AsyncExecution::Start(
   // happen before Done() (the event is safely overwritten on the async stream
   // because the stream is ordered).
   RETURN_IF_ERROR(async_stream->WaitFor(stream));
+  es->counter = 1;
 
   return ExecutionGuard(event, async_stream);
 }
@@ -154,14 +155,24 @@ absl::Status AsyncExecution::Done(Thunk::ExecutionScopedState* state,
   ASSIGN_OR_RETURN(ExecutionState * es,
                    GetExecutionState(state, start_thunk_info_.thunk_id));
 
-  if (--es->counter < 0) {
+  if (es->counter != 1) {
     return Internal("Async execution for `%s` not started (counter=%d)",
-                    start_thunk_info_.profile_annotation, es->counter + 1);
+                    start_thunk_info_.profile_annotation, es->counter);
   }
 
   // Wait for the async operation to complete by waiting for the event that was
   // recorded by the ExecutionGuard destructor at the end of Start.
-  return stream->WaitFor(es->event->get());
+  RETURN_IF_ERROR(stream->WaitFor(es->event->get()));
+  es->counter = 0;
+  return absl::OkStatus();
+}
+
+absl::Status AsyncExecution::FinalizeOnError(
+    Thunk::ExecutionScopedState* state) {
+  ASSIGN_OR_RETURN(ExecutionState * es,
+                   GetExecutionState(state, start_thunk_info_.thunk_id));
+  es->counter = 0;
+  return absl::OkStatus();
 }
 
 }  // namespace xla::gpu

@@ -1591,8 +1591,9 @@ TEST(FfiTest, Metadata) {
 }
 
 TEST(FfiTest, MetadataTraits) {
-  auto handler = Ffi::BindTo([]() { return Error::Success(); },
-                             {Traits::kCmdBufferCompatible});
+  auto handler = Ffi::BindTo(
+      []() { return Error::Success(); },
+      {Traits::kCmdBufferCompatible, Traits::kUsesDeviceCommunication});
 
   absl::StatusOr<XLA_FFI_Metadata> maybe_metadata =
       GetMetadata(GetXlaFfiApi(), *handler);
@@ -1601,7 +1602,9 @@ TEST(FfiTest, MetadataTraits) {
   XLA_FFI_Metadata metadata = maybe_metadata.value();
   EXPECT_EQ(metadata.api_version.major_version, XLA_FFI_API_MAJOR);
   EXPECT_EQ(metadata.api_version.minor_version, XLA_FFI_API_MINOR);
-  EXPECT_EQ(metadata.traits, XLA_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE);
+  EXPECT_EQ(metadata.traits,
+            XLA_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE |
+                XLA_FFI_HANDLER_TRAITS_USES_DEVICE_COMMUNICATION);
   EXPECT_EQ(metadata.state_type_id.type_id, XLA_FFI_UNKNOWN_TYPE_ID.type_id);
 }
 

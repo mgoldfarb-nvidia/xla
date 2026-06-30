@@ -757,6 +757,7 @@ cc_library(
         ":buffer_allocations",
         ":dense_data_intermediate",
         ":gpu_executable_buffer_allocator",
+        ":gpu_executable_completion_barrier",
         ":gpu_executable_proto_cc",
         ":gpu_executable_run_options",
         ":ir_emission_utils",
@@ -2256,6 +2257,37 @@ cc_library(
         "@riegeli//riegeli/bytes:reader",
         "@riegeli//riegeli/bytes:string_writer",
         "@tsl//tsl/platform:fingerprint",
+    ],
+)
+
+cc_library(
+    name = "gpu_executable_completion_barrier",
+    srcs = ["gpu_executable_completion_barrier.cc"],
+    hdrs = ["gpu_executable_completion_barrier.h"],
+    visibility = [],
+    deps = [
+        ":gpu_executable_run_options",
+        "//xla/runtime:device_id",
+        "//xla/stream_executor:stream",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/functional:function_ref",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+xla_cc_test(
+    name = "gpu_executable_completion_barrier_test",
+    srcs = ["gpu_executable_completion_barrier_test.cc"],
+    deps = [
+        ":gpu_executable_completion_barrier",
+        ":gpu_executable_run_options",
+        "//xla/runtime:device_id",
+        "//xla/tsl/platform:status_matchers",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_googletest//:gtest_main",
     ],
 )
 

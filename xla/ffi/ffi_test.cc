@@ -136,6 +136,25 @@ TEST(FfiTest, RegistrationTraitsBackwardsCompatibility) {
             XLA_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE);
 }
 
+TEST(FfiTest, DeviceCommunicationTraitRegistrationAndDecoding) {
+  static constexpr auto* noop = +[] { return absl::OkStatus(); };
+  XLA_FFI_DEFINE_HANDLER(DeviceCommunicationNoOp, noop, Ffi::Bind(),
+                         {Traits::kUsesDeviceCommunication});
+  XLA_FFI_REGISTER_HANDLER(GetXlaFfiApi(), "uses-device-communication", "Host",
+                           DeviceCommunicationNoOp);
+
+  auto handler = FindHandler("uses-device-communication", "Host");
+  TF_ASSERT_OK(handler.status());
+  EXPECT_EQ(handler->metadata.traits,
+            XLA_FFI_HANDLER_TRAITS_USES_DEVICE_COMMUNICATION);
+  EXPECT_TRUE(UsesDeviceCommunication(handler->metadata));
+  EXPECT_FALSE(IsCommandBufferCompatible(handler->metadata));
+
+  std::vector<Traits> traits = DecodeTraits(handler->metadata.traits);
+  ASSERT_EQ(traits.size(), 1);
+  EXPECT_EQ(traits.front(), Traits::kUsesDeviceCommunication);
+}
+
 // Declare XLA FFI handler as a function (extern "C" declaration).
 XLA_FFI_DECLARE_HANDLER_SYMBOL(NoOpHandler);
 
@@ -1165,14 +1184,14 @@ TEST(FfiTest, Metadata) {
 TEST(FfiTest, MetadataTraits) {
   static constexpr auto* noop = +[] { return absl::OkStatus(); };
   XLA_FFI_DEFINE_HANDLER(handler, noop, Ffi::Bind(),
-                         {Traits::kCmdBufferCompatible});
+                         {Traits::kUsesDeviceCommunication});
 
   absl::StatusOr<XLA_FFI_Metadata> maybe_metadata =
       GetMetadata(GetXlaFfiApi(), handler);
   EXPECT_TRUE(maybe_metadata.ok());
 
   XLA_FFI_Metadata metadata = maybe_metadata.value();
-  EXPECT_EQ(metadata.traits, XLA_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE);
+  EXPECT_EQ(metadata.traits, XLA_FFI_HANDLER_TRAITS_USES_DEVICE_COMMUNICATION);
   EXPECT_EQ(metadata.api_version.major_version, XLA_FFI_API_MAJOR);
   EXPECT_EQ(metadata.api_version.minor_version, XLA_FFI_API_MINOR);
   EXPECT_EQ(metadata.state_type_id.type_id, XLA_FFI_UNKNOWN_TYPE_ID.type_id);

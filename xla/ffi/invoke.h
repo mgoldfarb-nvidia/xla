@@ -70,6 +70,8 @@ class CollectiveMemory;
 
 namespace xla::ffi {
 
+class GpuCollectivesApi;
+
 // Context for invoking XLA FFI handlers. Backend specific context must be
 // constructed from `xla::ExecuteRunOptions`, to give FFI handlers access to
 // XLA runtime internals.
@@ -86,6 +88,7 @@ struct InvokeContext {
     gpu::CollectiveMemoryRequests* collective_memory_requests = nullptr;
     const gpu::CollectiveCliques* collective_cliques = nullptr;
     const gpu::CollectiveMemory* collective_memory = nullptr;
+    GpuCollectivesApi* gpu_collectives = nullptr;
     const stream_executor::GpuComputeCapability* compute_capability = nullptr;
     const xla::cpu::TargetMachineOptions* cpu_target_machine_options = nullptr;
     absl::Span<stream_executor::Stream* const> computation_streams;

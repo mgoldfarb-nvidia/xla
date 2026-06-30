@@ -208,10 +208,12 @@ cc_library(
         ":ffi_interop",
         ":ffi_registry",
         ":ffi_structs",
+        ":gpu_collectives_api",
         ":invoke",
         ":type_registry",
         "//xla:util",
         "//xla/ffi/api:c_api",
+        "//xla/ffi/api:c_api_gpu_collectives",
         "//xla/ffi/api:c_api_internal",
         "//xla/stream_executor:device_address",
         "//xla/stream_executor:device_address_allocator",
@@ -227,6 +229,35 @@ cc_library(
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
         "@eigen_archive//:eigen3",
+    ],
+)
+
+cc_library(
+    name = "gpu_collectives_api",
+    hdrs = ["gpu_collectives_api.h"],
+    deps = [
+        "//xla/ffi/api:c_api_gpu_collectives",
+        "@com_google_absl//absl/status",
+    ],
+)
+
+xla_cc_test(
+    name = "gpu_collectives_api_test",
+    srcs = ["gpu_collectives_api_test.cc"],
+    deps = [
+        ":call_frame",
+        ":ffi",
+        ":ffi_api",
+        ":ffi_registry",
+        ":ffi_structs",
+        ":gpu_collectives_api",
+        ":invoke",
+        "//xla/ffi/api:c_api",
+        "//xla/ffi/api:c_api_gpu_collectives",
+        "//xla/tsl/platform:test_main",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_googletest//:gtest",
     ],
 )
 
@@ -299,6 +330,7 @@ cc_library(
         ":execution_context",
         ":execution_state",
         "//xla:executable_run_options",
+        "//xla/ffi/api:c_api",
         "//xla/hlo/ir:hlo",
         "//xla/stream_executor:device_description",
         "//xla/tsl/concurrency:async_value",

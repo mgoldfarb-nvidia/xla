@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/backends/gpu/collectives/nccl_symmetric_memory.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
@@ -68,17 +69,50 @@ void LogInterconnectStatus(stream_executor::StreamExecutor* stream_executor) {
 
 }  // namespace
 
+SymmetricMemory::PackedKernelArgMetadata BuildNcclWindowKernelArgMetadata(
+    uint64_t validated_device_abi_version) {
+  return {/*device_abi_schema=*/kNcclWindowAbiSchema,
+          /*device_abi_version=*/validated_device_abi_version,
+          /*size_bytes=*/sizeof(ncclWindow_t),
+          /*alignment=*/alignof(ncclWindow_t)};
+}
+
+absl::Status ValidateNcclWindowDeviceAbi(uint64_t compile_time_version,
+                                         uint64_t runtime_version) {
+  if (compile_time_version != runtime_version) {
+    return absl::FailedPreconditionError(absl::StrFormat(
+        "NCCL symmetric memory device ABI mismatch: XLA compile-time "
+        "version=%d, loaded runtime version=%d",
+        compile_time_version, runtime_version));
+  }
+  return absl::OkStatus();
+}
+
 NcclSymmetricMemory::NcclSymmetricMemory(
     std::shared_ptr<NcclCommState> comm_state, ncclWindow_t win,
     stream_executor::DeviceAddressBase addr,
-    std::shared_ptr<tsl::Executor> executor)
-    : comm_state_(comm_state), win_(win), addr_(addr), executor_(executor) {}
+    std::shared_ptr<tsl::Executor> executor,
+    uint64_t validated_device_abi_version)
+    : comm_state_(comm_state),
+      win_(win),
+      addr_(addr),
+      executor_(executor),
+      kernel_arg_metadata_(
+          BuildNcclWindowKernelArgMetadata(validated_device_abi_version)) {}
 
 absl::StatusOr<std::unique_ptr<NcclSymmetricMemory>>
 NcclSymmetricMemory::Create(std::shared_ptr<NcclCommState> comm_state,
                             stream_executor::DeviceAddressBase addr,
                             const std::shared_ptr<tsl::Executor> executor,
                             stream_executor::StreamExecutor* stream_executor) {
+  int runtime_version = 0;
+  XLA_NCCL_RETURN_IF_ERROR(ncclGetVersion(&runtime_version));
+  if (absl::Status status =
+          ValidateNcclWindowDeviceAbi(NCCL_VERSION_CODE, runtime_version);
+      !status.ok()) {
+    return status;
+  }
+
   ncclWindow_t win;
   ncclResult_t nccl_status;
   {
@@ -96,8 +130,8 @@ NcclSymmetricMemory::Create(std::shared_ptr<NcclCommState> comm_state,
     return XLA_NCCL_STATUS(nccl_status);
   }
 
-  return absl::WrapUnique(
-      new NcclSymmetricMemory(comm_state, win, addr, executor));
+  return absl::WrapUnique(new NcclSymmetricMemory(comm_state, win, addr,
+                                                  executor, runtime_version));
 }
 
 NcclSymmetricMemory::~NcclSymmetricMemory() {

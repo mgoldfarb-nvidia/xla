@@ -66,6 +66,10 @@ bool IsCommandBufferCompatible(const XLA_FFI_Metadata& metadata) {
   return metadata.traits & XLA_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE;
 }
 
+bool UsesDeviceCommunication(const XLA_FFI_Metadata& metadata) {
+  return metadata.traits & XLA_FFI_HANDLER_TRAITS_USES_DEVICE_COMMUNICATION;
+}
+
 static std::vector<std::string> GetHandlerStages(
     const XLA_FFI_Handler_Bundle& bundle) {
   std::vector<std::string> stages;

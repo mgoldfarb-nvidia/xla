@@ -23,6 +23,8 @@ limitations under the License.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "xla/tsl/platform/status_macros.h"
@@ -53,6 +55,19 @@ static absl::StatusOr<se::StreamExecutor*> CreateExecutor() {
                    se::PlatformManager::PlatformWithName(platform_name));
   return platform->ExecutorForDevice(0);
 }
+
+class FailingThunk : public Thunk {
+ public:
+  FailingThunk() : Thunk(Thunk::kCustomCall, ThunkInfo()) {}
+
+  absl::Status ExecuteOnStream(const ExecuteParams&) override {
+    return absl::InternalError("intentional execution failure");
+  }
+  BufferUses buffer_uses() const override { return {}; }
+  absl::StatusOr<ThunkProto> ToProto() const override {
+    return absl::UnimplementedError("FailingThunk is not serializable");
+  }
+};
 
 // Test that 4 async start thunks each memset a quarter of a buffer on separate
 // streams, and 4 async done thunks synchronize back to the main stream.
@@ -144,6 +159,78 @@ TEST(AsyncThunkTest, ConcurrentMemsets) {
       ASSERT_EQ(result[i * kChunkLength + j], expected)
           << "Mismatch at chunk " << i << " element " << j;
     }
+  }
+}
+
+TEST(AsyncThunkTest, FinalizeAfterErrorClosesSkippedAsyncDone) {
+  ASSERT_OK_AND_ASSIGN(se::StreamExecutor * executor, CreateExecutor());
+  ASSERT_OK_AND_ASSIGN(auto stream, executor->CreateStream());
+  ASSERT_OK_AND_ASSIGN(auto async_stream, executor->CreateStream());
+
+  constexpr int64_t kLength = 256;
+  constexpr int64_t kBytes = kLength * sizeof(int32_t);
+  constexpr uint32_t kValue = 0x12345678;
+  se::StreamExecutorAddressAllocator allocator(executor);
+  ASSERT_OK_AND_ASSIGN(auto buffer,
+                       allocator.Allocate(executor->device_ordinal(), kBytes));
+  ASSERT_OK(stream->MemZero(buffer.ptr(), kBytes));
+
+  BufferAllocation allocation(/*index=*/0, kBytes, /*color=*/0);
+  ThunkSequence nested;
+  nested.push_back(std::make_unique<Memset32BitValueThunk>(
+      Thunk::ThunkInfo(), kValue,
+      BufferAllocation::Slice(&allocation, /*offset=*/0, kBytes)));
+
+  Thunk::ThunkInfo start_info;
+  start_info.profile_annotation = "start-before-failure";
+  start_info.thunk_id = ThunkId(1);
+  auto start = std::make_unique<AsyncStartThunk>(
+      start_info, ComputationStreamId(0), std::move(nested));
+  std::shared_ptr<AsyncExecution> async_execution = start->async_execution();
+
+  ThunkSequence thunks;
+  thunks.push_back(std::move(start));
+  thunks.push_back(std::make_unique<FailingThunk>());
+  thunks.push_back(
+      std::make_unique<AsyncDoneThunk>(Thunk::ThunkInfo(), async_execution));
+  ThunkExecutor thunk_executor(std::move(thunks));
+
+  BufferAllocations allocations({buffer.cref()}, executor->device_ordinal(),
+                                &allocator);
+  ServiceExecutableRunOptions run_options;
+  Thunk::ExecutionScopedState state;
+  Thunk::InitializeParams init_params;
+  init_params.executor = executor;
+  init_params.execution_scoped_state = &state;
+  ASSERT_OK(thunk_executor.Initialize(init_params));
+
+  Thunk::ExecuteParams params = Thunk::ExecuteParams::Create(
+      run_options, allocations, stream.get(), stream.get(),
+      /*collective_params=*/nullptr, /*collective_cliques=*/nullptr,
+      /*collective_memory=*/nullptr,
+      std::vector<se::Stream*>{async_stream.get()}, &state);
+  EXPECT_THAT(thunk_executor.ExecuteOnStream(params),
+              absl_testing::StatusIs(absl::StatusCode::kInternal,
+                                     "intentional execution failure"));
+
+  // GpuExecutable synchronizes every execution stream before finalization.
+  ASSERT_OK(async_stream->BlockHostUntilDone());
+  ASSERT_OK(thunk_executor.FinalizeOnError(&state));
+
+  // A fresh start proves that error finalization closed the skipped Done scope.
+  {
+    ASSERT_OK_AND_ASSIGN(
+        auto guard,
+        async_execution->Start(&state, stream.get(), async_stream.get()));
+  }
+  ASSERT_OK(async_execution->Done(&state, stream.get()));
+  ASSERT_OK(stream->BlockHostUntilDone());
+
+  std::vector<int32_t> result(kLength);
+  ASSERT_OK(stream->Memcpy(result.data(), buffer.cref(), kBytes));
+  ASSERT_OK(stream->BlockHostUntilDone());
+  for (int32_t value : result) {
+    EXPECT_EQ(static_cast<uint32_t>(value), kValue);
   }
 }
 

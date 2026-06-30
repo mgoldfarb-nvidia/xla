@@ -22,6 +22,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/types/span.h"
 #include "xla/executable_run_options.h"
+#include "xla/ffi/api/c_api.h"
 #include "xla/ffi/execution_context.h"
 #include "xla/ffi/execution_state.h"
 #include "xla/hlo/ir/hlo_computation.h"
@@ -40,6 +41,10 @@ struct ThreadPoolDevice;
 namespace xla::cpu {
 class TargetMachineOptions;
 }  // namespace xla::cpu
+
+namespace xla::ffi {
+class GpuCollectivesApi;
+}  // namespace xla::ffi
 
 namespace stream_executor {
 class Stream;
@@ -81,6 +86,8 @@ struct XLA_FFI_ExecutionContext {
     xla::gpu::CollectiveMemoryRequests* collective_memory_requests = nullptr;
     const xla::gpu::CollectiveCliques* collective_cliques = nullptr;
     const xla::gpu::CollectiveMemory* collective_memory = nullptr;
+    // Read-only bridge for GetDeviceComm and GetDeviceMemory.
+    xla::ffi::GpuCollectivesApi* gpu_collectives = nullptr;
     const stream_executor::GpuComputeCapability* gpu_compute_capability =
         nullptr;
     const xla::cpu::TargetMachineOptions* cpu_target_machine_options = nullptr;
@@ -98,6 +105,7 @@ struct XLA_FFI_ExecutionContext {
 
   xla::RunId run_id = xla::RunId{0};
   int32_t device_ordinal = -1;
+  XLA_FFI_ExecutionStage stage = XLA_FFI_ExecutionStage_INSTANTIATE;
 
   BackendContext backend_context;
   StateContext state_context;

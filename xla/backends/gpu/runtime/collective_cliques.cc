@@ -190,7 +190,10 @@ absl::StatusOr<CollectiveCliques> AcquireCollectiveCliques(
       return CliqueIds(clique_id);
     };
 
-    int64_t max_channels = r.key.communication_id() != CommunicationId(0)
+    // Communication id 1 is the XLA P2P lane. Other non-zero ids can be
+    // backend-owned collective lanes (for example callsite-exclusive public
+    // FFI collectives) and must retain the collective channel policy.
+    int64_t max_channels = r.key.communication_id() == CommunicationId(1)
                                ? params.p2p_max_nchannels
                                : params.collective_max_nchannels;
 

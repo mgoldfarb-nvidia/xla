@@ -27,6 +27,7 @@ limitations under the License.
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/base/casts.h"
+#include "absl/container/btree_set.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
@@ -34,6 +35,7 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/backends/cpu/target_machine_options.h"
+#include "xla/backends/gpu/collectives/gpu_communicator.h"
 #include "xla/backends/gpu/ffi.h"
 #include "xla/backends/gpu/runtime/collective_clique_requests.h"
 #include "xla/backends/gpu/runtime/collective_memory_requests.h"
@@ -52,6 +54,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/runtime/device_id.h"
 #include "xla/service/buffer_assignment.h"
+#include "xla/service/computation_placer.h"
 #include "xla/service/gpu/buffer_allocations.h"
 #include "xla/service/hlo.pb.h"
 #include "xla/service/hlo_module_config.h"
@@ -159,6 +162,28 @@ XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), kReturnErrorCustomCallName,
 XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), kReturnErrorCustomCallName,
                          "ROCM", kReturnError);
 
+absl::Status DeviceCommunicationNoOp(ffi::AnyBuffer) {
+  return absl::OkStatus();
+}
+
+XLA_FFI_DEFINE_HANDLER(kDeviceCommunicationNoOp, DeviceCommunicationNoOp,
+                       ffi::Ffi::Bind().Arg<ffi::AnyBuffer>());
+
+constexpr absl::string_view kDeviceCommunicationNoOpName =
+    "__xla_test$$device_communication_no_prepare";
+
+// Deliberately attach the trait to the registration instead of the handler
+// metadata. External DSOs register a bundle this way and do not need a user
+// Prepare callback.
+XLA_FFI_REGISTER_HANDLER(
+    ffi::GetXlaFfiApi(), kDeviceCommunicationNoOpName, "CUDA",
+    kDeviceCommunicationNoOp,
+    static_cast<XLA_FFI_Handler_Traits>(ffi::Traits::kUsesDeviceCommunication));
+XLA_FFI_REGISTER_HANDLER(
+    ffi::GetXlaFfiApi(), kDeviceCommunicationNoOpName, "ROCM",
+    kDeviceCommunicationNoOp,
+    static_cast<XLA_FFI_Handler_Traits>(ffi::Traits::kUsesDeviceCommunication));
+
 TEST(CustomCallThunkTest, ResolvesFFICustomCall) {
   ASSERT_OK_AND_ASSIGN(se::StreamExecutor * executor, GpuExecutor());
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Stream> stream,
@@ -187,6 +212,80 @@ TEST(CustomCallThunkTest, ResolvesFFICustomCall) {
   EXPECT_THAT(thunk->ExecuteOnStream(params),
               StatusIs(absl::StatusCode::kUnknown,
                        HasSubstr("Custom call was executed!")));
+}
+
+TEST(CustomCallThunkTest,
+     DeviceCommunicationTraitAutomaticallyPreparesTaggedBuffer) {
+  ASSERT_OK_AND_ASSIGN(se::StreamExecutor * executor, GpuExecutor());
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Stream> stream,
+                       executor->CreateStream());
+
+  DeviceAssignment device_assignment(/*replica_count=*/1,
+                                     /*computation_count=*/1);
+  device_assignment(0, 0) = 0;
+  ServiceExecutableRunOptions run_options;
+  run_options.mutable_run_options()->set_stream(stream.get());
+  run_options.mutable_run_options()->set_device_assignment(&device_assignment);
+  run_options.mutable_run_options()->set_local_device_count(1);
+  ASSERT_OK_AND_ASSIGN(
+      CollectiveParams collective_params,
+      CollectiveParams::Create(run_options, /*async_streams=*/{},
+                               LocalDeviceId(executor->device_ordinal())));
+
+  constexpr int64_t kBufferSize = 64;
+  BufferAllocation tagged_allocation(/*index=*/0, /*size=*/kBufferSize,
+                                     /*color=*/1);
+  Shape tagged_shape = ShapeUtil::MakeShape(U8, {16});
+  tagged_shape.mutable_layout()->set_memory_space(1);
+  ShapedSlice tagged_buffer{BufferAllocation::Slice(&tagged_allocation, 8, 16),
+                            std::move(tagged_shape)};
+
+  se::StreamExecutorAddressAllocator allocator(executor);
+  BufferAllocations buffer_allocations(
+      {se::DeviceAddressBase(
+          absl::bit_cast<void*>(static_cast<intptr_t>(0xDEADBEEF)),
+          kBufferSize)},
+      executor->device_ordinal(), &allocator);
+  CollectiveCliqueRequests clique_requests;
+  CollectiveMemoryRequests memory_requests(buffer_allocations);
+  Thunk::ExecutionScopedState execution_scoped_state;
+
+  Thunk::ThunkInfo thunk_info;
+  thunk_info.thunk_id = ThunkId(17);
+  ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<CustomCallThunk> thunk,
+      CustomCallThunk::Create(
+          std::move(thunk_info), std::string(kDeviceCommunicationNoOpName),
+          /*operands=*/{tagged_buffer}, /*results=*/{}, /*attributes=*/{},
+          /*called_computation=*/nullptr,
+          /*platform_name=*/executor->GetPlatform()->Name(),
+          /*gpu_compute_capability=*/
+          executor->GetDeviceDescription().gpu_compute_capability()));
+
+  Thunk::PrepareParams prepare_params{
+      &collective_params, &clique_requests,    &memory_requests,
+      executor,           &buffer_allocations, &execution_scoped_state};
+  ASSERT_OK(thunk->Prepare(prepare_params));
+
+  ASSERT_EQ(clique_requests.size(), 1);
+  std::vector<CollectiveCliqueRequests::CliqueRequest> clique_request =
+      clique_requests.OrderedRequestedCliques();
+  ASSERT_EQ(clique_request.size(), 1);
+  EXPECT_NE(
+      clique_request[0].key.communication_id().value() & (uint64_t{1} << 63),
+      0);
+  EXPECT_TRUE(clique_request[0].barrier_after_module_execution_requested);
+  EXPECT_NE(clique_request[0].dev_comms.find(
+                GpuDeviceCommunicator::Requirements{/*lsa_barrier_count=*/1}),
+            clique_request[0].dev_comms.end());
+
+  ASSERT_EQ(memory_requests.symmetric_size(), 1);
+  std::vector<CollectiveMemoryRequests::CollectiveAllocations> memory_request =
+      memory_requests.OrderedSymmetricAllocations();
+  ASSERT_EQ(memory_request.size(), 1);
+  EXPECT_EQ(memory_request[0].clique, clique_request[0].key);
+  EXPECT_EQ(memory_request[0].allocations,
+            (absl::btree_set<BufferAllocation::Index>{0}));
 }
 
 TEST(CustomCallThunkTest, CustomCallWithOwnedHandlers) {

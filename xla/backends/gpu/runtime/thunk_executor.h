@@ -56,6 +56,7 @@ class ThunkExecutor {
   absl::Status Prepare(const Thunk::PrepareParams& params);
   absl::Status Initialize(const Thunk::InitializeParams& params);
   absl::Status ExecuteOnStream(const Thunk::ExecuteParams& params);
+  absl::Status FinalizeOnError(Thunk::ExecutionScopedState* state);
 
   const ThunkSequence& thunks() const { return thunks_; }
   ThunkSequence& thunks() { return thunks_; }

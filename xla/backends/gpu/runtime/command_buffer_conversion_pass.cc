@@ -296,9 +296,15 @@ bool IsConvertible(const CustomCallThunk& custom_call_thunk,
   // Check if FFI handler is compatible with command buffers.
   absl::StatusOr<ffi::HandlerRegistration> registration =
       ffi::FindHandler(target_name, "gpu");
-  return registration.ok()
-             ? ffi::IsCommandBufferCompatible(registration->metadata)
-             : false;
+  if (!registration.ok()) return false;
+
+  // Traced command buffers are cached by operand/result allocation addresses,
+  // but device communicators and registered-memory handles can be recreated
+  // without those addresses changing. Until collective resource identity is
+  // part of the trace cache key, capturing such a handler can retain stale
+  // packed kernel arguments.
+  return ffi::IsCommandBufferCompatible(registration->metadata) &&
+         !ffi::UsesDeviceCommunication(registration->metadata);
 }
 
 // Returns true if the RaggedAllToAllThunk is convertible to a command

@@ -150,7 +150,48 @@ NcclCapabilities GetCapabilities(std::shared_ptr<NcclCommState> comm_state) {
 #endif
 }
 
+absl::Status ValidateLsaBarrierCount(int32_t count) {
+  if (count < 0) {
+    return InvalidArgument("lsa_barrier_count must be non-negative; got %d",
+                           count);
+  }
+  return absl::OkStatus();
+}
+
 }  // namespace
+
+GpuDeviceCommunicator::PackedKernelArgMetadata
+BuildNcclDeviceCommKernelArgMetadata(uint64_t validated_device_abi_version) {
+  return {/*device_abi_schema=*/kNcclDeviceCommAbiSchema,
+          /*device_abi_version=*/validated_device_abi_version,
+          /*size_bytes=*/sizeof(ncclDevComm),
+          /*alignment=*/alignof(ncclDevComm)};
+}
+
+absl::StatusOr<ncclDevCommRequirements> BuildNcclDeviceCommRequirements(
+    const GpuDeviceCommunicator::Requirements& requirements) {
+  RETURN_IF_ERROR(ValidateLsaBarrierCount(requirements.lsa_barrier_count));
+
+#if NCCL_VERSION_CODE >= 22900
+  ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+#else
+  ncclDevCommRequirements reqs{};
+#endif
+  reqs.lsaBarrierCount = requirements.lsa_barrier_count;
+
+  return reqs;
+}
+
+absl::Status ValidateNcclDeviceAbi(uint64_t compile_time_version,
+                                   uint64_t runtime_version) {
+  if (compile_time_version != runtime_version) {
+    return FailedPrecondition(
+        "NCCL device ABI mismatch: XLA compile-time version=%d, loaded runtime "
+        "version=%d",
+        compile_time_version, runtime_version);
+  }
+  return absl::OkStatus();
+}
 
 absl::Status NcclCapabilities::GetOneSidedCommUnsupportedError(
     absl::string_view op) const {
@@ -189,6 +230,10 @@ NcclCommunicator::CreateDeviceComm(
                 << requirements;
         if (cancel_->IsCancelled()) {
           return FailedPrecondition("NcclCommunicator aborted");
+        }
+        if (!capabilities_.supports_device_comm) {
+          return Unimplemented(
+              "NCCL communicator does not support the device API");
         }
 
         return NcclDeviceCommunicator::CreateFrom(*this, requirements);
@@ -1007,11 +1052,14 @@ Future<T> NcclCommunicator::Execute(
 NcclDeviceCommunicator::NcclDeviceCommunicator(
     std::shared_ptr<NcclCommState> parent_comm,
     se::StreamExecutor* stream_executor,
-    std::shared_ptr<tsl::Executor> executor, ncclDevComm dev_comm)
+    std::shared_ptr<tsl::Executor> executor,
+    uint64_t validated_device_abi_version, ncclDevComm dev_comm)
     : parent_comm_(parent_comm),
       stream_executor_(stream_executor),
       executor_(std::move(executor)),
-      dev_comm_(dev_comm) {}
+      dev_comm_(dev_comm),
+      kernel_arg_metadata_(
+          BuildNcclDeviceCommKernelArgMetadata(validated_device_abi_version)) {}
 
 NcclDeviceCommunicator::~NcclDeviceCommunicator() {
   VLOG(3) << absl::StreamFormat("Destroy NCCL device comm %v", *this);
@@ -1039,18 +1087,18 @@ absl::StatusOr<std::unique_ptr<NcclDeviceCommunicator>>
 NcclDeviceCommunicator::CreateFrom(const NcclCommunicator& comm,
                                    const Requirements& requirements) {
   VLOG(3) << absl::StreamFormat(
-      "Create NCCL device comm from %v: lsa_barrier_count=%d", comm,
-      requirements.lsa_barrier_count);
+      "Create NCCL device comm from %v with requirements %v", comm,
+      requirements);
 
   DCHECK(comm.stream_executor()) << "StreamExecutor is unavailable";
   auto activation = comm.stream_executor()->Activate();
 
-  ncclDevCommRequirements reqs{};
-  memset(&reqs, 0, sizeof(reqs));
-#if NCCL_VERSION_CODE >= 22900
-  reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-#endif
-  reqs.lsaBarrierCount = requirements.lsa_barrier_count;
+  ASSIGN_OR_RETURN(ncclDevCommRequirements reqs,
+                   BuildNcclDeviceCommRequirements(requirements));
+
+  int runtime_version = 0;
+  RETURN_IF_ERROR(XLA_NCCL_STATUS(ncclGetVersion(&runtime_version)));
+  RETURN_IF_ERROR(ValidateNcclDeviceAbi(NCCL_VERSION_CODE, runtime_version));
 
   std::shared_ptr<NcclCommState> comm_state = comm.comm_state();
   ncclDevComm dev_comm{};
@@ -1060,8 +1108,9 @@ NcclDeviceCommunicator::CreateFrom(const NcclCommunicator& comm,
         XLA_NCCL_STATUS(ncclDevCommCreate(comm_state->comm, &reqs, &dev_comm)));
   }
 
-  return absl::WrapUnique(new NcclDeviceCommunicator(
-      comm_state, comm.stream_executor(), comm.executor(), dev_comm));
+  return absl::WrapUnique(
+      new NcclDeviceCommunicator(comm_state, comm.stream_executor(),
+                                 comm.executor(), runtime_version, dev_comm));
 }
 
 PlatformCommunicatorHandle NcclDeviceCommunicator::platform_comm() const {

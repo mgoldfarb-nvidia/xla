@@ -61,6 +61,7 @@ class AsyncStartThunk : public Thunk {
   absl::Status Prepare(const PrepareParams& params) override;
   absl::Status Initialize(const InitializeParams& params) override;
   absl::Status ExecuteOnStream(const ExecuteParams& params) override;
+  absl::Status FinalizeOnError(ExecutionScopedState* state) override;
 
   // TODO(b/527907619): Implement this properly once we have figured out how
   // buffer uses should look like for async thunks.

@@ -109,6 +109,10 @@ absl::Status AsyncStartThunk::ExecuteOnStream(const ExecuteParams& params) {
   return executor_.ExecuteOnStream(params.WithComputeStream(async_stream));
 }
 
+absl::Status AsyncStartThunk::FinalizeOnError(ExecutionScopedState* state) {
+  return async_execution_->FinalizeOnError(state);
+}
+
 absl::Status AsyncStartThunk::WalkNested(Walker callback) {
   return executor_.thunks().WalkNested(callback);
 }

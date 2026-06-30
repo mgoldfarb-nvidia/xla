@@ -131,6 +131,20 @@ absl::Status ThunkExecutor::ExecuteOnStream(
   return absl::OkStatus();
 }
 
+absl::Status ThunkExecutor::FinalizeOnError(
+    Thunk::ExecutionScopedState* state) {
+  std::vector<Thunk*> nested_thunks;
+  for (const std::unique_ptr<Thunk>& thunk : thunks_) {
+    thunk->Walk([&](Thunk* nested) { nested_thunks.push_back(nested); });
+  }
+
+  absl::Status status = absl::OkStatus();
+  for (Thunk* thunk : nested_thunks) {
+    status.Update(thunk->FinalizeOnError(state));
+  }
+  return status;
+}
+
 //===----------------------------------------------------------------------===//
 // Tracking Thunk execution progress.
 //===----------------------------------------------------------------------===//
