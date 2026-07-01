@@ -53,26 +53,37 @@ TEST(GpuDeviceCommunicatorRequirementsTest,
   Requirements requirements{8};
 
   EXPECT_EQ(requirements.lsa_barrier_count, 8);
+  EXPECT_EQ(requirements.global_barrier_count, 0);
 }
 
-TEST(GpuDeviceCommunicatorRequirementsTest, EqualityUsesLsaBarrierCount) {
+TEST(GpuDeviceCommunicatorRequirementsTest, EqualityUsesAllBarrierCounts) {
+  Requirements one_global{8, 1};
+  Requirements two_global{8, 2};
+
   EXPECT_EQ(Requirements{8}, Requirements{8});
   EXPECT_FALSE(Requirements{8} == Requirements{7});
+  EXPECT_FALSE(one_global == two_global);
 }
 
-TEST(GpuDeviceCommunicatorRequirementsTest, OrdersLargerLsaBarrierCountsFirst) {
+TEST(GpuDeviceCommunicatorRequirementsTest,
+     OrdersGlobalThenLsaCountsDescending) {
   absl::btree_set<Requirements> requirements = {
-      Requirements{1}, Requirements{3}, Requirements{2}};
+      Requirements{1, 0}, Requirements{3, 0}, Requirements{2, 1},
+      Requirements{1, 2}};
 
-  ASSERT_EQ(requirements.size(), 3);
+  ASSERT_EQ(requirements.size(), 4);
   auto it = requirements.begin();
-  EXPECT_EQ((it++)->lsa_barrier_count, 3);
+  EXPECT_EQ((it)->global_barrier_count, 2);
+  EXPECT_EQ((it++)->lsa_barrier_count, 1);
+  EXPECT_EQ((it)->global_barrier_count, 1);
   EXPECT_EQ((it++)->lsa_barrier_count, 2);
+  EXPECT_EQ((it++)->lsa_barrier_count, 3);
   EXPECT_EQ((it++)->lsa_barrier_count, 1);
 }
 
-TEST(GpuDeviceCommunicatorRequirementsTest, StringifiesLsaBarrierCount) {
-  EXPECT_EQ(absl::StrCat(Requirements{8}), "{lsa_barrier_count: 8}");
+TEST(GpuDeviceCommunicatorRequirementsTest, StringifiesBarrierCounts) {
+  EXPECT_EQ(absl::StrCat(Requirements{8, 2}),
+            "{lsa_barrier_count: 8, global_barrier_count: 2}");
 }
 
 TEST(GpuDeviceCommunicatorKernelArgAbiTest, AcceptsExactProviderAbi) {

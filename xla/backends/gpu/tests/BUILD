@@ -1210,8 +1210,9 @@ cc_library(
     ]),
 )
 
-# CUDA/NCCL-only launcher for the real LSA collective kernel. This deliberately
-# has no dependency on StreamExecutor or any other XLA implementation target.
+# CUDA/NCCL-only launcher for the real device collective kernel, including its
+# full-team LSA/GIN synchronization path. This deliberately has no dependency
+# on StreamExecutor or any other XLA implementation target.
 cuda_library(
     name = "gpu_collectives_ffi_plugin_kernel",
     testonly = True,

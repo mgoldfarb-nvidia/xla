@@ -275,9 +275,11 @@ TEST(CustomCallThunkTest,
       clique_request[0].key.communication_id().value() & (uint64_t{1} << 63),
       0);
   EXPECT_TRUE(clique_request[0].barrier_after_module_execution_requested);
-  EXPECT_NE(clique_request[0].dev_comms.find(
-                GpuDeviceCommunicator::Requirements{/*lsa_barrier_count=*/1}),
-            clique_request[0].dev_comms.end());
+  EXPECT_NE(
+      clique_request[0].dev_comms.find(
+          GpuDeviceCommunicator::Requirements{/*lsa_barrier_count=*/0,
+                                              /*global_barrier_count=*/1}),
+      clique_request[0].dev_comms.end());
 
   ASSERT_EQ(memory_requests.symmetric_size(), 1);
   std::vector<CollectiveMemoryRequests::CollectiveAllocations> memory_request =

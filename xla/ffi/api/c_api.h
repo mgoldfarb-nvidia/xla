@@ -489,7 +489,10 @@ enum XLA_FFI_Handler_TraitsBits {
   XLA_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE = 1u << 0,
 
   // A GPU handler can initiate device-side communication. XLA prepares one
-  // load/store-accessible synchronization slot and registers tagged buffers.
+  // full-team synchronization slot and registers tagged buffers. The backend
+  // can implement the slot hierarchically, using load/store-accessible
+  // synchronization within a local accessibility domain and device networking
+  // between domains.
   // The device communication team is the full execution group (all replicas
   // and partitions, ordered by flattened ID).
   // Handlers with this trait execute outside command buffers because device

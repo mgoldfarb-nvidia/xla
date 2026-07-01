@@ -197,6 +197,11 @@ TEST(FfiCollectiveResourcesTest,
   std::vector<CollectiveCliqueRequests::CliqueRequest> clique_request =
       clique_requests.OrderedRequestedCliques();
   ASSERT_EQ(clique_request.size(), 1);
+  EXPECT_EQ(
+      clique_request[0].dev_comms,
+      (absl::btree_set<GpuDeviceCommunicator::Requirements>{
+          GpuDeviceCommunicator::Requirements{/*lsa_barrier_count=*/0,
+                                              /*global_barrier_count=*/1}}));
   std::vector<CollectiveMemoryRequests::CollectiveAllocations> memory_request =
       memory_requests.OrderedSymmetricAllocations();
   ASSERT_EQ(memory_request.size(), 1);

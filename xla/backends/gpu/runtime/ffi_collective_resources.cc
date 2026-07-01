@@ -56,7 +56,7 @@ namespace xla::gpu {
 namespace {
 
 constexpr int64_t kCollectiveMemorySpace = 1;
-constexpr int32_t kDeviceCommunicationBarrierSlots = 1;
+constexpr int32_t kDeviceCommunicationGlobalBarrierSlots = 1;
 constexpr uint64_t kFfiResourceDomainNamespace = uint64_t{1} << 63;
 
 uint64_t ResourceDomain(absl::string_view target_name,
@@ -193,7 +193,8 @@ absl::Status FfiCollectiveResources::PrepareDeviceCommunication() {
                       CommunicationId(resource_domain_)));
 
   GpuDeviceCommunicator::Requirements requirements{
-      kDeviceCommunicationBarrierSlots};
+      /*lsa_barrier_count=*/0,
+      /*global_barrier_count=*/kDeviceCommunicationGlobalBarrierSlots};
   CollectiveCliqueRequests::CliqueRequirements clique_requirements;
   clique_requirements.barrier_reqs =
       CollectiveCliqueRequests::BarrierRequirements{

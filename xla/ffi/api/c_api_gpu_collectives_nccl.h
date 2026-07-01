@@ -27,6 +27,15 @@ limitations under the License.
 // with destination_size == sizeof(ncclDevComm). The symmetric-memory
 // destination is an ncclWindow_t with destination_size ==
 // sizeof(ncclWindow_t).
+//
+// XLA provisions synchronization slot 0 as a full-team barrier. A device
+// kernel can use the NCCL LSA barrier when ncclDevComm::lsaSize equals
+// ncclDevComm::nRanks. Otherwise, it constructs ncclGin from the device
+// communicator and a context index, then uses NCCL's world ncclBarrierSession,
+// which composes the LSA and rail GIN barriers. XLA enables GIN while creating
+// the device communicator and registers every tagged symmetric window during
+// resource preparation; no FFI-side GIN registration or configuration is
+// required.
 #define XLA_FFI_GpuCollective_NCCL_DEVICE_COMM_ABI_SCHEMA \
   UINT64_C(0x4e43434c44433031)  // ASCII "NCCLDC01"
 #define XLA_FFI_GpuCollective_NCCL_SYMMETRIC_MEMORY_ABI_SCHEMA \

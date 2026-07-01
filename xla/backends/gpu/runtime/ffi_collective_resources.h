@@ -75,8 +75,9 @@ class FfiCollectiveResources final : public ffi::GpuCollectivesApi {
 
   // Declares all resources for the minimal initial contract. This is invoked
   // by the thunk based on handler metadata, before the handler's optional
-  // Prepare callback. It provisions one load/store-accessible synchronization
-  // slot per callsite.
+  // Prepare callback. It provisions one full-team synchronization slot per
+  // callsite. Backends can implement the slot hierarchically across local
+  // accessibility and device-network domains.
   absl::Status PrepareDeviceCommunication();
 
   absl::Status GetDeviceComm(

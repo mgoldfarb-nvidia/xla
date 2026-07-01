@@ -31,11 +31,14 @@ extern "C" {
 // Returns the execution-scoped device communicator selected and configured by
 // XLA for an FFI handler declared with USES_DEVICE_COMMUNICATION. It spans the
 // full execution group (all replicas and partitions, ordered by flattened ID).
-// The initial contract provides one load/store-accessible synchronization slot
-// (slot 0) per callsite; handlers requiring more slots are not supported. This
-// operation copies the provider kernel argument into caller-owned storage after
-// validating the expected provider schema, ABI version, and exact destination
-// size. It is available during the Initialize and Execute stages.
+// The initial contract provides one full-team synchronization slot (slot 0) per
+// callsite. On NCCL, XLA uses an LSA barrier when the team is load/store
+// accessible and composes LSA with GIN when it spans accessibility domains.
+// Handlers requiring more slots or separate user signal/counter pools are not
+// supported. This operation copies the provider kernel argument into
+// caller-owned storage after validating the expected provider schema, ABI
+// version, and exact destination size. It is available during the Initialize
+// and Execute stages.
 struct XLA_FFI_GpuCollectives_GetDeviceComm_Args {
   size_t struct_size;
   XLA_FFI_Extension_Base* extension_start;

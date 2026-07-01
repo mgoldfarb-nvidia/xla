@@ -25,16 +25,9 @@ limitations under the License.
 
 namespace {
 
-// This is the public-FFI variant of the existing NcclDevAllReduce test kernel
-// in collective_ops_ffi_kernels.cu.cc. It is compiled into the external DSO so
-// launching it requires no StreamExecutor or XLA GPU runtime symbols.
 template <typename T>
-__global__ void NcclDevAllReduce(ncclDevComm dev_comm, ncclWindow_t window,
-                                 size_t offset, size_t count) {
-  ncclLsaBarrierSession<ncclCoopCta> barrier(ncclCoopCta(), dev_comm,
-                                             ncclTeamTagLsa(), blockIdx.x);
-  barrier.sync(ncclCoopCta(), cuda::memory_order_relaxed);
-
+__device__ void LsaAllReduce(ncclDevComm dev_comm, ncclWindow_t window,
+                             size_t offset, size_t count) {
   const int rank = dev_comm.lsaRank;
   const int num_ranks = dev_comm.lsaSize;
   const int global_thread =
@@ -52,11 +45,47 @@ __global__ void NcclDevAllReduce(ncclDevComm dev_comm, ncclWindow_t window,
       output[i] = value;
     }
   }
+}
+
+template <typename T>
+__device__ void RunLsaAllReduce(ncclDevComm dev_comm, ncclWindow_t window,
+                                size_t offset, size_t count,
+                                ncclBarrierSession<ncclCoopCta>& barrier) {
+  barrier.sync(ncclCoopCta(), cuda::memory_order_relaxed,
+               ncclGinFenceLevel::Relaxed);
+  LsaAllReduce<T>(dev_comm, window, offset, count);
 
   // Public FFI handlers must collectively quiesce remote accesses before their
   // device work returns. This final barrier is what makes XLA's subsequent
   // local stream completion sufficient to release the registered allocations.
-  barrier.sync(ncclCoopCta(), cuda::memory_order_release);
+  barrier.sync(ncclCoopCta(), cuda::memory_order_release,
+               ncclGinFenceLevel::Relaxed);
+}
+
+// This is the public-FFI variant of the existing NcclDevAllReduce test kernel
+// in collective_ops_ffi_kernels.cu.cc. It is compiled into the external DSO so
+// launching it requires no StreamExecutor or XLA GPU runtime symbols.
+//
+// The data reduction is deliberately LSA-local. The surrounding barrier spans
+// the full execution team and therefore compiles and exercises the GIN path
+// when the team contains multiple LSA domains.
+template <typename T>
+__global__ void NcclDevLsaAllReduceWithFullTeamBarrier(ncclDevComm dev_comm,
+                                                       ncclWindow_t window,
+                                                       size_t offset,
+                                                       size_t count) {
+  constexpr uint32_t kBarrierSlot = 0;
+  if (dev_comm.lsaSize == dev_comm.nRanks) {
+    ncclBarrierSession<ncclCoopCta> barrier(ncclCoopCta(), ncclTeamTagLsa(),
+                                            dev_comm, kBarrierSlot);
+    RunLsaAllReduce<T>(dev_comm, window, offset, count, barrier);
+    return;
+  }
+
+  ncclGin gin(dev_comm, /*contextIndex=*/0);
+  ncclBarrierSession<ncclCoopCta> barrier(ncclCoopCta(), ncclTeamTagWorld(),
+                                          gin, kBarrierSlot);
+  RunLsaAllReduce<T>(dev_comm, window, offset, count, barrier);
 }
 
 }  // namespace
@@ -78,7 +107,7 @@ cudaError_t LaunchGpuCollectivesFfiTestKernel(cudaStream_t stream,
   std::memcpy(&unpacked_device_comm, device_comm, sizeof(unpacked_device_comm));
   std::memcpy(&unpacked_window, symmetric_memory, sizeof(unpacked_window));
 
-  NcclDevAllReduce<uint32_t><<<1, 8, 0, stream>>>(
+  NcclDevLsaAllReduceWithFullTeamBarrier<uint32_t><<<1, 8, 0, stream>>>(
       unpacked_device_comm, unpacked_window, offset, count);
   return cudaPeekAtLastError();
 }
@@ -106,12 +135,12 @@ cudaError_t LaunchGpuCollectivesFfiTwoBufferTestKernel(
   std::memcpy(&first_window, first_symmetric_memory, sizeof(first_window));
   std::memcpy(&second_window, second_symmetric_memory, sizeof(second_window));
 
-  NcclDevAllReduce<uint32_t><<<1, 8, 0, stream>>>(
+  NcclDevLsaAllReduceWithFullTeamBarrier<uint32_t><<<1, 8, 0, stream>>>(
       unpacked_device_comm, first_window, first_offset, first_count);
   cudaError_t launch_status = cudaPeekAtLastError();
   if (launch_status != cudaSuccess) return launch_status;
 
-  NcclDevAllReduce<uint32_t><<<1, 8, 0, stream>>>(
+  NcclDevLsaAllReduceWithFullTeamBarrier<uint32_t><<<1, 8, 0, stream>>>(
       unpacked_device_comm, second_window, second_offset, second_count);
   return cudaPeekAtLastError();
 }

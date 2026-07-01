@@ -85,20 +85,35 @@ class GpuDeviceCommunicator {
   struct Requirements {
     template <typename Sink>
     friend void AbslStringify(Sink& sink, const Requirements& reqs) {
-      absl::Format(&sink, "{lsa_barrier_count: %d}", reqs.lsa_barrier_count);
+      absl::Format(&sink, "{lsa_barrier_count: %d, global_barrier_count: %d}",
+                   reqs.lsa_barrier_count, reqs.global_barrier_count);
     }
 
     bool operator==(const Requirements& other) const {
-      return other.lsa_barrier_count == lsa_barrier_count;
+      return other.lsa_barrier_count == lsa_barrier_count &&
+             other.global_barrier_count == global_barrier_count;
     }
 
     bool operator<(const Requirements& other) const {
+      if (other.global_barrier_count != global_barrier_count) {
+        return other.global_barrier_count < global_barrier_count;
+      }
       return other.lsa_barrier_count < lsa_barrier_count;
     }
+
+    // Barrier counts reserve prefixes of one shared slot namespace. A local
+    // and a full-team barrier with the same index use the same local barrier
+    // resources and must not be active concurrently.
 
     // The number of barriers to allocate for load/store accessible
     // communication.
     int32_t lsa_barrier_count = 0;
+
+    // The number of barriers to allocate across the full communication team.
+    // Backends may implement this hierarchically, for example with an LSA
+    // barrier inside each local accessibility domain and device networking
+    // between domains.
+    int32_t global_barrier_count = 0;
   };
 
   // Returns a platform-specific handle to the underlying communicator object.

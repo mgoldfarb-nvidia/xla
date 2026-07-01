@@ -60,10 +60,16 @@ using NcclSignalDesc = GpuSignalDesc;
 inline constexpr uint64_t kNcclDeviceCommAbiSchema =
     uint64_t{0x4e43434c44433031};  // "NCCLDC01"
 
-// Validates and converts XLA's LSA barrier requirement to the compile-time NCCL
-// device API. This function does not access a GPU or an NCCL communicator.
+struct NcclCapabilities;
+
+// Validates and converts XLA's device communicator requirements to the
+// compile-time NCCL device API. Full-team barriers use only LSA when the
+// communicator has one LSA team, and otherwise use NCCL GIN to compose a
+// hierarchical barrier. This function does not access a GPU or an NCCL
+// communicator.
 absl::StatusOr<ncclDevCommRequirements> BuildNcclDeviceCommRequirements(
-    const GpuDeviceCommunicator::Requirements& requirements);
+    const GpuDeviceCommunicator::Requirements& requirements,
+    const NcclCapabilities& capabilities);
 
 // Validates exact compatibility between the NCCL ABI used to compile XLA and
 // the loaded NCCL runtime. This function does not access a GPU and is exposed
@@ -72,8 +78,19 @@ absl::Status ValidateNcclDeviceAbi(uint64_t compile_time_version,
                                    uint64_t runtime_version);
 
 struct NcclCapabilities {
-  bool supports_device_comm;
-  bool supports_one_sided_comm;
+  enum class GinConnectionType { kNone, kFull, kRail };
+
+  bool supports_device_comm = false;
+  bool supports_one_sided_comm = false;
+
+  // Number of load/store accessibility domains in this communicator. A
+  // full-team device barrier needs GIN when this is greater than one.
+  int lsa_team_count = 0;
+
+  // Best GIN connectivity supported by every rank in the communicator. Full
+  // connectivity is preferred; rail connectivity is sufficient for NCCL's
+  // hierarchical full-team barrier.
+  GinConnectionType gin_connection_type = GinConnectionType::kNone;
 
   // Reason one-sided comm is not supported, cached at construction. Empty
   // if one-sided comm is supported.

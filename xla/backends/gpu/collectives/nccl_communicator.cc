@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/backends/gpu/collectives/nccl_communicator.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -82,9 +83,7 @@ se::Stream* ToStream(const Communicator::Executor& executor) {
 }
 
 NcclCapabilities GetCapabilities(std::shared_ptr<NcclCommState> comm_state) {
-  bool support_device_comm = false;
-  bool support_one_sided_comm = false;
-  std::string one_sided_comm_unsupported_reason = "";
+  NcclCapabilities capabilities;
 
 #if NCCL_VERSION_CODE >= 22907
   ncclCommProperties_t props = NCCL_COMM_PROPERTIES_INITIALIZER;
@@ -92,20 +91,17 @@ NcclCapabilities GetCapabilities(std::shared_ptr<NcclCommState> comm_state) {
     absl::MutexLock lock(comm_state->mutex);
     ncclResult_t status = ncclCommQueryProperties(comm_state->comm, &props);
     if (status != ncclSuccess) {
-      return {
-          /*supports_device_comm=*/false,
-          /*supports_one_sided_comm=*/false,
-          /*one_sided_comm_unsupported_reason=*/
+      capabilities.one_sided_comm_unsupported_reason =
           absl::StrFormat("NCCL failed to query communicator properties: %s",
-                          ncclGetErrorString(status)),
-      };
+                          ncclGetErrorString(status));
+      return capabilities;
     }
   }
 
   if (props.hostRmaSupport) {
-    support_one_sided_comm = true;
+    capabilities.supports_one_sided_comm = true;
   } else {
-    one_sided_comm_unsupported_reason = absl::StrFormat(
+    capabilities.one_sided_comm_unsupported_reason = absl::StrFormat(
         "NCCL reports this communicator does not support host "
         "RMA (hostRmaSupport=false). This is typically caused "
         "by the hardware, network fabric, or NCCL runtime "
@@ -114,39 +110,30 @@ NcclCapabilities GetCapabilities(std::shared_ptr<NcclCommState> comm_state) {
         NCCL_VERSION_CODE);
   }
 
-  if (props.deviceApiSupport) {
-    support_device_comm = true;
+  capabilities.supports_device_comm = props.deviceApiSupport;
+  capabilities.lsa_team_count = props.nLsaTeams;
+  if (props.ginType != NCCL_GIN_TYPE_NONE) {
+    capabilities.gin_connection_type =
+        NcclCapabilities::GinConnectionType::kFull;
+  } else if (props.railedGinType != NCCL_GIN_TYPE_NONE) {
+    capabilities.gin_connection_type =
+        NcclCapabilities::GinConnectionType::kRail;
   }
-
-  return {
-      /*supports_device_comm=*/support_device_comm,
-      /*supports_one_sided_comm=*/support_one_sided_comm,
-      /*one_sided_comm_unsupported_reason=*/one_sided_comm_unsupported_reason,
-  };
+  return capabilities;
 #elif NCCL_VERSION_CODE >= 22900
-  return {
-      /*supports_device_comm=*/true,
-      /*supports_one_sided_comm=*/false,
-      /*one_sided_comm_unsupported_reason=*/
-      absl::StrFormat("NCCL >= 2.29.7 is required (current: %d)",
-                      NCCL_VERSION_CODE),
-  };
+  capabilities.supports_device_comm = true;
+  capabilities.one_sided_comm_unsupported_reason = absl::StrFormat(
+      "NCCL >= 2.29.7 is required (current: %d)", NCCL_VERSION_CODE);
+  return capabilities;
 #elif NCCL_VERSION_CODE >= 22800
-  return {
-      /*supports_device_comm=*/true,
-      /*supports_one_sided_comm=*/false,
-      /*one_sided_comm_unsupported_reason=*/
-      absl::StrFormat("NCCL >= 2.29.0 is required (current: %d)",
-                      NCCL_VERSION_CODE),
-  };
+  capabilities.supports_device_comm = true;
+  capabilities.one_sided_comm_unsupported_reason = absl::StrFormat(
+      "NCCL >= 2.29.0 is required (current: %d)", NCCL_VERSION_CODE);
+  return capabilities;
 #else
-  return {
-      /*supports_device_comm=*/false,
-      /*supports_one_sided_comm=*/false,
-      /*one_sided_comm_unsupported_reason=*/
-      absl::StrFormat("NCCL >= 2.29.0 is required (current: %d)",
-                      NCCL_VERSION_CODE),
-  };
+  capabilities.one_sided_comm_unsupported_reason = absl::StrFormat(
+      "NCCL >= 2.29.0 is required (current: %d)", NCCL_VERSION_CODE);
+  return capabilities;
 #endif
 }
 
@@ -158,11 +145,22 @@ absl::Status ValidateLsaBarrierCount(int32_t count) {
   return absl::OkStatus();
 }
 
+absl::Status ValidateGlobalBarrierCount(int32_t count) {
+  if (count < 0) {
+    return InvalidArgument("global_barrier_count must be non-negative; got %d",
+                           count);
+  }
+  return absl::OkStatus();
+}
+
 }  // namespace
 
 absl::StatusOr<ncclDevCommRequirements> BuildNcclDeviceCommRequirements(
-    const GpuDeviceCommunicator::Requirements& requirements) {
+    const GpuDeviceCommunicator::Requirements& requirements,
+    const NcclCapabilities& capabilities) {
   RETURN_IF_ERROR(ValidateLsaBarrierCount(requirements.lsa_barrier_count));
+  RETURN_IF_ERROR(
+      ValidateGlobalBarrierCount(requirements.global_barrier_count));
 
 #if NCCL_VERSION_CODE >= 22900
   ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
@@ -170,6 +168,46 @@ absl::StatusOr<ncclDevCommRequirements> BuildNcclDeviceCommRequirements(
   ncclDevCommRequirements reqs{};
 #endif
   reqs.lsaBarrierCount = requirements.lsa_barrier_count;
+
+  if (requirements.global_barrier_count == 0) return reqs;
+
+#if NCCL_VERSION_CODE >= 22907
+  if (capabilities.lsa_team_count <= 0) {
+    return Unimplemented(
+        "NCCL communicator does not report its LSA topology; full-team device "
+        "barriers require NCCL >= 2.29.7");
+  }
+
+  // A full-team barrier needs only the LSA barrier when every rank belongs to
+  // one load/store accessibility domain.
+  if (capabilities.lsa_team_count == 1) {
+    reqs.lsaBarrierCount =
+        std::max(reqs.lsaBarrierCount, requirements.global_barrier_count);
+    return reqs;
+  }
+
+  // Across multiple LSA domains NCCL implements a full-team barrier as an LSA
+  // inner barrier plus a GIN rail barrier. NCCL allocates the barrier's private
+  // signals and counters from barrierCount; callers do not need public leases.
+  reqs.barrierCount = requirements.global_barrier_count;
+  switch (capabilities.gin_connection_type) {
+    case NcclCapabilities::GinConnectionType::kFull:
+      reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
+      break;
+    case NcclCapabilities::GinConnectionType::kRail:
+      reqs.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
+      break;
+    case NcclCapabilities::GinConnectionType::kNone:
+      return Unimplemented(
+          "Full-team device barrier spans %d LSA domains, but NCCL reports no "
+          "GIN connectivity",
+          capabilities.lsa_team_count);
+  }
+#else
+  return Unimplemented(
+      "Full-team device barriers require NCCL >= 2.29.7 (current: %d)",
+      NCCL_VERSION_CODE);
+#endif
 
   return reqs;
 }
@@ -1085,8 +1123,9 @@ NcclDeviceCommunicator::CreateFrom(const NcclCommunicator& comm,
   DCHECK(comm.stream_executor()) << "StreamExecutor is unavailable";
   auto activation = comm.stream_executor()->Activate();
 
-  ASSIGN_OR_RETURN(ncclDevCommRequirements reqs,
-                   BuildNcclDeviceCommRequirements(requirements));
+  ASSIGN_OR_RETURN(
+      ncclDevCommRequirements reqs,
+      BuildNcclDeviceCommRequirements(requirements, comm.capabilities_));
 
   int runtime_version = 0;
   RETURN_IF_ERROR(XLA_NCCL_STATUS(ncclGetVersion(&runtime_version)));
