@@ -18,23 +18,38 @@ limitations under the License.
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <tuple>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/container/btree_set.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
+#include "xla/backends/gpu/collectives/loopback_collectives.h"
+#include "xla/backends/gpu/runtime/collective_clique_requests.h"
+#include "xla/backends/gpu/runtime/collective_memory_requests.h"
+#include "xla/backends/gpu/runtime/collective_params.h"
 #include "xla/backends/gpu/runtime/thunk_id.h"
+#include "xla/executable_run_options.h"
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/c_api_gpu_collectives.h"
+#include "xla/runtime/device_id.h"
 #include "xla/service/buffer_assignment.h"
+#include "xla/service/computation_placer.h"
 #include "xla/service/gpu/buffer_allocations.h"
+#include "xla/service/gpu/gpu_executable_run_options.h"
+#include "xla/service/service_executable_run_options.h"
 #include "xla/service/shaped_slice.h"
 #include "xla/shape_util.h"
 #include "xla/stream_executor/device_address.h"
+#include "xla/stream_executor/platform.h"
+#include "xla/stream_executor/platform_manager.h"
+#include "xla/stream_executor/stream.h"
+#include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/xla_data.pb.h"
 
@@ -116,6 +131,109 @@ TEST(FfiCollectiveResourcesTest, DiscoversCollectiveMemoryTags) {
   FfiCollectiveResources resources =
       MakeResources(ThunkId(1), operands, results);
   EXPECT_EQ(FfiCollectiveResourcesTestPeer::TaggedBufferCount(resources), 2);
+}
+
+TEST(FfiCollectiveResourcesTest,
+     RegistersEveryDistinctCollectiveMemoryAllocation) {
+  ASSERT_OK_AND_ASSIGN(se::Platform * platform,
+                       se::PlatformManager::PlatformWithName("Host"));
+  ASSERT_OK_AND_ASSIGN(se::StreamExecutor * executor,
+                       platform->ExecutorForDevice(0));
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Stream> stream,
+                       executor->CreateStream());
+
+  DeviceAssignment device_assignment(/*replica_count=*/1,
+                                     /*computation_count=*/1);
+  device_assignment(0, 0) = 0;
+  LoopbackCollectives collectives;
+  GpuExecutableRunOptions gpu_options;
+  gpu_options.set_collectives(&collectives);
+  ServiceExecutableRunOptions run_options;
+  run_options.mutable_run_options()->set_stream(stream.get());
+  run_options.mutable_run_options()->set_device_assignment(&device_assignment);
+  run_options.mutable_run_options()->set_gpu_executable_run_options(
+      &gpu_options);
+  run_options.mutable_run_options()->set_local_device_count(1);
+  ASSERT_OK_AND_ASSIGN(
+      CollectiveParams collective_params,
+      CollectiveParams::Create(run_options, /*async_streams=*/{},
+                               LocalDeviceId(executor->device_ordinal())));
+
+  std::array<std::byte, 64> first_storage;
+  std::array<std::byte, 96> second_storage;
+  std::array<std::byte, 32> ordinary_storage;
+  BufferAllocation first(/*index=*/0, /*size=*/first_storage.size(),
+                         /*color=*/1);
+  BufferAllocation second(/*index=*/1, /*size=*/second_storage.size(),
+                          /*color=*/1);
+  BufferAllocation ordinary(/*index=*/2, /*size=*/ordinary_storage.size(),
+                            /*color=*/1);
+  std::vector<NullableShapedSlice> operands{
+      ShapedSlice{BufferAllocation::Slice(&first, /*offset=*/8, /*size=*/16),
+                  MakeU8Shape(16, /*memory_space=*/1)},
+      ShapedSlice{BufferAllocation::Slice(&first, /*offset=*/32, /*size=*/16),
+                  MakeU8Shape(16, /*memory_space=*/1)},
+      ShapedSlice{BufferAllocation::Slice(&ordinary, /*offset=*/0, /*size=*/16),
+                  MakeU8Shape(16, /*memory_space=*/0)}};
+  std::vector<NullableShapedSlice> results{
+      ShapedSlice{BufferAllocation::Slice(&second, /*offset=*/16, /*size=*/32),
+                  MakeU8Shape(32, /*memory_space=*/1)}};
+  FfiCollectiveResources resources =
+      MakeResources(ThunkId(1), operands, results);
+  EXPECT_EQ(FfiCollectiveResourcesTestPeer::TaggedBufferCount(resources), 3);
+
+  std::array<se::DeviceAddressBase, 3> addresses{
+      se::DeviceAddressBase(first_storage.data(), first_storage.size()),
+      se::DeviceAddressBase(second_storage.data(), second_storage.size()),
+      se::DeviceAddressBase(ordinary_storage.data(), ordinary_storage.size())};
+  BufferAllocations buffers(addresses, executor->device_ordinal(), nullptr);
+  CollectiveCliqueRequests clique_requests;
+  CollectiveMemoryRequests memory_requests(buffers);
+  ASSERT_OK(resources.BeginInvocation(XLA_FFI_ExecutionStage_PREPARE, &buffers,
+                                      &collective_params, &clique_requests,
+                                      &memory_requests, nullptr, nullptr));
+  ASSERT_OK(resources.PrepareDeviceCommunication());
+
+  ASSERT_EQ(clique_requests.size(), 1);
+  std::vector<CollectiveCliqueRequests::CliqueRequest> clique_request =
+      clique_requests.OrderedRequestedCliques();
+  ASSERT_EQ(clique_request.size(), 1);
+  std::vector<CollectiveMemoryRequests::CollectiveAllocations> memory_request =
+      memory_requests.OrderedSymmetricAllocations();
+  ASSERT_EQ(memory_request.size(), 1);
+  EXPECT_EQ(memory_request[0].clique, clique_request[0].key);
+  EXPECT_EQ(memory_request[0].allocations,
+            (absl::btree_set<BufferAllocation::Index>{0, 1}));
+
+  ASSERT_OK(resources.BeginInvocation(XLA_FFI_ExecutionStage_EXECUTE, &buffers,
+                                      nullptr, nullptr, nullptr, nullptr,
+                                      nullptr));
+  int64_t dim = 4;
+  XLA_FFI_Buffer buffer{XLA_FFI_Buffer_STRUCT_SIZE,
+                        /*extension_start=*/nullptr,
+                        XLA_FFI_DataType_U8,
+                        first_storage.data() + 12,
+                        1,
+                        &dim};
+  ASSERT_OK_AND_ASSIGN(
+      auto first_view,
+      FfiCollectiveResourcesTestPeer::FindBufferView(resources, buffer));
+  EXPECT_EQ(std::get<0>(first_view), 0);
+  EXPECT_EQ(std::get<1>(first_view), 12);
+
+  dim = 8;
+  buffer.data = second_storage.data() + 24;
+  ASSERT_OK_AND_ASSIGN(
+      auto second_view,
+      FfiCollectiveResourcesTestPeer::FindBufferView(resources, buffer));
+  EXPECT_EQ(std::get<0>(second_view), 1);
+  EXPECT_EQ(std::get<1>(second_view), 24);
+
+  dim = 4;
+  buffer.data = ordinary_storage.data() + 4;
+  EXPECT_THAT(
+      FfiCollectiveResourcesTestPeer::FindBufferView(resources, buffer),
+      StatusIs(absl::StatusCode::kFailedPrecondition, HasSubstr("not tagged")));
 }
 
 TEST(FfiCollectiveResourcesTest,

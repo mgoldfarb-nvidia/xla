@@ -41,9 +41,10 @@ struct GpuCollectiveDeviceMemory {
 };
 
 // Header-only wrapper for the GPU device-communication C extension. XLA owns
-// resource selection, registration, and lifetime; handlers can only retrieve
-// the resulting device communicator and tagged device-memory arguments. Buffer
-// registration does not change normal FFI argument/result access rules.
+// resource selection, registration, and lifetime; handlers can retrieve the
+// resulting device communicator and each of any number of tagged device-memory
+// arguments independently. Buffer registration does not change normal FFI
+// argument/result access rules.
 class GpuCollectives {
  public:
   GpuCollectives(const XLA_FFI_Api* api, XLA_FFI_ExecutionContext* ctx)

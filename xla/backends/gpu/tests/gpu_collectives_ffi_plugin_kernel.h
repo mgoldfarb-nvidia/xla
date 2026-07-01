@@ -31,4 +31,14 @@ cudaError_t LaunchGpuCollectivesFfiTestKernel(cudaStream_t stream,
                                               size_t symmetric_memory_size,
                                               uint64_t offset, size_t count);
 
+// Launches one NCCL LSA all-reduce over each of two tagged buffers. This is
+// intentionally a test-only, fixed-arity launcher; the public FFI API remains
+// buffer-count agnostic and resolves each buffer separately.
+cudaError_t LaunchGpuCollectivesFfiTwoBufferTestKernel(
+    cudaStream_t stream, const void* device_comm, size_t device_comm_size,
+    const void* first_symmetric_memory, size_t first_symmetric_memory_size,
+    uint64_t first_offset, size_t first_count,
+    const void* second_symmetric_memory, size_t second_symmetric_memory_size,
+    uint64_t second_offset, size_t second_count);
+
 #endif  // XLA_BACKENDS_GPU_TESTS_GPU_COLLECTIVES_FFI_PLUGIN_KERNEL_H_

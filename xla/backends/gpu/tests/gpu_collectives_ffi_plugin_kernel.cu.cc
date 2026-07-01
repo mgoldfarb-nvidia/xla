@@ -82,3 +82,36 @@ cudaError_t LaunchGpuCollectivesFfiTestKernel(cudaStream_t stream,
       unpacked_device_comm, unpacked_window, offset, count);
   return cudaPeekAtLastError();
 }
+
+cudaError_t LaunchGpuCollectivesFfiTwoBufferTestKernel(
+    cudaStream_t stream, const void* device_comm, size_t device_comm_size,
+    const void* first_symmetric_memory, size_t first_symmetric_memory_size,
+    uint64_t first_offset, size_t first_count,
+    const void* second_symmetric_memory, size_t second_symmetric_memory_size,
+    uint64_t second_offset, size_t second_count) {
+  if (stream == nullptr || device_comm == nullptr ||
+      device_comm_size != sizeof(ncclDevComm) ||
+      first_symmetric_memory == nullptr ||
+      first_symmetric_memory_size != sizeof(ncclWindow_t) || first_count == 0 ||
+      second_symmetric_memory == nullptr ||
+      second_symmetric_memory_size != sizeof(ncclWindow_t) ||
+      second_count == 0) {
+    return cudaErrorInvalidValue;
+  }
+
+  ncclDevComm unpacked_device_comm;
+  ncclWindow_t first_window;
+  ncclWindow_t second_window;
+  std::memcpy(&unpacked_device_comm, device_comm, sizeof(unpacked_device_comm));
+  std::memcpy(&first_window, first_symmetric_memory, sizeof(first_window));
+  std::memcpy(&second_window, second_symmetric_memory, sizeof(second_window));
+
+  NcclDevAllReduce<uint32_t><<<1, 8, 0, stream>>>(
+      unpacked_device_comm, first_window, first_offset, first_count);
+  cudaError_t launch_status = cudaPeekAtLastError();
+  if (launch_status != cudaSuccess) return launch_status;
+
+  NcclDevAllReduce<uint32_t><<<1, 8, 0, stream>>>(
+      unpacked_device_comm, second_window, second_offset, second_count);
+  return cudaPeekAtLastError();
+}

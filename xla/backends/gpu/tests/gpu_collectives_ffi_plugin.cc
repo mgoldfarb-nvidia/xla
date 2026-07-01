@@ -16,6 +16,7 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <string>
@@ -180,8 +181,8 @@ ErrorOr<DeviceMemorySnapshot> PackDeviceMemory(
   if (!storage.has_value()) return Unexpected(storage.error());
 
   GpuCollectiveDeviceMemory packed;
-  error = collectives.GetDeviceMemory(&view, storage->data,
-                                      query.metadata.size, &packed);
+  error = collectives.GetDeviceMemory(&view, storage->data, query.metadata.size,
+                                      &packed);
   if (error.failure()) return Unexpected(std::move(error));
   if (!SameMetadata(query.metadata, packed.metadata) ||
       query.offset != packed.offset) {
@@ -212,24 +213,70 @@ struct CollectiveState {
   static TypeInfo info;
 
   DeviceCommSnapshot device_comm;
-  DeviceMemorySnapshot device_memory;
+  std::vector<DeviceMemorySnapshot> device_memories;
 };
 
 TypeId CollectiveState::id = {};
 TypeInfo CollectiveState::info = xla::ffi::MakeTypeInfo<CollectiveState>();
 
-ErrorOr<std::unique_ptr<CollectiveState>> Initialize(
-    AnyBuffer operand, Result<AnyBuffer>, GpuCollectives collectives) {
+ErrorOr<std::vector<DeviceMemorySnapshot>> PackDeviceMemories(
+    const GpuCollectives& collectives,
+    std::initializer_list<AnyBuffer> buffers) {
+  std::vector<DeviceMemorySnapshot> device_memories;
+  device_memories.reserve(buffers.size());
+  for (AnyBuffer buffer : buffers) {
+    ErrorOr<DeviceMemorySnapshot> device_memory =
+        PackDeviceMemory(collectives, buffer);
+    if (!device_memory.has_value()) return Unexpected(device_memory.error());
+    device_memories.push_back(*std::move(device_memory));
+  }
+  return device_memories;
+}
+
+bool SameDeviceMemorySnapshots(const std::vector<DeviceMemorySnapshot>& lhs,
+                               const std::vector<DeviceMemorySnapshot>& rhs) {
+  if (lhs.size() != rhs.size()) return false;
+  for (size_t i = 0; i < lhs.size(); ++i) {
+    if (!SameDeviceMemorySnapshot(lhs[i], rhs[i])) return false;
+  }
+  return true;
+}
+
+ErrorOr<std::unique_ptr<CollectiveState>> PackCollectiveState(
+    const GpuCollectives& collectives,
+    std::initializer_list<AnyBuffer> buffers) {
   ErrorOr<DeviceCommSnapshot> device_comm = PackDeviceComm(collectives);
   if (!device_comm.has_value()) return Unexpected(device_comm.error());
-  ErrorOr<DeviceMemorySnapshot> device_memory =
-      PackDeviceMemory(collectives, operand);
-  if (!device_memory.has_value()) return Unexpected(device_memory.error());
+  ErrorOr<std::vector<DeviceMemorySnapshot>> device_memories =
+      PackDeviceMemories(collectives, buffers);
+  if (!device_memories.has_value()) {
+    return Unexpected(device_memories.error());
+  }
 
   auto state = std::make_unique<CollectiveState>();
   state->device_comm = *std::move(device_comm);
-  state->device_memory = *std::move(device_memory);
+  state->device_memories = *std::move(device_memories);
   return state;
+}
+
+bool SameCollectiveState(const CollectiveState& lhs,
+                         const CollectiveState& rhs) {
+  return SameDeviceCommSnapshot(lhs.device_comm, rhs.device_comm) &&
+         SameDeviceMemorySnapshots(lhs.device_memories, rhs.device_memories);
+}
+
+Error ValidateExactAlias(AnyBuffer operand, Result<AnyBuffer> result) {
+  if (operand.untyped_data() != result->untyped_data() ||
+      !(operand.dimensions() == result->dimensions())) {
+    return FailedPrecondition(
+        "custom-call result does not alias its operand exactly");
+  }
+  return Error::Success();
+}
+
+ErrorOr<std::unique_ptr<CollectiveState>> Initialize(
+    AnyBuffer operand, Result<AnyBuffer>, GpuCollectives collectives) {
+  return PackCollectiveState(collectives, {operand});
 }
 
 Error Execute(AnyBuffer operand, Result<AnyBuffer> result,
@@ -238,37 +285,82 @@ Error Execute(AnyBuffer operand, Result<AnyBuffer> result,
   if (initialized == nullptr) {
     return FailedPrecondition("FFI initialize state is missing");
   }
-  if (operand.untyped_data() != result->untyped_data() ||
-      !(operand.dimensions() == result->dimensions())) {
-    return FailedPrecondition(
-        "custom-call result does not alias its operand exactly");
-  }
+  Error error = ValidateExactAlias(operand, result);
+  if (error.failure()) return error;
 
-  ErrorOr<DeviceCommSnapshot> device_comm = PackDeviceComm(collectives);
-  if (!device_comm.has_value()) return device_comm.error();
-  ErrorOr<DeviceMemorySnapshot> device_memory =
-      PackDeviceMemory(collectives, operand);
-  if (!device_memory.has_value()) return device_memory.error();
-
-  if (!SameDeviceCommSnapshot(initialized->device_comm, *device_comm)) {
+  ErrorOr<std::unique_ptr<CollectiveState>> current =
+      PackCollectiveState(collectives, {operand});
+  if (!current.has_value()) return current.error();
+  const CollectiveState& current_state = **current;
+  if (!SameCollectiveState(*initialized, current_state)) {
     return FailedPrecondition(
-        "device communicator changed between Initialize and Execute");
-  }
-  if (!SameDeviceMemorySnapshot(initialized->device_memory, *device_memory)) {
-    return FailedPrecondition(
-        "device memory changed between Initialize and Execute");
+        "device communication resources changed between Initialize and "
+        "Execute");
   }
 
   if (operand.element_type() != xla::ffi::U32) {
     return FailedPrecondition("test kernel requires a U32 operand");
   }
+  const DeviceMemorySnapshot& device_memory =
+      current_state.device_memories.front();
   cudaError_t launch_status = LaunchGpuCollectivesFfiTestKernel(
-      stream, device_comm->bytes.data(), device_comm->bytes.size(),
-      device_memory->bytes.data(), device_memory->bytes.size(),
-      device_memory->result.offset, operand.element_count() - 1);
+      stream, current_state.device_comm.bytes.data(),
+      current_state.device_comm.bytes.size(), device_memory.bytes.data(),
+      device_memory.bytes.size(), device_memory.result.offset,
+      operand.element_count() - 1);
   if (launch_status != cudaSuccess) {
     return FailedPrecondition(
         std::string("failed to launch NCCL LSA kernel: ") +
+        cudaGetErrorString(launch_status));
+  }
+  return Error::Success();
+}
+
+ErrorOr<std::unique_ptr<CollectiveState>> InitializeTwoBuffers(
+    AnyBuffer first_operand, AnyBuffer second_operand, Result<AnyBuffer>,
+    Result<AnyBuffer>, GpuCollectives collectives) {
+  return PackCollectiveState(collectives, {first_operand, second_operand});
+}
+
+Error ExecuteTwoBuffers(AnyBuffer first_operand, AnyBuffer second_operand,
+                        Result<AnyBuffer> first_result,
+                        Result<AnyBuffer> second_result,
+                        CollectiveState* initialized,
+                        GpuCollectives collectives, cudaStream_t stream) {
+  if (initialized == nullptr) {
+    return FailedPrecondition("FFI initialize state is missing");
+  }
+  Error error = ValidateExactAlias(first_operand, first_result);
+  if (error.failure()) return error;
+  error = ValidateExactAlias(second_operand, second_result);
+  if (error.failure()) return error;
+
+  ErrorOr<std::unique_ptr<CollectiveState>> current =
+      PackCollectiveState(collectives, {first_operand, second_operand});
+  if (!current.has_value()) return current.error();
+  const CollectiveState& current_state = **current;
+  if (!SameCollectiveState(*initialized, current_state)) {
+    return FailedPrecondition(
+        "device communication resources changed between Initialize and "
+        "Execute");
+  }
+  if (first_operand.element_type() != xla::ffi::U32 ||
+      second_operand.element_type() != xla::ffi::U32) {
+    return FailedPrecondition("test kernel requires U32 operands");
+  }
+
+  const DeviceMemorySnapshot& first_memory = current_state.device_memories[0];
+  const DeviceMemorySnapshot& second_memory = current_state.device_memories[1];
+  cudaError_t launch_status = LaunchGpuCollectivesFfiTwoBufferTestKernel(
+      stream, current_state.device_comm.bytes.data(),
+      current_state.device_comm.bytes.size(), first_memory.bytes.data(),
+      first_memory.bytes.size(), first_memory.result.offset,
+      first_operand.element_count() - 1, second_memory.bytes.data(),
+      second_memory.bytes.size(), second_memory.result.offset,
+      second_operand.element_count() - 1);
+  if (launch_status != cudaSuccess) {
+    return FailedPrecondition(
+        std::string("failed to launch two-buffer NCCL LSA kernel: ") +
         cudaGetErrorString(launch_status));
   }
   return Error::Success();
@@ -288,6 +380,24 @@ XLA_FFI_DEFINE_HANDLER(kExecute, Execute,
                            .Ctx<GpuCollectives>()
                            .Ctx<PlatformStream<cudaStream_t>>());
 
+XLA_FFI_DEFINE_HANDLER(kInitializeTwoBuffers, InitializeTwoBuffers,
+                       Ffi::BindInitialize()
+                           .Arg<AnyBuffer>()
+                           .Arg<AnyBuffer>()
+                           .Ret<AnyBuffer>()
+                           .Ret<AnyBuffer>()
+                           .Ctx<GpuCollectives>());
+
+XLA_FFI_DEFINE_HANDLER(kExecuteTwoBuffers, ExecuteTwoBuffers,
+                       Ffi::BindExecute()
+                           .Arg<AnyBuffer>()
+                           .Arg<AnyBuffer>()
+                           .Ret<AnyBuffer>()
+                           .Ret<AnyBuffer>()
+                           .Ctx<Initialized<CollectiveState>>()
+                           .Ctx<GpuCollectives>()
+                           .Ctx<PlatformStream<cudaStream_t>>());
+
 }  // namespace
 
 extern "C" __attribute__((visibility("default"))) XLA_FFI_Error*
@@ -298,13 +408,26 @@ XlaGpuCollectivesFfiRegister(const XLA_FFI_Api* api) {
     return error;
   }
 
+  if (XLA_FFI_Error* error = Ffi::RegisterStaticHandler(
+          api, "__xla_test_gpu_collectives_public_dso", "gpu",
+          XLA_FFI_Handler_Bundle{
+              /*instantiate=*/nullptr,
+              /*prepare=*/nullptr,
+              /*initialize=*/kInitialize,
+              /*execute=*/kExecute,
+          },
+          static_cast<XLA_FFI_Handler_Traits>(
+              xla::ffi::Traits::kUsesDeviceCommunication))) {
+    return error;
+  }
+
   return Ffi::RegisterStaticHandler(
-      api, "__xla_test_gpu_collectives_public_dso", "gpu",
+      api, "__xla_test_gpu_collectives_public_dso_two_buffers", "gpu",
       XLA_FFI_Handler_Bundle{
           /*instantiate=*/nullptr,
           /*prepare=*/nullptr,
-          /*initialize=*/kInitialize,
-          /*execute=*/kExecute,
+          /*initialize=*/kInitializeTwoBuffers,
+          /*execute=*/kExecuteTwoBuffers,
       },
       static_cast<XLA_FFI_Handler_Traits>(
           xla::ffi::Traits::kUsesDeviceCommunication));

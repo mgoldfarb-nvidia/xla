@@ -68,12 +68,15 @@ typedef XLA_FFI_Error* XLA_FFI_GpuCollectives_GetDeviceComm(
     XLA_FFI_GpuCollectives_GetDeviceComm_Args* args);
 
 // Returns the device-memory handle for a tagged FFI argument or result buffer.
-// XLA registers the complete backing allocation; offset locates the requested
-// buffer view within that allocation. Registration does not grant write access:
-// normal FFI argument/result and output-aliasing rules continue to apply. A
-// tagged buffer is a logical memory-space-1 custom-call operand/result (set by
-// frontends with operands_memory_spaces/results_memory_spaces). This query is
-// available during the Initialize and Execute stages.
+// A handler can query any number of tagged buffers independently; no buffer
+// count or registration list is part of the API. For this callsite's
+// communication team, XLA registers each complete backing allocation once, and
+// offset locates the requested buffer view within that allocation. Registration
+// does not grant write access: normal FFI argument/result and output-aliasing
+// rules continue to apply. A tagged buffer is a logical memory-space-1
+// custom-call operand/result (set by frontends with operands_memory_spaces/
+// results_memory_spaces). This query is available during the Initialize and
+// Execute stages.
 struct XLA_FFI_GpuCollectives_GetDeviceMemory_Args {
   size_t struct_size;
   XLA_FFI_Extension_Base* extension_start;
