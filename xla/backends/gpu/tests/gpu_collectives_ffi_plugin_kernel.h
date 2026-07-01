@@ -21,9 +21,9 @@ limitations under the License.
 
 #include <cuda_runtime_api.h>
 
-// Launches the public-FFI DSO test's NCCL LSA all-reduce. The NCCL types stay
-// opaque at this boundary so the host-side FFI handler only depends on packed
-// bytes returned by the public API.
+// Launches the public-FFI DSO test's NCCL LSA all-reduce. NCCL types stay
+// opaque at the launcher boundary; the host-side FFI handler owns typed
+// ncclDevComm and ncclWindow_t snapshots returned by the public API.
 cudaError_t LaunchGpuCollectivesFfiTestKernel(cudaStream_t stream,
                                               const void* device_comm,
                                               size_t device_comm_size,

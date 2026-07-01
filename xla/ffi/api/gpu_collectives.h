@@ -28,18 +28,6 @@ limitations under the License.
 
 namespace xla::ffi {
 
-struct GpuCollectivePackedKernelArgMetadata {
-  size_t size = 0;
-  size_t alignment = 0;
-  uint64_t schema = 0;
-  uint64_t abi_version = 0;
-};
-
-struct GpuCollectiveDeviceMemory {
-  GpuCollectivePackedKernelArgMetadata metadata;
-  uint64_t offset = 0;
-};
-
 // Header-only wrapper for the GPU device-communication C extension. XLA owns
 // resource selection, registration, and lifetime; handlers can retrieve the
 // resulting device communicator and each of any number of tagged device-memory
@@ -52,35 +40,37 @@ class GpuCollectives {
 
   bool available() const { return CheckExtension().has_value(); }
 
-  Error GetDeviceComm(void* destination, size_t capacity,
-                      GpuCollectivePackedKernelArgMetadata* metadata) const {
+  Error GetDeviceComm(uint64_t expected_abi_schema,
+                      uint64_t expected_abi_version, void* destination,
+                      size_t destination_size) const {
     ErrorOr<const XLA_FFI_GpuCollectives_Extension*> extension =
         CheckExtension();
     if (!extension.has_value()) return extension.error();
     if ((*extension)->get_device_comm == nullptr) {
       return Unimplemented("GetDeviceComm is unavailable");
     }
-    if (metadata == nullptr) {
-      return Error::InvalidArgument("metadata must not be null");
+    if (destination == nullptr) {
+      return Error::InvalidArgument("destination must not be null");
     }
-
-    XLA_FFI_GpuCollective_PackedKernelArg kernel_arg = {};
-    kernel_arg.struct_size = XLA_FFI_GpuCollective_PackedKernelArg_STRUCT_SIZE;
-    kernel_arg.destination = destination;
-    kernel_arg.capacity = capacity;
+    if (destination_size == 0) {
+      return Error::InvalidArgument("destination size must not be zero");
+    }
 
     XLA_FFI_GpuCollectives_GetDeviceComm_Args args = {};
     args.struct_size = XLA_FFI_GpuCollectives_GetDeviceComm_Args_STRUCT_SIZE;
     args.ctx = ctx_;
-    args.kernel_arg = &kernel_arg;
+    args.expected_abi_schema = expected_abi_schema;
+    args.expected_abi_version = expected_abi_version;
+    args.destination = destination;
+    args.destination_size = destination_size;
 
     XLA_FFI_Error* error = (*extension)->get_device_comm(&args);
-    *metadata = Metadata(kernel_arg);
     return error ? TakeError(error) : Error::Success();
   }
 
-  Error GetDeviceMemory(AnyBuffer buffer, void* destination, size_t capacity,
-                        GpuCollectiveDeviceMemory* result) const {
+  Error GetDeviceMemory(AnyBuffer buffer, uint64_t expected_abi_schema,
+                        uint64_t expected_abi_version, void* destination,
+                        size_t destination_size, uint64_t* offset) const {
     AnyBuffer::Dimensions dimensions = buffer.dimensions();
     XLA_FFI_Buffer c_buffer = {
         XLA_FFI_Buffer_STRUCT_SIZE,
@@ -90,37 +80,47 @@ class GpuCollectives {
         static_cast<int64_t>(dimensions.size()),
         const_cast<int64_t*>(dimensions.begin()),
     };
-    return GetDeviceMemory(&c_buffer, destination, capacity, result);
+    return GetDeviceMemory(&c_buffer, expected_abi_schema,
+                           expected_abi_version, destination, destination_size,
+                           offset);
   }
 
-  Error GetDeviceMemory(const XLA_FFI_Buffer* buffer, void* destination,
-                        size_t capacity,
-                        GpuCollectiveDeviceMemory* result) const {
+  Error GetDeviceMemory(const XLA_FFI_Buffer* buffer,
+                        uint64_t expected_abi_schema,
+                        uint64_t expected_abi_version, void* destination,
+                        size_t destination_size, uint64_t* offset) const {
     ErrorOr<const XLA_FFI_GpuCollectives_Extension*> extension =
         CheckExtension();
     if (!extension.has_value()) return extension.error();
     if ((*extension)->get_device_memory == nullptr) {
       return Unimplemented("GetDeviceMemory is unavailable");
     }
-    if (result == nullptr) {
-      return Error::InvalidArgument("result must not be null");
+    if (buffer == nullptr) {
+      return Error::InvalidArgument("buffer must not be null");
     }
-
-    XLA_FFI_GpuCollective_PackedKernelArg kernel_arg = {};
-    kernel_arg.struct_size = XLA_FFI_GpuCollective_PackedKernelArg_STRUCT_SIZE;
-    kernel_arg.destination = destination;
-    kernel_arg.capacity = capacity;
+    if (destination == nullptr) {
+      return Error::InvalidArgument("destination must not be null");
+    }
+    if (destination_size == 0) {
+      return Error::InvalidArgument("destination size must not be zero");
+    }
+    if (offset == nullptr) {
+      return Error::InvalidArgument("offset must not be null");
+    }
 
     XLA_FFI_GpuCollectives_GetDeviceMemory_Args args = {};
     args.struct_size = XLA_FFI_GpuCollectives_GetDeviceMemory_Args_STRUCT_SIZE;
     args.ctx = ctx_;
     args.buffer = buffer;
-    args.kernel_arg = &kernel_arg;
+    args.expected_abi_schema = expected_abi_schema;
+    args.expected_abi_version = expected_abi_version;
+    args.destination = destination;
+    args.destination_size = destination_size;
 
     XLA_FFI_Error* error = (*extension)->get_device_memory(&args);
-    result->metadata = Metadata(kernel_arg);
-    result->offset = args.offset;
-    return error ? TakeError(error) : Error::Success();
+    if (error != nullptr) return TakeError(error);
+    *offset = args.offset;
+    return Error::Success();
   }
 
  private:
@@ -160,16 +160,6 @@ class GpuCollectives {
           "GPU device-communication extension minor version is too old"));
     }
     return extension_;
-  }
-
-  static GpuCollectivePackedKernelArgMetadata Metadata(
-      const XLA_FFI_GpuCollective_PackedKernelArg& kernel_arg) {
-    return GpuCollectivePackedKernelArgMetadata{
-        kernel_arg.size,
-        kernel_arg.alignment,
-        kernel_arg.schema,
-        kernel_arg.abi_version,
-    };
   }
 
   Error TakeError(XLA_FFI_Error* error) const {

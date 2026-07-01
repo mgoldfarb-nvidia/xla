@@ -67,11 +67,14 @@ class FfiCollectiveResourcesTestPeer {
                            view->allocation_size);
   }
 
-  static absl::Status PreparePackedDestination(
-      XLA_FFI_GpuCollective_PackedKernelArg* output, uint64_t schema,
-      uint64_t abi_version, size_t size, size_t alignment) {
-    return FfiCollectiveResources::PreparePackedDestination(
-        output, schema, abi_version, size, alignment);
+  static absl::Status ValidateKernelArgDestination(
+      uint64_t expected_abi_schema, uint64_t expected_abi_version,
+      void* destination, size_t destination_size, uint64_t provider_abi_schema,
+      uint64_t provider_abi_version, size_t provider_size) {
+    return FfiCollectiveResources::ValidateKernelArgDestination(
+        expected_abi_schema, expected_abi_version, destination,
+        destination_size, provider_abi_schema, provider_abi_version,
+        provider_size);
   }
 
   static size_t TaggedBufferCount(const FfiCollectiveResources& resources) {
@@ -321,54 +324,63 @@ TEST(FfiCollectiveResourcesTest, RejectsAmbiguousAliasedAllocations) {
                        HasSubstr("aliases multiple allocations")));
 }
 
-TEST(FfiCollectiveResourcesTest, PackedArgumentQueryReportsExactRequirements) {
-  XLA_FFI_GpuCollective_PackedKernelArg packed{
-      XLA_FFI_GpuCollective_PackedKernelArg_STRUCT_SIZE};
-  EXPECT_THAT(FfiCollectiveResourcesTestPeer::PreparePackedDestination(
-                  &packed, /*schema=*/17, /*abi_version=*/18, /*size=*/8,
-                  /*alignment=*/8),
+TEST(FfiCollectiveResourcesTest, ValidatesKernelArgumentDestination) {
+  std::array<std::byte, 8> storage;
+  EXPECT_THAT(FfiCollectiveResourcesTestPeer::ValidateKernelArgDestination(
+                  /*expected_abi_schema=*/17, /*expected_abi_version=*/18,
+                  storage.data(), storage.size(), /*provider_abi_schema=*/17,
+                  /*provider_abi_version=*/18, /*provider_size=*/8),
               IsOk());
-  EXPECT_EQ(packed.size, 8);
-  EXPECT_EQ(packed.alignment, 8);
-  EXPECT_EQ(packed.schema, 17);
-  EXPECT_EQ(packed.abi_version, 18);
 
-  alignas(8) std::array<std::byte, 16> storage;
-  packed.destination = storage.data();
-  packed.capacity = 7;
-  EXPECT_THAT(FfiCollectiveResourcesTestPeer::PreparePackedDestination(
-                  &packed, 17, 18, 8, 8),
-              StatusIs(absl::StatusCode::kResourceExhausted));
-  packed.capacity = 8;
-  EXPECT_THAT(FfiCollectiveResourcesTestPeer::PreparePackedDestination(
-                  &packed, 17, 18, 8, 8),
-              IsOk());
-  packed.destination = storage.data() + 1;
-  EXPECT_THAT(
-      FfiCollectiveResourcesTestPeer::PreparePackedDestination(&packed, 17, 18,
-                                                               8, 8),
-      StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("alignment")));
-
-  packed.destination = nullptr;
-  packed.capacity = 0;
-  EXPECT_THAT(FfiCollectiveResourcesTestPeer::PreparePackedDestination(
-                  &packed, /*schema=*/0, /*abi_version=*/18, 8, 8),
+  EXPECT_THAT(FfiCollectiveResourcesTestPeer::ValidateKernelArgDestination(
+                  17, 18, /*destination=*/nullptr, storage.size(), 17, 18, 8),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("must not be null")));
+  EXPECT_THAT(FfiCollectiveResourcesTestPeer::ValidateKernelArgDestination(
+                  17, 18, storage.data(), storage.size(),
+                  /*provider_abi_schema=*/0, 18, 8),
               StatusIs(absl::StatusCode::kFailedPrecondition,
                        HasSubstr("invalid kernel argument metadata")));
+  EXPECT_THAT(FfiCollectiveResourcesTestPeer::ValidateKernelArgDestination(
+                  17, 18, storage.data(), storage.size(), 17,
+                  /*provider_abi_version=*/0, 8),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("invalid kernel argument metadata")));
+  EXPECT_THAT(FfiCollectiveResourcesTestPeer::ValidateKernelArgDestination(
+                  17, 18, storage.data(), storage.size(), 17, 18,
+                  /*provider_size=*/0),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("invalid kernel argument metadata")));
+  EXPECT_THAT(FfiCollectiveResourcesTestPeer::ValidateKernelArgDestination(
+                  17, 18, storage.data(), storage.size(),
+                  /*provider_abi_schema=*/19, 18, 8),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("ABI schema mismatch")));
+  EXPECT_THAT(FfiCollectiveResourcesTestPeer::ValidateKernelArgDestination(
+                  17, 18, storage.data(), storage.size(), 17,
+                  /*provider_abi_version=*/19, 8),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("ABI version mismatch")));
+  EXPECT_THAT(FfiCollectiveResourcesTestPeer::ValidateKernelArgDestination(
+                  17, 18, storage.data(), /*destination_size=*/7, 17, 18, 8),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("destination size mismatch")));
 }
 
-TEST(FfiCollectiveResourcesTest, RequiresDeclarativePreparationBeforeQueries) {
+TEST(FfiCollectiveResourcesTest, RequiresDeclarativePreparationBeforeAccess) {
   FfiCollectiveResources resources = MakeResources(ThunkId(1));
   ASSERT_OK(resources.BeginInvocation(XLA_FFI_ExecutionStage_EXECUTE, nullptr,
                                       nullptr, nullptr, nullptr, nullptr,
                                       nullptr));
 
-  XLA_FFI_GpuCollective_PackedKernelArg packed{
-      XLA_FFI_GpuCollective_PackedKernelArg_STRUCT_SIZE};
   XLA_FFI_GpuCollectives_GetDeviceComm_Args get{
       XLA_FFI_GpuCollectives_GetDeviceComm_Args_STRUCT_SIZE,
       /*extension_start=*/nullptr,
-      /*ctx=*/nullptr, &packed};
+      /*ctx=*/nullptr,
+      /*expected_abi_schema=*/17,
+      /*expected_abi_version=*/18,
+      /*destination=*/nullptr,
+      /*destination_size=*/0};
   EXPECT_THAT(resources.GetDeviceComm(&get),
               StatusIs(absl::StatusCode::kFailedPrecondition,
                        HasSubstr("USES_DEVICE_COMMUNICATION")));

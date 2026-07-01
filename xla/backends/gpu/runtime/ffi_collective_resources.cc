@@ -80,10 +80,6 @@ absl::Status CheckStructSize(absl::string_view name, size_t expected,
   return absl::OkStatus();
 }
 
-bool IsPowerOfTwo(size_t value) {
-  return value != 0 && (value & (value - 1)) == 0;
-}
-
 }  // namespace
 
 FfiCollectiveResources::FfiCollectiveResources(
@@ -232,44 +228,35 @@ absl::Status FfiCollectiveResources::CheckStageForGet(
   return absl::OkStatus();
 }
 
-absl::Status FfiCollectiveResources::PreparePackedDestination(
-    XLA_FFI_GpuCollective_PackedKernelArg* output, uint64_t schema,
-    uint64_t abi_version, size_t size, size_t alignment) {
-  if (output == nullptr) {
-    return InvalidArgument("Packed kernel argument output must not be null");
+absl::Status FfiCollectiveResources::ValidateKernelArgDestination(
+    uint64_t expected_abi_schema, uint64_t expected_abi_version,
+    void* destination, size_t destination_size, uint64_t provider_abi_schema,
+    uint64_t provider_abi_version, size_t provider_size) {
+  if (destination == nullptr) {
+    return InvalidArgument("Kernel argument destination must not be null");
   }
-  RETURN_IF_ERROR(CheckStructSize(
-      "XLA_FFI_GpuCollective_PackedKernelArg",
-      XLA_FFI_GpuCollective_PackedKernelArg_STRUCT_SIZE, output->struct_size));
-
-  output->size = size;
-  output->alignment = alignment;
-  output->schema = schema;
-  output->abi_version = abi_version;
-
-  if (size == 0 || !IsPowerOfTwo(alignment) || schema == 0 ||
-      abi_version == 0) {
+  if (provider_abi_schema == 0 || provider_abi_version == 0 ||
+      provider_size == 0) {
     return FailedPrecondition(
         "Device-communication provider returned invalid kernel argument "
         "metadata");
   }
-  if (output->destination == nullptr && output->capacity == 0) {
-    return absl::OkStatus();
+  if (expected_abi_schema != provider_abi_schema) {
+    return FailedPrecondition(
+        "Kernel argument ABI schema mismatch: expected %d, provider returned "
+        "%d",
+        expected_abi_schema, provider_abi_schema);
   }
-  if (output->destination == nullptr) {
+  if (expected_abi_version != provider_abi_version) {
+    return FailedPrecondition(
+        "Kernel argument ABI version mismatch: expected %d, provider returned "
+        "%d",
+        expected_abi_version, provider_abi_version);
+  }
+  if (destination_size != provider_size) {
     return InvalidArgument(
-        "Packed kernel argument destination is null with non-zero capacity");
-  }
-  if (output->capacity < size) {
-    return ResourceExhausted(
-        "Packed kernel argument requires %d bytes, but capacity is %d", size,
-        output->capacity);
-  }
-  if (reinterpret_cast<uintptr_t>(output->destination) % alignment != 0) {
-    return InvalidArgument(
-        "Packed kernel argument destination does not satisfy %d-byte "
-        "alignment",
-        alignment);
+        "Kernel argument destination size mismatch: expected %d bytes, got %d",
+        provider_size, destination_size);
   }
   return absl::OkStatus();
 }
@@ -292,22 +279,18 @@ absl::Status FfiCollectiveResources::GetDeviceComm(
                        record.requirements));
   const GpuDeviceCommunicator::PackedKernelArgMetadata& metadata =
       communicator->GetKernelArgMetadata();
-  RETURN_IF_ERROR(PreparePackedDestination(
-      args->kernel_arg, metadata.device_abi_schema, metadata.device_abi_version,
-      metadata.size_bytes, metadata.alignment));
+  RETURN_IF_ERROR(ValidateKernelArgDestination(
+      args->expected_abi_schema, args->expected_abi_version, args->destination,
+      args->destination_size, metadata.device_abi_schema,
+      metadata.device_abi_version, metadata.size_bytes));
 
-  bool query = args->kernel_arg->destination == nullptr &&
-               args->kernel_arg->capacity == 0;
-  if (!query) {
-    se::PackedKernelArg packed = communicator->PackKernelArg();
-    if (packed.size_bytes() != metadata.size_bytes) {
-      return Internal(
-          "Packed device communicator size %d does not match metadata size %d",
-          packed.size_bytes(), metadata.size_bytes);
-    }
-    std::memcpy(args->kernel_arg->destination, packed.data(),
-                packed.size_bytes());
+  se::PackedKernelArg packed = communicator->PackKernelArg();
+  if (packed.size_bytes() != metadata.size_bytes) {
+    return Internal(
+        "Packed device communicator size %d does not match metadata size %d",
+        packed.size_bytes(), metadata.size_bytes);
   }
+  std::memcpy(args->destination, packed.data(), packed.size_bytes());
   return absl::OkStatus();
 }
 
@@ -457,25 +440,23 @@ absl::Status FfiCollectiveResources::GetDeviceMemory(
   if (view.offset > std::numeric_limits<uint64_t>::max() - symmetric_offset) {
     return Internal("Device-memory view offset overflows");
   }
-  args->offset = symmetric_offset + view.offset;
+  uint64_t offset = symmetric_offset + view.offset;
 
   SymmetricMemory::PackedKernelArgMetadata metadata =
       symmetric_memory->GetKernelArgMetadata();
-  RETURN_IF_ERROR(PreparePackedDestination(
-      args->kernel_arg, metadata.device_abi_schema, metadata.device_abi_version,
-      metadata.size_bytes, metadata.alignment));
+  RETURN_IF_ERROR(ValidateKernelArgDestination(
+      args->expected_abi_schema, args->expected_abi_version, args->destination,
+      args->destination_size, metadata.device_abi_schema,
+      metadata.device_abi_version, metadata.size_bytes));
 
-  bool query = args->kernel_arg->destination == nullptr &&
-               args->kernel_arg->capacity == 0;
-  if (!query) {
-    SymmetricMemory::PackedKernelArg packed = symmetric_memory->PackKernelArg();
-    if (metadata.size_bytes != sizeof(packed)) {
-      return Internal(
-          "Packed device-memory size %d does not match metadata size %d",
-          sizeof(packed), metadata.size_bytes);
-    }
-    std::memcpy(args->kernel_arg->destination, &packed, sizeof(packed));
+  SymmetricMemory::PackedKernelArg packed = symmetric_memory->PackKernelArg();
+  if (metadata.size_bytes != sizeof(packed)) {
+    return Internal(
+        "Packed device-memory size %d does not match metadata size %d",
+        sizeof(packed), metadata.size_bytes);
   }
+  std::memcpy(args->destination, &packed, sizeof(packed));
+  args->offset = offset;
   return absl::OkStatus();
 }
 

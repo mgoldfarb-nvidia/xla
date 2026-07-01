@@ -17,16 +17,18 @@ limitations under the License.
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
-#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "third_party/nccl/nccl.h"
 #include "xla/backends/gpu/tests/gpu_collectives_ffi_plugin_kernel.h"
 #include "xla/ffi/api/c_api_gpu_collectives_nccl.h"
 #include "xla/ffi/api/gpu_collectives.h"
+
+// Include NCCL after XLA headers.
+#include "third_party/nccl/nccl.h"
+#include "third_party/nccl/nccl_device.h"
 
 namespace {
 
@@ -35,8 +37,6 @@ using xla::ffi::Error;
 using xla::ffi::ErrorCode;
 using xla::ffi::ErrorOr;
 using xla::ffi::Ffi;
-using xla::ffi::GpuCollectiveDeviceMemory;
-using xla::ffi::GpuCollectivePackedKernelArgMetadata;
 using xla::ffi::GpuCollectives;
 using xla::ffi::Initialized;
 using xla::ffi::PlatformStream;
@@ -49,99 +49,21 @@ Error FailedPrecondition(std::string message) {
   return Error(ErrorCode::kFailedPrecondition, std::move(message));
 }
 
-bool SameMetadata(const GpuCollectivePackedKernelArgMetadata& lhs,
-                  const GpuCollectivePackedKernelArgMetadata& rhs) {
-  return lhs.size == rhs.size && lhs.alignment == rhs.alignment &&
-         lhs.schema == rhs.schema && lhs.abi_version == rhs.abi_version;
-}
-
-Error ValidateMetadata(const GpuCollectivePackedKernelArgMetadata& metadata,
-                       uint64_t expected_schema) {
-  if (metadata.size == 0) {
-    return FailedPrecondition("packed kernel argument has zero size");
-  }
-  if (metadata.alignment == 0 ||
-      (metadata.alignment & (metadata.alignment - 1)) != 0) {
-    return FailedPrecondition(
-        "packed kernel argument alignment is not a power of two");
-  }
-  if (metadata.schema != expected_schema) {
-    return FailedPrecondition("unexpected packed kernel argument schema");
-  }
-  if (metadata.abi_version != NCCL_VERSION_CODE) {
-    return FailedPrecondition("unexpected NCCL device ABI version");
-  }
-  return Error::Success();
-}
-
-struct AlignedStorage {
-  std::vector<uint8_t> storage;
-  void* data = nullptr;
-};
-
-ErrorOr<AlignedStorage> MakeAlignedStorage(size_t size, size_t alignment) {
-  if (size == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0) {
-    return Unexpected(FailedPrecondition(
-        "cannot allocate storage for invalid size or alignment"));
-  }
-  if (size > std::numeric_limits<size_t>::max() - (alignment - 1)) {
-    return Unexpected(
-        FailedPrecondition("packed kernel argument storage size overflows"));
-  }
-
-  AlignedStorage result;
-  result.storage.resize(size + alignment - 1);
-  uintptr_t begin = reinterpret_cast<uintptr_t>(result.storage.data());
-  if (begin > std::numeric_limits<uintptr_t>::max() - (alignment - 1)) {
-    return Unexpected(FailedPrecondition(
-        "packed kernel argument alignment calculation overflows"));
-  }
-  uintptr_t aligned =
-      (begin + alignment - 1) & ~(static_cast<uintptr_t>(alignment) - 1);
-  result.data = reinterpret_cast<void*>(aligned);
-  return result;
-}
-
-struct DeviceCommSnapshot {
-  GpuCollectivePackedKernelArgMetadata metadata;
-  std::vector<uint8_t> bytes;
-};
-
 struct DeviceMemorySnapshot {
-  GpuCollectiveDeviceMemory result;
-  std::vector<uint8_t> bytes;
+  ncclWindow_t window{};
+  uint64_t offset = 0;
 };
 
-ErrorOr<DeviceCommSnapshot> PackDeviceComm(const GpuCollectives& collectives) {
-  GpuCollectivePackedKernelArgMetadata query;
+ErrorOr<ncclDevComm> SnapshotDeviceComm(const GpuCollectives& collectives) {
+  ncclDevComm device_comm{};
   Error error = collectives.GetDeviceComm(
-      /*destination=*/nullptr, /*capacity=*/0, &query);
+      XLA_FFI_GpuCollective_NCCL_DEVICE_COMM_ABI_SCHEMA, NCCL_VERSION_CODE,
+      &device_comm, sizeof(device_comm));
   if (error.failure()) return Unexpected(std::move(error));
-
-  error = ValidateMetadata(query,
-                           XLA_FFI_GpuCollective_NCCL_DEVICE_COMM_ABI_SCHEMA);
-  if (error.failure()) return Unexpected(std::move(error));
-
-  ErrorOr<AlignedStorage> storage =
-      MakeAlignedStorage(query.size, query.alignment);
-  if (!storage.has_value()) return Unexpected(storage.error());
-
-  GpuCollectivePackedKernelArgMetadata packed;
-  error = collectives.GetDeviceComm(storage->data, query.size, &packed);
-  if (error.failure()) return Unexpected(std::move(error));
-  if (!SameMetadata(query, packed)) {
-    return Unexpected(FailedPrecondition(
-        "device communicator query and pack metadata are inconsistent"));
-  }
-
-  DeviceCommSnapshot snapshot;
-  snapshot.metadata = packed;
-  snapshot.bytes.resize(packed.size);
-  std::memcpy(snapshot.bytes.data(), storage->data, snapshot.bytes.size());
-  return snapshot;
+  return device_comm;
 }
 
-ErrorOr<DeviceMemorySnapshot> PackDeviceMemory(
+ErrorOr<DeviceMemorySnapshot> SnapshotDeviceMemory(
     const GpuCollectives& collectives, AnyBuffer buffer) {
   AnyBuffer::Dimensions dimensions = buffer.dimensions();
   if (buffer.element_type() != xla::ffi::U32 || dimensions.size() != 1 ||
@@ -151,7 +73,7 @@ ErrorOr<DeviceMemorySnapshot> PackDeviceMemory(
         "elements"));
   }
 
-  // Query a strict subview so the end-to-end test exercises view offsets even
+  // Request a strict subview so the end-to-end test exercises view offsets even
   // when buffer assignment gives the FFI operand its own allocation.
   int64_t view_elements = dimensions[0] - 1;
   XLA_FFI_Buffer view = {
@@ -163,70 +85,48 @@ ErrorOr<DeviceMemorySnapshot> PackDeviceMemory(
       &view_elements,
   };
 
-  GpuCollectiveDeviceMemory query;
-  Error error = collectives.GetDeviceMemory(&view, /*destination=*/nullptr,
-                                            /*capacity=*/0, &query);
+  DeviceMemorySnapshot snapshot;
+  Error error = collectives.GetDeviceMemory(
+      &view, XLA_FFI_GpuCollective_NCCL_SYMMETRIC_MEMORY_ABI_SCHEMA,
+      NCCL_VERSION_CODE, &snapshot.window, sizeof(snapshot.window),
+      &snapshot.offset);
   if (error.failure()) return Unexpected(std::move(error));
-
-  error = ValidateMetadata(
-      query.metadata, XLA_FFI_GpuCollective_NCCL_SYMMETRIC_MEMORY_ABI_SCHEMA);
-  if (error.failure()) return Unexpected(std::move(error));
-  if (query.offset == 0) {
+  if (snapshot.offset == 0) {
     return Unexpected(FailedPrecondition(
         "device-memory view did not preserve a nonzero allocation offset"));
   }
-
-  ErrorOr<AlignedStorage> storage =
-      MakeAlignedStorage(query.metadata.size, query.metadata.alignment);
-  if (!storage.has_value()) return Unexpected(storage.error());
-
-  GpuCollectiveDeviceMemory packed;
-  error = collectives.GetDeviceMemory(&view, storage->data, query.metadata.size,
-                                      &packed);
-  if (error.failure()) return Unexpected(std::move(error));
-  if (!SameMetadata(query.metadata, packed.metadata) ||
-      query.offset != packed.offset) {
-    return Unexpected(FailedPrecondition(
-        "device-memory query and pack metadata are inconsistent"));
-  }
-
-  DeviceMemorySnapshot snapshot;
-  snapshot.result = packed;
-  snapshot.bytes.resize(packed.metadata.size);
-  std::memcpy(snapshot.bytes.data(), storage->data, snapshot.bytes.size());
   return snapshot;
 }
 
-bool SameDeviceCommSnapshot(const DeviceCommSnapshot& lhs,
-                            const DeviceCommSnapshot& rhs) {
-  return SameMetadata(lhs.metadata, rhs.metadata) && lhs.bytes == rhs.bytes;
+bool SameDeviceComm(const ncclDevComm& lhs, const ncclDevComm& rhs) {
+  return std::memcmp(&lhs, &rhs, sizeof(ncclDevComm)) == 0;
 }
 
 bool SameDeviceMemorySnapshot(const DeviceMemorySnapshot& lhs,
                               const DeviceMemorySnapshot& rhs) {
-  return SameMetadata(lhs.result.metadata, rhs.result.metadata) &&
-         lhs.result.offset == rhs.result.offset && lhs.bytes == rhs.bytes;
+  return lhs.offset == rhs.offset &&
+         std::memcmp(&lhs.window, &rhs.window, sizeof(ncclWindow_t)) == 0;
 }
 
 struct CollectiveState {
   static TypeId id;
   static TypeInfo info;
 
-  DeviceCommSnapshot device_comm;
+  ncclDevComm device_comm{};
   std::vector<DeviceMemorySnapshot> device_memories;
 };
 
 TypeId CollectiveState::id = {};
 TypeInfo CollectiveState::info = xla::ffi::MakeTypeInfo<CollectiveState>();
 
-ErrorOr<std::vector<DeviceMemorySnapshot>> PackDeviceMemories(
+ErrorOr<std::vector<DeviceMemorySnapshot>> SnapshotDeviceMemories(
     const GpuCollectives& collectives,
     std::initializer_list<AnyBuffer> buffers) {
   std::vector<DeviceMemorySnapshot> device_memories;
   device_memories.reserve(buffers.size());
   for (AnyBuffer buffer : buffers) {
     ErrorOr<DeviceMemorySnapshot> device_memory =
-        PackDeviceMemory(collectives, buffer);
+        SnapshotDeviceMemory(collectives, buffer);
     if (!device_memory.has_value()) return Unexpected(device_memory.error());
     device_memories.push_back(*std::move(device_memory));
   }
@@ -242,13 +142,13 @@ bool SameDeviceMemorySnapshots(const std::vector<DeviceMemorySnapshot>& lhs,
   return true;
 }
 
-ErrorOr<std::unique_ptr<CollectiveState>> PackCollectiveState(
+ErrorOr<std::unique_ptr<CollectiveState>> SnapshotCollectiveState(
     const GpuCollectives& collectives,
     std::initializer_list<AnyBuffer> buffers) {
-  ErrorOr<DeviceCommSnapshot> device_comm = PackDeviceComm(collectives);
+  ErrorOr<ncclDevComm> device_comm = SnapshotDeviceComm(collectives);
   if (!device_comm.has_value()) return Unexpected(device_comm.error());
   ErrorOr<std::vector<DeviceMemorySnapshot>> device_memories =
-      PackDeviceMemories(collectives, buffers);
+      SnapshotDeviceMemories(collectives, buffers);
   if (!device_memories.has_value()) {
     return Unexpected(device_memories.error());
   }
@@ -261,7 +161,7 @@ ErrorOr<std::unique_ptr<CollectiveState>> PackCollectiveState(
 
 bool SameCollectiveState(const CollectiveState& lhs,
                          const CollectiveState& rhs) {
-  return SameDeviceCommSnapshot(lhs.device_comm, rhs.device_comm) &&
+  return SameDeviceComm(lhs.device_comm, rhs.device_comm) &&
          SameDeviceMemorySnapshots(lhs.device_memories, rhs.device_memories);
 }
 
@@ -276,7 +176,7 @@ Error ValidateExactAlias(AnyBuffer operand, Result<AnyBuffer> result) {
 
 ErrorOr<std::unique_ptr<CollectiveState>> Initialize(
     AnyBuffer operand, Result<AnyBuffer>, GpuCollectives collectives) {
-  return PackCollectiveState(collectives, {operand});
+  return SnapshotCollectiveState(collectives, {operand});
 }
 
 Error Execute(AnyBuffer operand, Result<AnyBuffer> result,
@@ -289,7 +189,7 @@ Error Execute(AnyBuffer operand, Result<AnyBuffer> result,
   if (error.failure()) return error;
 
   ErrorOr<std::unique_ptr<CollectiveState>> current =
-      PackCollectiveState(collectives, {operand});
+      SnapshotCollectiveState(collectives, {operand});
   if (!current.has_value()) return current.error();
   const CollectiveState& current_state = **current;
   if (!SameCollectiveState(*initialized, current_state)) {
@@ -304,9 +204,8 @@ Error Execute(AnyBuffer operand, Result<AnyBuffer> result,
   const DeviceMemorySnapshot& device_memory =
       current_state.device_memories.front();
   cudaError_t launch_status = LaunchGpuCollectivesFfiTestKernel(
-      stream, current_state.device_comm.bytes.data(),
-      current_state.device_comm.bytes.size(), device_memory.bytes.data(),
-      device_memory.bytes.size(), device_memory.result.offset,
+      stream, &current_state.device_comm, sizeof(current_state.device_comm),
+      &device_memory.window, sizeof(device_memory.window), device_memory.offset,
       operand.element_count() - 1);
   if (launch_status != cudaSuccess) {
     return FailedPrecondition(
@@ -319,7 +218,7 @@ Error Execute(AnyBuffer operand, Result<AnyBuffer> result,
 ErrorOr<std::unique_ptr<CollectiveState>> InitializeTwoBuffers(
     AnyBuffer first_operand, AnyBuffer second_operand, Result<AnyBuffer>,
     Result<AnyBuffer>, GpuCollectives collectives) {
-  return PackCollectiveState(collectives, {first_operand, second_operand});
+  return SnapshotCollectiveState(collectives, {first_operand, second_operand});
 }
 
 Error ExecuteTwoBuffers(AnyBuffer first_operand, AnyBuffer second_operand,
@@ -336,7 +235,7 @@ Error ExecuteTwoBuffers(AnyBuffer first_operand, AnyBuffer second_operand,
   if (error.failure()) return error;
 
   ErrorOr<std::unique_ptr<CollectiveState>> current =
-      PackCollectiveState(collectives, {first_operand, second_operand});
+      SnapshotCollectiveState(collectives, {first_operand, second_operand});
   if (!current.has_value()) return current.error();
   const CollectiveState& current_state = **current;
   if (!SameCollectiveState(*initialized, current_state)) {
@@ -352,11 +251,10 @@ Error ExecuteTwoBuffers(AnyBuffer first_operand, AnyBuffer second_operand,
   const DeviceMemorySnapshot& first_memory = current_state.device_memories[0];
   const DeviceMemorySnapshot& second_memory = current_state.device_memories[1];
   cudaError_t launch_status = LaunchGpuCollectivesFfiTwoBufferTestKernel(
-      stream, current_state.device_comm.bytes.data(),
-      current_state.device_comm.bytes.size(), first_memory.bytes.data(),
-      first_memory.bytes.size(), first_memory.result.offset,
-      first_operand.element_count() - 1, second_memory.bytes.data(),
-      second_memory.bytes.size(), second_memory.result.offset,
+      stream, &current_state.device_comm, sizeof(current_state.device_comm),
+      &first_memory.window, sizeof(first_memory.window), first_memory.offset,
+      first_operand.element_count() - 1, &second_memory.window,
+      sizeof(second_memory.window), second_memory.offset,
       second_operand.element_count() - 1);
   if (launch_status != cudaSuccess) {
     return FailedPrecondition(

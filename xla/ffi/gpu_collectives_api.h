@@ -23,8 +23,8 @@ namespace xla::ffi {
 
 // Backend-neutral interface used by the public GPU device-communication C API.
 // A GPU execution installs an execution-scoped implementation in the FFI
-// execution context; the generic C callbacks validate ABI and stage before
-// forwarding read-only resource queries.
+// execution context; the generic C callbacks validate the argument struct size
+// and execution stage before forwarding resource-copy operations.
 class GpuCollectivesApi {
  public:
   virtual ~GpuCollectivesApi() = default;

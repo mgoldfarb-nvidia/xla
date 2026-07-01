@@ -18,9 +18,15 @@ limitations under the License.
 
 #include <stdint.h>
 
-// Stable schemas for NCCL packed kernel arguments returned by the generic GPU
+// Stable schemas for NCCL device kernel arguments returned by the generic GPU
 // device-communication API. These constants identify the concrete device ABI;
 // they do not select NCCL or configure communication resources.
+//
+// Callers include nccl.h and nccl_device.h, and use NCCL_VERSION_CODE as the
+// expected ABI version. The device-communicator destination is an ncclDevComm
+// with destination_size == sizeof(ncclDevComm). The symmetric-memory
+// destination is an ncclWindow_t with destination_size ==
+// sizeof(ncclWindow_t).
 #define XLA_FFI_GpuCollective_NCCL_DEVICE_COMM_ABI_SCHEMA \
   UINT64_C(0x4e43434c44433031)  // ASCII "NCCLDC01"
 #define XLA_FFI_GpuCollective_NCCL_SYMMETRIC_MEMORY_ABI_SCHEMA \

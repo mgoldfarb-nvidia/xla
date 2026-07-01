@@ -112,9 +112,10 @@ class FfiCollectiveResources final : public ffi::GpuCollectivesApi {
   absl::Status CheckStageForGet(absl::string_view operation) const;
 
   absl::StatusOr<BufferView> FindBufferView(const XLA_FFI_Buffer& buffer) const;
-  static absl::Status PreparePackedDestination(
-      XLA_FFI_GpuCollective_PackedKernelArg* output, uint64_t schema,
-      uint64_t abi_version, size_t size, size_t alignment);
+  static absl::Status ValidateKernelArgDestination(
+      uint64_t expected_abi_schema, uint64_t expected_abi_version,
+      void* destination, size_t destination_size, uint64_t provider_abi_schema,
+      uint64_t provider_abi_version, size_t provider_size);
 
   uint64_t resource_domain_;
   bool has_valid_resource_domain_;
