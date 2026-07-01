@@ -69,14 +69,6 @@ void LogInterconnectStatus(stream_executor::StreamExecutor* stream_executor) {
 
 }  // namespace
 
-SymmetricMemory::PackedKernelArgMetadata BuildNcclWindowKernelArgMetadata(
-    uint64_t validated_device_abi_version) {
-  return {/*device_abi_schema=*/kNcclWindowAbiSchema,
-          /*device_abi_version=*/validated_device_abi_version,
-          /*size_bytes=*/sizeof(ncclWindow_t),
-          /*alignment=*/alignof(ncclWindow_t)};
-}
-
 absl::Status ValidateNcclWindowDeviceAbi(uint64_t compile_time_version,
                                          uint64_t runtime_version) {
   if (compile_time_version != runtime_version) {
@@ -93,12 +85,11 @@ NcclSymmetricMemory::NcclSymmetricMemory(
     stream_executor::DeviceAddressBase addr,
     std::shared_ptr<tsl::Executor> executor,
     uint64_t validated_device_abi_version)
-    : comm_state_(comm_state),
+    : SymmetricMemory(kNcclWindowAbiSchema, validated_device_abi_version),
+      comm_state_(comm_state),
       win_(win),
       addr_(addr),
-      executor_(executor),
-      kernel_arg_metadata_(
-          BuildNcclWindowKernelArgMetadata(validated_device_abi_version)) {}
+      executor_(executor) {}
 
 absl::StatusOr<std::unique_ptr<NcclSymmetricMemory>>
 NcclSymmetricMemory::Create(std::shared_ptr<NcclCommState> comm_state,

@@ -68,13 +68,9 @@ class FfiCollectiveResourcesTestPeer {
   }
 
   static absl::Status ValidateKernelArgDestination(
-      uint64_t expected_abi_schema, uint64_t expected_abi_version,
-      void* destination, size_t destination_size, uint64_t provider_abi_schema,
-      uint64_t provider_abi_version, size_t provider_size) {
+      void* destination, size_t destination_size, size_t packed_size) {
     return FfiCollectiveResources::ValidateKernelArgDestination(
-        expected_abi_schema, expected_abi_version, destination,
-        destination_size, provider_abi_schema, provider_abi_version,
-        provider_size);
+        destination, destination_size, packed_size);
   }
 
   static size_t TaggedBufferCount(const FfiCollectiveResources& resources) {
@@ -327,42 +323,19 @@ TEST(FfiCollectiveResourcesTest, RejectsAmbiguousAliasedAllocations) {
 TEST(FfiCollectiveResourcesTest, ValidatesKernelArgumentDestination) {
   std::array<std::byte, 8> storage;
   EXPECT_THAT(FfiCollectiveResourcesTestPeer::ValidateKernelArgDestination(
-                  /*expected_abi_schema=*/17, /*expected_abi_version=*/18,
-                  storage.data(), storage.size(), /*provider_abi_schema=*/17,
-                  /*provider_abi_version=*/18, /*provider_size=*/8),
+                  storage.data(), storage.size(), /*packed_size=*/8),
               IsOk());
 
   EXPECT_THAT(FfiCollectiveResourcesTestPeer::ValidateKernelArgDestination(
-                  17, 18, /*destination=*/nullptr, storage.size(), 17, 18, 8),
+                  /*destination=*/nullptr, storage.size(), /*packed_size=*/8),
               StatusIs(absl::StatusCode::kInvalidArgument,
                        HasSubstr("must not be null")));
   EXPECT_THAT(FfiCollectiveResourcesTestPeer::ValidateKernelArgDestination(
-                  17, 18, storage.data(), storage.size(),
-                  /*provider_abi_schema=*/0, 18, 8),
+                  storage.data(), storage.size(), /*packed_size=*/0),
               StatusIs(absl::StatusCode::kFailedPrecondition,
-                       HasSubstr("invalid kernel argument metadata")));
+                       HasSubstr("empty kernel argument")));
   EXPECT_THAT(FfiCollectiveResourcesTestPeer::ValidateKernelArgDestination(
-                  17, 18, storage.data(), storage.size(), 17,
-                  /*provider_abi_version=*/0, 8),
-              StatusIs(absl::StatusCode::kFailedPrecondition,
-                       HasSubstr("invalid kernel argument metadata")));
-  EXPECT_THAT(FfiCollectiveResourcesTestPeer::ValidateKernelArgDestination(
-                  17, 18, storage.data(), storage.size(), 17, 18,
-                  /*provider_size=*/0),
-              StatusIs(absl::StatusCode::kFailedPrecondition,
-                       HasSubstr("invalid kernel argument metadata")));
-  EXPECT_THAT(FfiCollectiveResourcesTestPeer::ValidateKernelArgDestination(
-                  17, 18, storage.data(), storage.size(),
-                  /*provider_abi_schema=*/19, 18, 8),
-              StatusIs(absl::StatusCode::kFailedPrecondition,
-                       HasSubstr("ABI schema mismatch")));
-  EXPECT_THAT(FfiCollectiveResourcesTestPeer::ValidateKernelArgDestination(
-                  17, 18, storage.data(), storage.size(), 17,
-                  /*provider_abi_version=*/19, 8),
-              StatusIs(absl::StatusCode::kFailedPrecondition,
-                       HasSubstr("ABI version mismatch")));
-  EXPECT_THAT(FfiCollectiveResourcesTestPeer::ValidateKernelArgDestination(
-                  17, 18, storage.data(), /*destination_size=*/7, 17, 18, 8),
+                  storage.data(), /*destination_size=*/7, /*packed_size=*/8),
               StatusIs(absl::StatusCode::kInvalidArgument,
                        HasSubstr("destination size mismatch")));
 }

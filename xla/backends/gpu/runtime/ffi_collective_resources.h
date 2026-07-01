@@ -113,9 +113,7 @@ class FfiCollectiveResources final : public ffi::GpuCollectivesApi {
 
   absl::StatusOr<BufferView> FindBufferView(const XLA_FFI_Buffer& buffer) const;
   static absl::Status ValidateKernelArgDestination(
-      uint64_t expected_abi_schema, uint64_t expected_abi_version,
-      void* destination, size_t destination_size, uint64_t provider_abi_schema,
-      uint64_t provider_abi_version, size_t provider_size);
+      void* destination, size_t destination_size, size_t packed_size);
 
   uint64_t resource_domain_;
   bool has_valid_resource_domain_;

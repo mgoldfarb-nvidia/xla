@@ -15,16 +15,38 @@ limitations under the License.
 
 #include "xla/backends/gpu/collectives/gpu_communicator.h"
 
+#include <cstdint>
 #include <string>
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/container/btree_set.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/types/span.h"
+#include "xla/stream_executor/kernel_args.h"
 
 namespace xla::gpu {
 namespace {
 
+using ::absl_testing::IsOk;
+using ::absl_testing::StatusIs;
+using ::testing::HasSubstr;
 using Requirements = GpuDeviceCommunicator::Requirements;
+
+class FakeGpuDeviceCommunicator final : public GpuDeviceCommunicator {
+ public:
+  FakeGpuDeviceCommunicator(uint64_t device_abi_schema,
+                            uint64_t device_abi_version)
+      : GpuDeviceCommunicator(device_abi_schema, device_abi_version) {}
+
+  int64_t lsa_size() const final { return 0; }
+  std::string ToString() const final { return "FakeGpuDeviceCommunicator"; }
+  se::PackedKernelArg PackKernelArg() const final {
+    return se::PackedKernelArg(/*size_bytes=*/0, [](absl::Span<char>) {});
+  }
+};
 
 TEST(GpuDeviceCommunicatorRequirementsTest,
      PreservesLegacyAggregateInitialization) {
@@ -51,6 +73,55 @@ TEST(GpuDeviceCommunicatorRequirementsTest, OrdersLargerLsaBarrierCountsFirst) {
 
 TEST(GpuDeviceCommunicatorRequirementsTest, StringifiesLsaBarrierCount) {
   EXPECT_EQ(absl::StrCat(Requirements{8}), "{lsa_barrier_count: 8}");
+}
+
+TEST(GpuDeviceCommunicatorKernelArgAbiTest, AcceptsExactProviderAbi) {
+  FakeGpuDeviceCommunicator communicator(/*device_abi_schema=*/123,
+                                         /*device_abi_version=*/456);
+
+  EXPECT_THAT(communicator.CheckKernelArgAbi(/*expected_schema=*/123,
+                                             /*expected_version=*/456),
+              IsOk());
+}
+
+TEST(GpuDeviceCommunicatorKernelArgAbiTest, RejectsZeroProviderSchema) {
+  FakeGpuDeviceCommunicator communicator(/*device_abi_schema=*/0,
+                                         /*device_abi_version=*/456);
+
+  EXPECT_THAT(communicator.CheckKernelArgAbi(/*expected_schema=*/123,
+                                             /*expected_version=*/456),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("does not expose")));
+}
+
+TEST(GpuDeviceCommunicatorKernelArgAbiTest, RejectsZeroProviderVersion) {
+  FakeGpuDeviceCommunicator communicator(/*device_abi_schema=*/123,
+                                         /*device_abi_version=*/0);
+
+  EXPECT_THAT(communicator.CheckKernelArgAbi(/*expected_schema=*/123,
+                                             /*expected_version=*/456),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("does not expose")));
+}
+
+TEST(GpuDeviceCommunicatorKernelArgAbiTest, RejectsSchemaMismatch) {
+  FakeGpuDeviceCommunicator communicator(/*device_abi_schema=*/123,
+                                         /*device_abi_version=*/456);
+
+  EXPECT_THAT(communicator.CheckKernelArgAbi(/*expected_schema=*/124,
+                                             /*expected_version=*/456),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("schema mismatch")));
+}
+
+TEST(GpuDeviceCommunicatorKernelArgAbiTest, RejectsVersionMismatch) {
+  FakeGpuDeviceCommunicator communicator(/*device_abi_schema=*/123,
+                                         /*device_abi_version=*/456);
+
+  EXPECT_THAT(communicator.CheckKernelArgAbi(/*expected_schema=*/123,
+                                             /*expected_version=*/457),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("version mismatch")));
 }
 
 }  // namespace

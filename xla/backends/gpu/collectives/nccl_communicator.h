@@ -65,11 +65,6 @@ inline constexpr uint64_t kNcclDeviceCommAbiSchema =
 absl::StatusOr<ncclDevCommRequirements> BuildNcclDeviceCommRequirements(
     const GpuDeviceCommunicator::Requirements& requirements);
 
-// Builds metadata for an NCCL ABI version that has already passed exact
-// compile-time/runtime validation.
-GpuDeviceCommunicator::PackedKernelArgMetadata
-BuildNcclDeviceCommKernelArgMetadata(uint64_t validated_device_abi_version);
-
 // Validates exact compatibility between the NCCL ABI used to compile XLA and
 // the loaded NCCL runtime. This function does not access a GPU and is exposed
 // for focused unit testing.
@@ -334,10 +329,6 @@ class NcclDeviceCommunicator : public GpuDeviceCommunicator {
 
   std::string ToString() const final;
 
-  const PackedKernelArgMetadata& GetKernelArgMetadata() const final {
-    return kernel_arg_metadata_;
-  }
-
   se::PackedKernelArg PackKernelArg() const final;
 
  private:
@@ -351,7 +342,6 @@ class NcclDeviceCommunicator : public GpuDeviceCommunicator {
   se::StreamExecutor* stream_executor_;
   std::shared_ptr<tsl::Executor> executor_;
   ncclDevComm dev_comm_;
-  PackedKernelArgMetadata kernel_arg_metadata_;
 };
 
 }  // namespace xla::gpu

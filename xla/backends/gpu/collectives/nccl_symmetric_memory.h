@@ -36,11 +36,6 @@ namespace xla::gpu {
 inline constexpr uint64_t kNcclWindowAbiSchema =
     uint64_t{0x4e43434c574e3031};  // "NCCLWN01"
 
-// Builds metadata for an NCCL ABI version that has already passed exact
-// compile-time/runtime validation.
-SymmetricMemory::PackedKernelArgMetadata BuildNcclWindowKernelArgMetadata(
-    uint64_t validated_device_abi_version);
-
 absl::Status ValidateNcclWindowDeviceAbi(uint64_t compile_time_version,
                                          uint64_t runtime_version);
 
@@ -67,10 +62,6 @@ class NcclSymmetricMemory final : public SymmetricMemory {
 
   std::string ToString() const final;
 
-  PackedKernelArgMetadata GetKernelArgMetadata() const final {
-    return kernel_arg_metadata_;
-  }
-
   PackedKernelArg PackKernelArg() const final;
 
  private:
@@ -83,7 +74,6 @@ class NcclSymmetricMemory final : public SymmetricMemory {
   ncclWindow_t win_;
   stream_executor::DeviceAddressBase addr_;
   std::shared_ptr<tsl::Executor> executor_;
-  PackedKernelArgMetadata kernel_arg_metadata_;
 };
 
 }  // namespace xla::gpu

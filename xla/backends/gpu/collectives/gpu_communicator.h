@@ -81,17 +81,6 @@ class GpuDeviceCommunicator {
  public:
   virtual ~GpuDeviceCommunicator() = default;
 
-  // Describes the opaque bytes returned by PackKernelArg together with the
-  // concrete provider ABI that interprets them.
-  struct PackedKernelArgMetadata {
-    uint64_t device_abi_schema = 0;
-    // The provider ABI version after the compile-time and runtime versions have
-    // been validated for exact compatibility.
-    uint64_t device_abi_version = 0;
-    size_t size_bytes = 0;
-    size_t alignment = 1;
-  };
-
   // Requirements for constructing a device communicator object.
   struct Requirements {
     template <typename Sink>
@@ -122,9 +111,14 @@ class GpuDeviceCommunicator {
 
   virtual std::string ToString() const = 0;
 
-  // Returns metadata required to safely interpret the opaque bytes returned by
-  // PackKernelArg.
-  virtual const PackedKernelArgMetadata& GetKernelArgMetadata() const = 0;
+  // Checks that device code expecting the given provider ABI can interpret the
+  // opaque bytes returned by PackKernelArg.
+  absl::Status CheckKernelArgAbi(uint64_t expected_schema,
+                                 uint64_t expected_version) const {
+    return xla::internal::CheckKernelArgAbi(
+        device_abi_schema_, device_abi_version_, expected_schema,
+        expected_version);
+  }
 
   // Packs device communicator as a device kernel argument.
   virtual se::PackedKernelArg PackKernelArg() const = 0;
@@ -133,6 +127,16 @@ class GpuDeviceCommunicator {
   friend void AbslStringify(Sink& sink, const GpuDeviceCommunicator& comm) {
     absl::Format(&sink, "%s", comm.ToString());
   }
+
+ protected:
+  GpuDeviceCommunicator(uint64_t device_abi_schema,
+                        uint64_t device_abi_version)
+      : device_abi_schema_(device_abi_schema),
+        device_abi_version_(device_abi_version) {}
+
+ private:
+  const uint64_t device_abi_schema_;
+  const uint64_t device_abi_version_;
 };
 
 // GpuCommunicator extends Communicator with synchronous versions of the

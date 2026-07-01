@@ -16,7 +16,6 @@ limitations under the License.
 #ifndef XLA_CORE_COLLECTIVES_SYMMETRIC_MEMORY_H_
 #define XLA_CORE_COLLECTIVES_SYMMETRIC_MEMORY_H_
 
-#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -29,23 +28,39 @@ limitations under the License.
 
 namespace xla {
 
+namespace internal {
+
+// Checks that a provider's kernel argument ABI matches the ABI expected by a
+// separately compiled consumer. A zero provider schema or version means that
+// the provider does not expose a supported kernel argument ABI.
+inline absl::Status CheckKernelArgAbi(uint64_t provider_schema,
+                                      uint64_t provider_version,
+                                      uint64_t expected_schema,
+                                      uint64_t expected_version) {
+  if (provider_schema == 0 || provider_version == 0) {
+    return absl::FailedPreconditionError(
+        "Collective provider does not expose a supported kernel argument ABI");
+  }
+  if (provider_schema != expected_schema) {
+    return absl::FailedPreconditionError(absl::StrFormat(
+        "Kernel argument ABI schema mismatch: provider=%d, expected=%d",
+        provider_schema, expected_schema));
+  }
+  if (provider_version != expected_version) {
+    return absl::FailedPreconditionError(absl::StrFormat(
+        "Kernel argument ABI version mismatch: provider=%d, expected=%d",
+        provider_version, expected_version));
+  }
+  return absl::OkStatus();
+}
+
+}  // namespace internal
+
 // Symmetric memory allows memory allocations from different devices to be
 // grouped into a symmetric memory allocation, where each device in a collective
 // clique can access peer memory through the symmetric memory handle.
 class SymmetricMemory {
  public:
-  // Describes the provider ABI for the opaque value returned by
-  // PackKernelArg. Schema and version checks are required because device code
-  // interprets the concrete provider type hidden behind this interface.
-  struct PackedKernelArgMetadata {
-    uint64_t device_abi_schema = 0;
-    // The provider ABI version after the compile-time and runtime versions have
-    // been validated for exact compatibility.
-    uint64_t device_abi_version = 0;
-    size_t size_bytes = 0;
-    size_t alignment = 1;
-  };
-
   virtual ~SymmetricMemory() = default;
 
   // Device address on the local device backing the symmetric memory.
@@ -79,14 +94,12 @@ class SymmetricMemory {
   // kernels (a platform-specific POD data type, happens to be a pointer).
   using PackedKernelArg = void*;
 
-  // Returns metadata required to safely interpret the opaque value returned by
-  // PackKernelArg. Backends that do not expose a stable device ABI return a
-  // zero schema and version by default.
-  virtual PackedKernelArgMetadata GetKernelArgMetadata() const {
-    return {/*device_abi_schema=*/0,
-            /*device_abi_version=*/0,
-            /*size_bytes=*/sizeof(PackedKernelArg),
-            /*alignment=*/alignof(PackedKernelArg)};
+  // Checks that this provider's packed kernel argument ABI matches the ABI
+  // expected by a separately compiled consumer.
+  absl::Status CheckKernelArgAbi(uint64_t expected_schema,
+                                 uint64_t expected_version) const {
+    return internal::CheckKernelArgAbi(device_abi_schema_, device_abi_version_,
+                                       expected_schema, expected_version);
   }
 
   virtual PackedKernelArg PackKernelArg() const = 0;
@@ -95,6 +108,16 @@ class SymmetricMemory {
   friend void AbslStringify(Sink& sink, const SymmetricMemory& mem) {
     absl::Format(&sink, "%s", mem.ToString());
   }
+
+ protected:
+  explicit SymmetricMemory(uint64_t device_abi_schema = 0,
+                           uint64_t device_abi_version = 0)
+      : device_abi_schema_(device_abi_schema),
+        device_abi_version_(device_abi_version) {}
+
+ private:
+  const uint64_t device_abi_schema_;
+  const uint64_t device_abi_version_;
 };
 
 }  // namespace xla

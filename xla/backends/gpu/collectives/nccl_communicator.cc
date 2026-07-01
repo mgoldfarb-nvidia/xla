@@ -160,14 +160,6 @@ absl::Status ValidateLsaBarrierCount(int32_t count) {
 
 }  // namespace
 
-GpuDeviceCommunicator::PackedKernelArgMetadata
-BuildNcclDeviceCommKernelArgMetadata(uint64_t validated_device_abi_version) {
-  return {/*device_abi_schema=*/kNcclDeviceCommAbiSchema,
-          /*device_abi_version=*/validated_device_abi_version,
-          /*size_bytes=*/sizeof(ncclDevComm),
-          /*alignment=*/alignof(ncclDevComm)};
-}
-
 absl::StatusOr<ncclDevCommRequirements> BuildNcclDeviceCommRequirements(
     const GpuDeviceCommunicator::Requirements& requirements) {
   RETURN_IF_ERROR(ValidateLsaBarrierCount(requirements.lsa_barrier_count));
@@ -1054,12 +1046,12 @@ NcclDeviceCommunicator::NcclDeviceCommunicator(
     se::StreamExecutor* stream_executor,
     std::shared_ptr<tsl::Executor> executor,
     uint64_t validated_device_abi_version, ncclDevComm dev_comm)
-    : parent_comm_(parent_comm),
+    : GpuDeviceCommunicator(kNcclDeviceCommAbiSchema,
+                            validated_device_abi_version),
+      parent_comm_(parent_comm),
       stream_executor_(stream_executor),
       executor_(std::move(executor)),
-      dev_comm_(dev_comm),
-      kernel_arg_metadata_(
-          BuildNcclDeviceCommKernelArgMetadata(validated_device_abi_version)) {}
+      dev_comm_(dev_comm) {}
 
 NcclDeviceCommunicator::~NcclDeviceCommunicator() {
   VLOG(3) << absl::StreamFormat("Destroy NCCL device comm %v", *this);

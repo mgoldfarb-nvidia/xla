@@ -66,29 +66,7 @@ TEST(NcclDeviceAbiTest, RejectsVersionMismatch) {
                          "version=23000")));
 }
 
-TEST(NcclDeviceKernelArgMetadataTest, ReportsValidatedProviderAbi) {
-  GpuDeviceCommunicator::PackedKernelArgMetadata metadata =
-      BuildNcclDeviceCommKernelArgMetadata(
-          /*validated_device_abi_version=*/22907);
-
-  EXPECT_EQ(metadata.device_abi_schema, kNcclDeviceCommAbiSchema);
-  EXPECT_EQ(metadata.device_abi_version, 22907);
-  EXPECT_EQ(metadata.size_bytes, sizeof(ncclDevComm));
-  EXPECT_EQ(metadata.alignment, alignof(ncclDevComm));
-}
-
-TEST(NcclWindowKernelArgMetadataTest, ReportsStableProviderAbi) {
-  SymmetricMemory::PackedKernelArgMetadata metadata =
-      BuildNcclWindowKernelArgMetadata(
-          /*validated_device_abi_version=*/22907);
-
-  EXPECT_EQ(metadata.device_abi_schema, kNcclWindowAbiSchema);
-  EXPECT_EQ(metadata.device_abi_version, 22907);
-  EXPECT_EQ(metadata.size_bytes, sizeof(ncclWindow_t));
-  EXPECT_EQ(metadata.alignment, alignof(ncclWindow_t));
-}
-
-TEST(NcclWindowKernelArgMetadataTest, RequiresExactRuntimeVersion) {
+TEST(NcclWindowDeviceAbiTest, RequiresExactRuntimeVersion) {
   EXPECT_OK(ValidateNcclWindowDeviceAbi(/*compile_time_version=*/22907,
                                         /*runtime_version=*/22907));
   EXPECT_THAT(
