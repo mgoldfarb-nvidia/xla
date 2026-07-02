@@ -34,6 +34,18 @@ namespace {
 
 class TestGpuCollectivesApi final : public GpuCollectivesApi {
  public:
+  absl::Status RequestDeviceCommunication(
+      XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args*) override {
+    ++device_communication_requests;
+    return device_communication_request_status;
+  }
+
+  absl::Status GetDeviceCommunicationInfo(
+      XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args*) override {
+    ++device_communication_info_gets;
+    return device_communication_info_status;
+  }
+
   absl::Status GetDeviceComm(
       XLA_FFI_GpuCollectives_GetDeviceComm_Args*) override {
     ++device_comm_gets;
@@ -46,8 +58,12 @@ class TestGpuCollectivesApi final : public GpuCollectivesApi {
     return device_memory_status;
   }
 
+  absl::Status device_communication_request_status = absl::OkStatus();
+  absl::Status device_communication_info_status = absl::OkStatus();
   absl::Status device_comm_status = absl::OkStatus();
   absl::Status device_memory_status = absl::OkStatus();
+  int device_communication_requests = 0;
+  int device_communication_info_gets = 0;
   int device_comm_gets = 0;
   int device_memory_gets = 0;
 };
@@ -109,7 +125,7 @@ XLA_FFI_Error* LegacyV03Handler(XLA_FFI_CallFrame* call_frame) {
   return nullptr;
 }
 
-TEST(GpuCollectivesApiTest, RootApiPublishesMinimalVersionedExtension) {
+TEST(GpuCollectivesApiTest, RootApiPublishesVersionedExtension) {
   const XLA_FFI_Api* api = GetXlaFfiApi();
   ASSERT_EQ(api->api_version.major_version, 0);
   ASSERT_EQ(api->api_version.minor_version, XLA_FFI_API_MINOR);
@@ -123,6 +139,8 @@ TEST(GpuCollectivesApiTest, RootApiPublishesMinimalVersionedExtension) {
   EXPECT_EQ(extension->api_minor_version, XLA_FFI_GPU_COLLECTIVES_API_MINOR);
   EXPECT_NE(extension->get_device_comm, nullptr);
   EXPECT_NE(extension->get_device_memory, nullptr);
+  EXPECT_NE(extension->request_device_communication, nullptr);
+  EXPECT_NE(extension->get_device_communication_info, nullptr);
 }
 
 TEST(GpuCollectivesApiTest, RegistersAndInvokesLegacyV03Handler) {
@@ -179,6 +197,10 @@ TEST(GpuCollectivesApiTest, RejectsNullOperationArgs) {
             XLA_FFI_Error_Code_INVALID_ARGUMENT);
   EXPECT_EQ(TakeErrorCode(extension->get_device_memory(nullptr)),
             XLA_FFI_Error_Code_INVALID_ARGUMENT);
+  EXPECT_EQ(TakeErrorCode(extension->request_device_communication(nullptr)),
+            XLA_FFI_Error_Code_INVALID_ARGUMENT);
+  EXPECT_EQ(TakeErrorCode(extension->get_device_communication_info(nullptr)),
+            XLA_FFI_Error_Code_INVALID_ARGUMENT);
 }
 
 TEST(GpuCollectivesApiTest, RejectsWrongStageBeforeForwarding) {
@@ -192,6 +214,77 @@ TEST(GpuCollectivesApiTest, RejectsWrongStageBeforeForwarding) {
   XLA_FFI_Error* error = GpuCollectivesExtension()->get_device_comm(&args);
   EXPECT_EQ(TakeErrorCode(error), XLA_FFI_Error_Code_FAILED_PRECONDITION);
   EXPECT_EQ(adapter.device_comm_gets, 0);
+
+  XLA_FFI_GpuDeviceCommunication_Requirements requirements = {};
+  requirements.struct_size =
+      XLA_FFI_GpuDeviceCommunication_Requirements_STRUCT_SIZE;
+  XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args request = {};
+  request.struct_size =
+      XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args_STRUCT_SIZE;
+  request.ctx = &ctx;
+  request.requirements = &requirements;
+
+  ctx.stage = XLA_FFI_ExecutionStage_EXECUTE;
+  error = GpuCollectivesExtension()->request_device_communication(&request);
+  EXPECT_EQ(TakeErrorCode(error), XLA_FFI_Error_Code_FAILED_PRECONDITION);
+  EXPECT_EQ(adapter.device_communication_requests, 0);
+}
+
+TEST(GpuCollectivesApiTest, RejectsNullOrTruncatedNestedStructs) {
+  TestGpuCollectivesApi adapter;
+  XLA_FFI_ExecutionContext prepare =
+      GpuContext(XLA_FFI_ExecutionStage_PREPARE, &adapter);
+
+  XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args request = {};
+  request.struct_size =
+      XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args_STRUCT_SIZE;
+  request.ctx = &prepare;
+  XLA_FFI_Error* error =
+      GpuCollectivesExtension()->request_device_communication(&request);
+  EXPECT_EQ(TakeErrorCode(error), XLA_FFI_Error_Code_INVALID_ARGUMENT);
+
+  XLA_FFI_GpuDeviceCommunication_Requirements requirements = {};
+  requirements.struct_size =
+      XLA_FFI_GpuDeviceCommunication_Requirements_STRUCT_SIZE;
+  request.requirements = &requirements;
+  request.struct_size =
+      XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args_STRUCT_SIZE_V1_1 -
+      1;
+  error = GpuCollectivesExtension()->request_device_communication(&request);
+  EXPECT_EQ(TakeErrorCode(error), XLA_FFI_Error_Code_INVALID_ARGUMENT);
+
+  request.struct_size =
+      XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args_STRUCT_SIZE;
+  requirements.struct_size =
+      XLA_FFI_GpuDeviceCommunication_Requirements_STRUCT_SIZE_V1_1 - 1;
+  error = GpuCollectivesExtension()->request_device_communication(&request);
+  EXPECT_EQ(TakeErrorCode(error), XLA_FFI_Error_Code_INVALID_ARGUMENT);
+  EXPECT_EQ(adapter.device_communication_requests, 0);
+
+  XLA_FFI_ExecutionContext initialize =
+      GpuContext(XLA_FFI_ExecutionStage_INITIALIZE, &adapter);
+  XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args get_info = {};
+  get_info.struct_size =
+      XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args_STRUCT_SIZE;
+  get_info.ctx = &initialize;
+  error = GpuCollectivesExtension()->get_device_communication_info(&get_info);
+  EXPECT_EQ(TakeErrorCode(error), XLA_FFI_Error_Code_INVALID_ARGUMENT);
+
+  XLA_FFI_GpuDeviceCommunication_Info info = {};
+  info.struct_size = XLA_FFI_GpuDeviceCommunication_Info_STRUCT_SIZE;
+  get_info.info = &info;
+  get_info.struct_size =
+      XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args_STRUCT_SIZE_V1_1 -
+      1;
+  error = GpuCollectivesExtension()->get_device_communication_info(&get_info);
+  EXPECT_EQ(TakeErrorCode(error), XLA_FFI_Error_Code_INVALID_ARGUMENT);
+
+  get_info.struct_size =
+      XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args_STRUCT_SIZE;
+  info.struct_size = XLA_FFI_GpuDeviceCommunication_Info_STRUCT_SIZE_V1_1 - 1;
+  error = GpuCollectivesExtension()->get_device_communication_info(&get_info);
+  EXPECT_EQ(TakeErrorCode(error), XLA_FFI_Error_Code_INVALID_ARGUMENT);
+  EXPECT_EQ(adapter.device_communication_info_gets, 0);
 }
 
 TEST(GpuCollectivesApiTest, RejectsCpuAndMissingGpuAdapter) {
@@ -212,10 +305,33 @@ TEST(GpuCollectivesApiTest, RejectsCpuAndMissingGpuAdapter) {
   EXPECT_EQ(TakeErrorCode(error), XLA_FFI_Error_Code_FAILED_PRECONDITION);
 }
 
-TEST(GpuCollectivesApiTest, ForwardsBothOperationsAtAuthoritativeStages) {
+TEST(GpuCollectivesApiTest, ForwardsOperationsAtAuthoritativeStages) {
   TestGpuCollectivesApi adapter;
+  XLA_FFI_ExecutionContext prepare =
+      GpuContext(XLA_FFI_ExecutionStage_PREPARE, &adapter);
+  XLA_FFI_GpuDeviceCommunication_Requirements requirements = {};
+  requirements.struct_size =
+      XLA_FFI_GpuDeviceCommunication_Requirements_STRUCT_SIZE;
+  XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args request = {};
+  request.struct_size =
+      XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args_STRUCT_SIZE;
+  request.ctx = &prepare;
+  request.requirements = &requirements;
+  EXPECT_EQ(GpuCollectivesExtension()->request_device_communication(&request),
+            nullptr);
+
   XLA_FFI_ExecutionContext initialize =
       GpuContext(XLA_FFI_ExecutionStage_INITIALIZE, &adapter);
+
+  XLA_FFI_GpuDeviceCommunication_Info info = {};
+  info.struct_size = XLA_FFI_GpuDeviceCommunication_Info_STRUCT_SIZE;
+  XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args get_info = {};
+  get_info.struct_size =
+      XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args_STRUCT_SIZE;
+  get_info.ctx = &initialize;
+  get_info.info = &info;
+  EXPECT_EQ(GpuCollectivesExtension()->get_device_communication_info(&get_info),
+            nullptr);
 
   XLA_FFI_GpuCollectives_GetDeviceComm_Args device_comm = {};
   device_comm.struct_size =
@@ -232,6 +348,8 @@ TEST(GpuCollectivesApiTest, ForwardsBothOperationsAtAuthoritativeStages) {
   EXPECT_EQ(GpuCollectivesExtension()->get_device_memory(&device_memory),
             nullptr);
 
+  EXPECT_EQ(adapter.device_communication_requests, 1);
+  EXPECT_EQ(adapter.device_communication_info_gets, 1);
   EXPECT_EQ(adapter.device_comm_gets, 1);
   EXPECT_EQ(adapter.device_memory_gets, 1);
 }
@@ -248,6 +366,37 @@ TEST(GpuCollectivesApiTest, PreservesAdapterStatusCode) {
   XLA_FFI_Error* error = GpuCollectivesExtension()->get_device_comm(&args);
   EXPECT_EQ(TakeErrorCode(error), XLA_FFI_Error_Code_RESOURCE_EXHAUSTED);
   EXPECT_EQ(adapter.device_comm_gets, 1);
+
+  adapter.device_communication_request_status =
+      absl::UnavailableError("request unavailable");
+  XLA_FFI_ExecutionContext prepare =
+      GpuContext(XLA_FFI_ExecutionStage_PREPARE, &adapter);
+  XLA_FFI_GpuDeviceCommunication_Requirements requirements = {};
+  requirements.struct_size =
+      XLA_FFI_GpuDeviceCommunication_Requirements_STRUCT_SIZE;
+  XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args request = {};
+  request.struct_size =
+      XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args_STRUCT_SIZE;
+  request.ctx = &prepare;
+  request.requirements = &requirements;
+  error = GpuCollectivesExtension()->request_device_communication(&request);
+  EXPECT_EQ(TakeErrorCode(error), XLA_FFI_Error_Code_UNAVAILABLE);
+  EXPECT_EQ(adapter.device_communication_requests, 1);
+
+  adapter.device_communication_info_status =
+      absl::DataLossError("info unavailable");
+  XLA_FFI_ExecutionContext initialize =
+      GpuContext(XLA_FFI_ExecutionStage_INITIALIZE, &adapter);
+  XLA_FFI_GpuDeviceCommunication_Info info = {};
+  info.struct_size = XLA_FFI_GpuDeviceCommunication_Info_STRUCT_SIZE;
+  XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args get_info = {};
+  get_info.struct_size =
+      XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args_STRUCT_SIZE;
+  get_info.ctx = &initialize;
+  get_info.info = &info;
+  error = GpuCollectivesExtension()->get_device_communication_info(&get_info);
+  EXPECT_EQ(TakeErrorCode(error), XLA_FFI_Error_Code_DATA_LOSS);
+  EXPECT_EQ(adapter.device_communication_info_gets, 1);
 }
 
 }  // namespace

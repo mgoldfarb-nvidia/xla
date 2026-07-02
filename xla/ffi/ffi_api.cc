@@ -649,6 +649,74 @@ static absl::Status ValidateDeviceCommunicationStage(
   return absl::OkStatus();
 }
 
+static absl::Status ValidateDeviceCommunicationPrepareStage(
+    XLA_FFI_ExecutionContext* ctx, absl::string_view operation) {
+  if (ctx == nullptr) {
+    return InvalidArgument(
+        "GPU device-communication execution context is null");
+  }
+  if (ctx->stage != XLA_FFI_ExecutionStage_PREPARE) {
+    return FailedPrecondition("%s is only valid during Prepare", operation);
+  }
+  return absl::OkStatus();
+}
+
+static XLA_FFI_Error* GpuCollectivesRequestDeviceCommunication(
+    XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args* args) {
+  if (args == nullptr) {
+    return ToFfiError(
+        InvalidArgument("RequestDeviceCommunication args are null"));
+  }
+  XLA_FFI_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
+      "XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args",
+      XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args_STRUCT_SIZE_V1_1,
+      args->struct_size));
+  if (args->requirements == nullptr) {
+    return ToFfiError(
+        InvalidArgument("Device communication requirements are null"));
+  }
+  XLA_FFI_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
+      "XLA_FFI_GpuDeviceCommunication_Requirements",
+      XLA_FFI_GpuDeviceCommunication_Requirements_STRUCT_SIZE_V1_1,
+      args->requirements->struct_size));
+
+  absl::Status stage = ValidateDeviceCommunicationPrepareStage(
+      args->ctx, "RequestDeviceCommunication");
+  if (!stage.ok()) return ToFfiError(std::move(stage));
+
+  absl::StatusOr<GpuCollectivesApi*> api = GetGpuCollectivesApi(args->ctx);
+  if (!api.ok()) return ToFfiError(api.status());
+  return ToFfiError((*api)->RequestDeviceCommunication(args));
+}
+
+static XLA_FFI_Error* GpuCollectivesGetDeviceCommunicationInfo(
+    XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args* args) {
+  if (args == nullptr) {
+    return ToFfiError(
+        InvalidArgument("GetDeviceCommunicationInfo args are null"));
+  }
+  XLA_FFI_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
+      "XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args",
+      XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args_STRUCT_SIZE_V1_1,
+      args->struct_size));
+  if (args->info == nullptr) {
+    return ToFfiError(
+        InvalidArgument("Device communication info destination is null"));
+  }
+  XLA_FFI_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
+      "XLA_FFI_GpuDeviceCommunication_Info",
+      XLA_FFI_GpuDeviceCommunication_Info_STRUCT_SIZE_V1_1,
+      args->info->struct_size));
+
+  absl::Status stage =
+      ValidateDeviceCommunicationStage(args->ctx, "GetDeviceCommunicationInfo");
+  if (!stage.ok()) return ToFfiError(std::move(stage));
+
+  absl::StatusOr<GpuCollectivesApi*> api = GetGpuCollectivesApi(args->ctx);
+  if (!api.ok()) return ToFfiError(api.status());
+  return ToFfiError((*api)->GetDeviceCommunicationInfo(args));
+}
+
 static XLA_FFI_Error* GpuCollectivesGetDeviceComm(
     XLA_FFI_GpuCollectives_GetDeviceComm_Args* args) {
   if (args == nullptr) {
@@ -656,7 +724,7 @@ static XLA_FFI_Error* GpuCollectivesGetDeviceComm(
   }
   XLA_FFI_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
       "XLA_FFI_GpuCollectives_GetDeviceComm_Args",
-      XLA_FFI_GpuCollectives_GetDeviceComm_Args_STRUCT_SIZE,
+      XLA_FFI_GpuCollectives_GetDeviceComm_Args_STRUCT_SIZE_V1_0,
       args->struct_size));
   absl::Status stage =
       ValidateDeviceCommunicationStage(args->ctx, "GetDeviceComm");
@@ -674,7 +742,7 @@ static XLA_FFI_Error* GpuCollectivesGetDeviceMemory(
   }
   XLA_FFI_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
       "XLA_FFI_GpuCollectives_GetDeviceMemory_Args",
-      XLA_FFI_GpuCollectives_GetDeviceMemory_Args_STRUCT_SIZE,
+      XLA_FFI_GpuCollectives_GetDeviceMemory_Args_STRUCT_SIZE_V1_0,
       args->struct_size));
   absl::Status stage =
       ValidateDeviceCommunicationStage(args->ctx, "GetDeviceMemory");
@@ -700,6 +768,8 @@ const XLA_FFI_Api* GetXlaFfiApi() {
       XLA_FFI_GPU_COLLECTIVES_API_MINOR,
       GpuCollectivesGetDeviceComm,
       GpuCollectivesGetDeviceMemory,
+      GpuCollectivesRequestDeviceCommunication,
+      GpuCollectivesGetDeviceCommunicationInfo,
   };
 
   static const XLA_FFI_Api api = {

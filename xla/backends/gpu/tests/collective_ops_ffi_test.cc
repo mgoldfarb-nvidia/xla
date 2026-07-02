@@ -153,9 +153,11 @@ static absl::Status PrepareDeviceAllReduce(
           *collective_params, {AllDevices()},
           CollectiveOpGroupMode::COLLECTIVE_OP_GROUP_MODE_FLATTENED_ID));
 
-  // Ask for a device communicator with 8 lsa barriers.
+  // Ask for a device communicator with 8 local-domain barriers.
   CollectiveCliqueRequests::CliqueRequirements requirements;
-  requirements.dev_comm = GpuDeviceCommunicator::Requirements{8};
+  GpuDeviceCommunicator::Requirements device_communication_requirements;
+  device_communication_requirements.local_barrier_count = 8;
+  requirements.dev_comm = device_communication_requirements;
   std::vector<GlobalDeviceId> all_device_groups;
   for (int i = 0; i < kNumReplicas; ++i) {
     all_device_groups.push_back(GlobalDeviceId(i));
@@ -361,10 +363,11 @@ static absl::Status DeviceAllReduce(se::Stream* stream, ffi::BufferR0<U32> src,
 
   // Get requested device communicator for a given clique.
   auto rank = clique_key.rank(collective_params->global_device_id);
-  ASSIGN_OR_RETURN(
-      GpuDeviceCommunicator * dev_comm,
-      collective_cliques->GetDeviceComm(
-          clique_key, *rank, GpuDeviceCommunicator::Requirements{8}));
+  GpuDeviceCommunicator::Requirements device_communication_requirements;
+  device_communication_requirements.local_barrier_count = 8;
+  ASSIGN_OR_RETURN(GpuDeviceCommunicator * dev_comm,
+                   collective_cliques->GetDeviceComm(
+                       clique_key, *rank, device_communication_requirements));
 
   // Load custom kernel that does device-initiated collectives.
   ASSIGN_OR_RETURN(auto kernel, se::gpu::GpuKernelRegistry::GetGlobalRegistry()

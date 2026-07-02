@@ -42,48 +42,81 @@ class FakeGpuDeviceCommunicator final : public GpuDeviceCommunicator {
       : GpuDeviceCommunicator(device_abi_schema, device_abi_version) {}
 
   int64_t lsa_size() const final { return 0; }
+  const Info& info() const final { return info_; }
   std::string ToString() const final { return "FakeGpuDeviceCommunicator"; }
   se::PackedKernelArg PackKernelArg() const final {
     return se::PackedKernelArg(/*size_bytes=*/0, [](absl::Span<char>) {});
   }
+
+ private:
+  Info info_;
 };
 
-TEST(GpuDeviceCommunicatorRequirementsTest,
-     PreservesLegacyAggregateInitialization) {
-  Requirements requirements{8};
+TEST(GpuDeviceCommunicatorRequirementsTest, DefaultsToLocalWithNoResources) {
+  Requirements requirements;
 
-  EXPECT_EQ(requirements.lsa_barrier_count, 8);
-  EXPECT_EQ(requirements.global_barrier_count, 0);
+  EXPECT_EQ(requirements.peer_access,
+            GpuDeviceCommunicator::PeerAccess::kLocalDomain);
+  EXPECT_EQ(requirements.required_features, 0);
+  EXPECT_EQ(requirements.preferred_features, 0);
+  EXPECT_EQ(requirements.local_barrier_count, 0);
+  EXPECT_EQ(requirements.team_barrier_count, 0);
+  EXPECT_EQ(requirements.notification_slot_count, 0);
+  EXPECT_EQ(requirements.completion_slot_count, 0);
 }
 
-TEST(GpuDeviceCommunicatorRequirementsTest, EqualityUsesAllBarrierCounts) {
-  Requirements one_global{8, 1};
-  Requirements two_global{8, 2};
+TEST(GpuDeviceCommunicatorRequirementsTest, EqualityUsesAllFields) {
+  Requirements lhs;
+  lhs.peer_access = GpuDeviceCommunicator::PeerAccess::kHierarchical;
+  lhs.required_features = GpuDeviceCommunicator::kNetworkDeviceOperations;
+  lhs.preferred_features = GpuDeviceCommunicator::kLocalMulticast;
+  lhs.local_barrier_count = 1;
+  lhs.team_barrier_count = 2;
+  lhs.notification_slot_count = 3;
+  lhs.completion_slot_count = 4;
+  Requirements rhs = lhs;
 
-  EXPECT_EQ(Requirements{8}, Requirements{8});
-  EXPECT_FALSE(Requirements{8} == Requirements{7});
-  EXPECT_FALSE(one_global == two_global);
+  EXPECT_EQ(lhs, rhs);
+  ++rhs.completion_slot_count;
+  EXPECT_FALSE(lhs == rhs);
 }
 
-TEST(GpuDeviceCommunicatorRequirementsTest,
-     OrdersGlobalThenLsaCountsDescending) {
-  absl::btree_set<Requirements> requirements = {
-      Requirements{1, 0}, Requirements{3, 0}, Requirements{2, 1},
-      Requirements{1, 2}};
+TEST(GpuDeviceCommunicatorRequirementsTest, OrdersAllFieldsDeterministically) {
+  Requirements local;
+  Requirements hierarchical;
+  hierarchical.peer_access = GpuDeviceCommunicator::PeerAccess::kHierarchical;
+  Requirements with_feature = local;
+  with_feature.required_features =
+      GpuDeviceCommunicator::kNetworkDeviceOperations;
+  Requirements with_barrier = local;
+  with_barrier.team_barrier_count = 1;
+
+  absl::btree_set<Requirements> requirements = {hierarchical, with_feature,
+                                                with_barrier, local};
 
   ASSERT_EQ(requirements.size(), 4);
   auto it = requirements.begin();
-  EXPECT_EQ((it)->global_barrier_count, 2);
-  EXPECT_EQ((it++)->lsa_barrier_count, 1);
-  EXPECT_EQ((it)->global_barrier_count, 1);
-  EXPECT_EQ((it++)->lsa_barrier_count, 2);
-  EXPECT_EQ((it++)->lsa_barrier_count, 3);
-  EXPECT_EQ((it++)->lsa_barrier_count, 1);
+  EXPECT_EQ(*it++, hierarchical);
+  EXPECT_EQ(*it++, with_feature);
+  EXPECT_EQ(*it++, with_barrier);
+  EXPECT_EQ(*it++, local);
 }
 
-TEST(GpuDeviceCommunicatorRequirementsTest, StringifiesBarrierCounts) {
-  EXPECT_EQ(absl::StrCat(Requirements{8, 2}),
-            "{lsa_barrier_count: 8, global_barrier_count: 2}");
+TEST(GpuDeviceCommunicatorRequirementsTest, StringifiesAllFields) {
+  Requirements requirements;
+  requirements.peer_access = GpuDeviceCommunicator::PeerAccess::kHierarchical;
+  requirements.required_features =
+      GpuDeviceCommunicator::kNetworkDeviceOperations;
+  requirements.preferred_features = GpuDeviceCommunicator::kLocalMulticast;
+  requirements.local_barrier_count = 1;
+  requirements.team_barrier_count = 2;
+  requirements.notification_slot_count = 3;
+  requirements.completion_slot_count = 4;
+
+  EXPECT_EQ(absl::StrCat(requirements),
+            "{peer_access: 1, required_features: 0x2, preferred_features: 0x1, "
+            "local_barrier_count: 1, team_barrier_count: 2, "
+            "notification_slot_count: 3, completion_slot_count: 4}");
 }
 
 TEST(GpuDeviceCommunicatorKernelArgAbiTest, AcceptsExactProviderAbi) {

@@ -19,6 +19,7 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -74,6 +75,58 @@ limitations under the License.
 namespace xla::gpu {
 namespace {
 
+using DeviceCommFeatures = GpuDeviceCommunicator::Features;
+using DeviceCommPeerAccess = GpuDeviceCommunicator::PeerAccess;
+using DeviceCommTopology = GpuDeviceCommunicator::Topology;
+
+// NCCL's proxy GIN descriptors encode signal and counter ids in 24 and 23
+// bits, respectively. NCCL can configure smaller pools at run time, but a
+// request above these limits can never be represented.
+constexpr int kMaxGinSignalCount = (1 << 24) - 1;
+constexpr int kMaxGinCounterCount = (1 << 23) - 1;
+
+enum class GinRequirement { kNone = 0, kRail = 1, kFull = 2 };
+
+GinRequirement StrongerGinRequirement(GinRequirement lhs, GinRequirement rhs) {
+  return static_cast<int>(lhs) >= static_cast<int>(rhs) ? lhs : rhs;
+}
+
+bool CanSatisfyGinRequirement(GinRequirement requirement,
+                              const NcclCapabilities& capabilities) {
+  switch (requirement) {
+    case GinRequirement::kNone:
+      return true;
+    case GinRequirement::kRail:
+      return capabilities.supports_full_gin || capabilities.supports_rail_gin;
+    case GinRequirement::kFull:
+      return capabilities.supports_full_gin;
+  }
+  return false;
+}
+
+absl::Status ValidateNonNegative(absl::string_view name, int32_t count) {
+  if (count < 0) {
+    return InvalidArgument("%s must be non-negative; got %d", name, count);
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<int> CheckedAdd(absl::string_view expression, int lhs, int rhs) {
+  if (lhs < 0 || rhs < 0 || lhs > std::numeric_limits<int>::max() - rhs) {
+    return InvalidArgument("%s overflows NCCL's signed count type", expression);
+  }
+  return lhs + rhs;
+}
+
+absl::StatusOr<int> CheckedMultiply(absl::string_view expression, int lhs,
+                                    int rhs) {
+  if (lhs < 0 || rhs < 0 ||
+      (lhs != 0 && rhs > std::numeric_limits<int>::max() / lhs)) {
+    return InvalidArgument("%s overflows NCCL's signed count type", expression);
+  }
+  return lhs * rhs;
+}
+
 CUstream AsCudaStream(se::Stream* stream) {
   return absl::bit_cast<CUstream>(stream->platform_specific_handle().stream);
 }
@@ -84,6 +137,29 @@ se::Stream* ToStream(const Communicator::Executor& executor) {
 
 NcclCapabilities GetCapabilities(std::shared_ptr<NcclCommState> comm_state) {
   NcclCapabilities capabilities;
+
+  ncclResult_t identity_status;
+  {
+    absl::MutexLock lock(comm_state->mutex);
+    identity_status = ncclCommUserRank(comm_state->comm, &capabilities.rank);
+    if (identity_status == ncclSuccess) {
+      identity_status =
+          ncclCommCount(comm_state->comm, &capabilities.team_size);
+    }
+  }
+  if (identity_status != ncclSuccess) {
+    capabilities.one_sided_comm_unsupported_reason =
+        absl::StrFormat("NCCL failed to query communicator identity: %s",
+                        ncclGetErrorString(identity_status));
+    return capabilities;
+  }
+  if (capabilities.team_size <= 0 || capabilities.rank < 0 ||
+      capabilities.rank >= capabilities.team_size) {
+    capabilities.one_sided_comm_unsupported_reason = absl::StrFormat(
+        "NCCL returned invalid communicator identity: rank %d of %d",
+        capabilities.rank, capabilities.team_size);
+    return capabilities;
+  }
 
 #if NCCL_VERSION_CODE >= 22907
   ncclCommProperties_t props = NCCL_COMM_PROPERTIES_INITIALIZER;
@@ -111,14 +187,19 @@ NcclCapabilities GetCapabilities(std::shared_ptr<NcclCommState> comm_state) {
   }
 
   capabilities.supports_device_comm = props.deviceApiSupport;
-  capabilities.lsa_team_count = props.nLsaTeams;
-  if (props.ginType != NCCL_GIN_TYPE_NONE) {
-    capabilities.gin_connection_type =
-        NcclCapabilities::GinConnectionType::kFull;
-  } else if (props.railedGinType != NCCL_GIN_TYPE_NONE) {
-    capabilities.gin_connection_type =
-        NcclCapabilities::GinConnectionType::kRail;
+  capabilities.supports_multimem = props.multimemSupport;
+  if (props.rank != capabilities.rank ||
+      props.nRanks != capabilities.team_size) {
+    capabilities.supports_device_comm = false;
+    capabilities.one_sided_comm_unsupported_reason = absl::StrFormat(
+        "NCCL communicator identity changed during capability query: "
+        "%d/%d became %d/%d",
+        capabilities.rank, capabilities.team_size, props.rank, props.nRanks);
+    return capabilities;
   }
+  capabilities.lsa_team_count = props.nLsaTeams;
+  capabilities.supports_full_gin = props.ginType != NCCL_GIN_TYPE_NONE;
+  capabilities.supports_rail_gin = props.railedGinType != NCCL_GIN_TYPE_NONE;
   return capabilities;
 #elif NCCL_VERSION_CODE >= 22900
   capabilities.supports_device_comm = true;
@@ -137,79 +218,347 @@ NcclCapabilities GetCapabilities(std::shared_ptr<NcclCommState> comm_state) {
 #endif
 }
 
-absl::Status ValidateLsaBarrierCount(int32_t count) {
-  if (count < 0) {
-    return InvalidArgument("lsa_barrier_count must be non-negative; got %d",
-                           count);
-  }
-  return absl::OkStatus();
-}
-
-absl::Status ValidateGlobalBarrierCount(int32_t count) {
-  if (count < 0) {
-    return InvalidArgument("global_barrier_count must be non-negative; got %d",
-                           count);
-  }
-  return absl::OkStatus();
-}
-
 }  // namespace
 
-absl::StatusOr<ncclDevCommRequirements> BuildNcclDeviceCommRequirements(
+absl::StatusOr<NcclDeviceCommPlan> BuildNcclDeviceCommPlan(
     const GpuDeviceCommunicator::Requirements& requirements,
     const NcclCapabilities& capabilities) {
-  RETURN_IF_ERROR(ValidateLsaBarrierCount(requirements.lsa_barrier_count));
-  RETURN_IF_ERROR(
-      ValidateGlobalBarrierCount(requirements.global_barrier_count));
+  RETURN_IF_ERROR(ValidateNonNegative("local_barrier_count",
+                                      requirements.local_barrier_count));
+  RETURN_IF_ERROR(ValidateNonNegative("team_barrier_count",
+                                      requirements.team_barrier_count));
+  RETURN_IF_ERROR(ValidateNonNegative("notification_slot_count",
+                                      requirements.notification_slot_count));
+  RETURN_IF_ERROR(ValidateNonNegative("completion_slot_count",
+                                      requirements.completion_slot_count));
+
+  switch (requirements.peer_access) {
+    case DeviceCommPeerAccess::kLocalDomain:
+    case DeviceCommPeerAccess::kHierarchical:
+    case DeviceCommPeerAccess::kDirectAnyPeer:
+      break;
+    default:
+      return InvalidArgument("Unknown device communication peer access: %d",
+                             static_cast<int>(requirements.peer_access));
+  }
+
+  DeviceCommFeatures unknown_required =
+      requirements.required_features & ~GpuDeviceCommunicator::kKnownFeatures;
+  if (unknown_required != 0) {
+    return Unimplemented(
+        "Unsupported required device communication features: 0x%x",
+        unknown_required);
+  }
+
+  if (!capabilities.supports_device_comm) {
+    return Unimplemented("NCCL communicator does not support the device API");
+  }
+
+  DeviceCommFeatures required_features = requirements.required_features;
+  DeviceCommFeatures preferred_features =
+      requirements.preferred_features & GpuDeviceCommunicator::kKnownFeatures &
+      ~required_features;
+  if (requirements.notification_slot_count != 0 ||
+      requirements.completion_slot_count != 0) {
+    required_features |= GpuDeviceCommunicator::kNetworkDeviceOperations;
+    preferred_features &= ~GpuDeviceCommunicator::kNetworkDeviceOperations;
+  }
+
+  bool needs_lsa_topology =
+      requirements.peer_access != DeviceCommPeerAccess::kLocalDomain ||
+      requirements.team_barrier_count != 0 ||
+      (required_features & GpuDeviceCommunicator::kNetworkDeviceOperations) !=
+          0;
+  if (needs_lsa_topology && capabilities.lsa_team_count <= 0) {
+    return Unimplemented(
+        "NCCL communicator does not report its LSA topology; semantic device "
+        "communication requires NCCL >= 2.29.7");
+  }
+  if (capabilities.team_size > 0 && capabilities.lsa_team_count > 0 &&
+      capabilities.lsa_team_count > capabilities.team_size) {
+    return FailedPrecondition(
+        "NCCL reported %d LSA domains for a team of %d ranks",
+        capabilities.lsa_team_count, capabilities.team_size);
+  }
+
+  ASSIGN_OR_RETURN(int lsa_barrier_count,
+                   CheckedAdd("team_barrier_count + local_barrier_count",
+                              requirements.team_barrier_count,
+                              requirements.local_barrier_count));
+
+  // ncclLsaBarrierCreateRequirement evaluates
+  // (3 * barriers + barriers * lsa_size) in signed int arithmetic. Team size is
+  // a conservative upper bound for lsa_size.
+  if (lsa_barrier_count != 0 && capabilities.team_size > 0) {
+    if (capabilities.team_size > std::numeric_limits<int>::max() - 3 ||
+        lsa_barrier_count >
+            std::numeric_limits<int>::max() / (capabilities.team_size + 3)) {
+      return InvalidArgument(
+          "LSA barrier storage arithmetic overflows NCCL's signed count type");
+    }
+  }
+
+  const bool multiple_lsa_domains = capabilities.lsa_team_count > 1;
+  int rail_barrier_signal_count = 0;
+  if (multiple_lsa_domains) {
+    ASSIGN_OR_RETURN(rail_barrier_signal_count,
+                     CheckedMultiply("team_barrier_count * lsa_domain_count",
+                                     requirements.team_barrier_count,
+                                     capabilities.lsa_team_count));
+  }
+  ASSIGN_OR_RETURN(int total_gin_signal_count,
+                   CheckedAdd("notification slots + team barrier signals",
+                              requirements.notification_slot_count,
+                              rail_barrier_signal_count));
+  if (total_gin_signal_count > kMaxGinSignalCount) {
+    return InvalidArgument(
+        "GIN signal requirement %d exceeds NCCL's representable maximum %d",
+        total_gin_signal_count, kMaxGinSignalCount);
+  }
+  if (requirements.completion_slot_count > kMaxGinCounterCount) {
+    return InvalidArgument(
+        "GIN counter requirement %d exceeds NCCL's representable maximum %d",
+        requirements.completion_slot_count, kMaxGinCounterCount);
+  }
+
+  NcclDeviceCommPlan plan;
 
 #if NCCL_VERSION_CODE >= 22900
-  ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+  plan.requirements = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
 #else
-  ncclDevCommRequirements reqs{};
+  plan.requirements = ncclDevCommRequirements{};
 #endif
-  reqs.lsaBarrierCount = requirements.lsa_barrier_count;
+  ncclDevCommRequirements& reqs = plan.requirements;
+  reqs.lsaBarrierCount = lsa_barrier_count;
 
-  if (requirements.global_barrier_count == 0) return reqs;
+  bool request_multimem = ((required_features | preferred_features) &
+                           GpuDeviceCommunicator::kLocalMulticast) != 0;
+  bool require_multimem =
+      (required_features & GpuDeviceCommunicator::kLocalMulticast) != 0;
+  if (require_multimem && !capabilities.supports_multimem) {
+    return Unimplemented(
+        "Device communication requires local multicast, but NCCL reports no "
+        "Multimem support");
+  }
+#if NCCL_VERSION_CODE >= 22900
+  reqs.lsaMultimem = request_multimem && capabilities.supports_multimem;
+  if (reqs.lsaMultimem) {
+    plan.enabled_features |= GpuDeviceCommunicator::kLocalMulticast;
+  }
+#else
+  if (require_multimem) {
+    return Unimplemented(
+        "Local multicast requires NCCL >= 2.29.0 (current: %d)",
+        NCCL_VERSION_CODE);
+  }
+#endif
+
+  GinRequirement required_gin = GinRequirement::kNone;
+  bool peer_access_uses_gin = false;
+  switch (requirements.peer_access) {
+    case DeviceCommPeerAccess::kLocalDomain:
+      break;
+    case DeviceCommPeerAccess::kHierarchical:
+      if (multiple_lsa_domains) {
+        required_gin = GinRequirement::kRail;
+        peer_access_uses_gin = true;
+      }
+      break;
+    case DeviceCommPeerAccess::kDirectAnyPeer:
+      if (multiple_lsa_domains) {
+        required_gin = GinRequirement::kFull;
+        peer_access_uses_gin = true;
+      }
+      break;
+  }
+
+  // A multi-domain team barrier uses GIN internally, but does not expose that
+  // path as handler-visible data-plane connectivity.
+  if (multiple_lsa_domains && requirements.team_barrier_count != 0) {
+    required_gin = StrongerGinRequirement(required_gin, GinRequirement::kRail);
+  }
+
+  auto network_feature_gin_requirement = [&] {
+    // A hierarchical multi-domain algorithm can address its rail peers. Local
+    // domain access and a one-domain hierarchical request need FULL GIN because
+    // a rail has no other peer in the requested scope.
+    return requirements.peer_access == DeviceCommPeerAccess::kHierarchical &&
+                   multiple_lsa_domains
+               ? GinRequirement::kRail
+               : GinRequirement::kFull;
+  };
+
+  bool network_feature_enabled = false;
+  if ((required_features & GpuDeviceCommunicator::kNetworkDeviceOperations) !=
+      0) {
+    required_gin =
+        StrongerGinRequirement(required_gin, network_feature_gin_requirement());
+    network_feature_enabled = true;
+  }
+
+  if (!CanSatisfyGinRequirement(required_gin, capabilities)) {
+    return Unimplemented(
+        "NCCL cannot satisfy device communication requirements %v: "
+        "full_gin=%d, rail_gin=%d, lsa_domains=%d",
+        requirements, capabilities.supports_full_gin,
+        capabilities.supports_rail_gin, capabilities.lsa_team_count);
+  }
+
+  GinRequirement gin = required_gin;
+  if ((preferred_features & GpuDeviceCommunicator::kNetworkDeviceOperations) !=
+      0) {
+    GinRequirement preferred_gin = network_feature_gin_requirement();
+    if (CanSatisfyGinRequirement(preferred_gin, capabilities)) {
+      gin = StrongerGinRequirement(gin, preferred_gin);
+      network_feature_enabled = true;
+    }
+  }
 
 #if NCCL_VERSION_CODE >= 22907
-  if (capabilities.lsa_team_count <= 0) {
-    return Unimplemented(
-        "NCCL communicator does not report its LSA topology; full-team device "
-        "barriers require NCCL >= 2.29.7");
-  }
+  reqs.barrierCount =
+      multiple_lsa_domains ? requirements.team_barrier_count : 0;
+  reqs.railGinBarrierCount = 0;
+  reqs.ginSignalCount = requirements.notification_slot_count;
+  reqs.ginCounterCount = requirements.completion_slot_count;
 
-  // A full-team barrier needs only the LSA barrier when every rank belongs to
-  // one load/store accessibility domain.
-  if (capabilities.lsa_team_count == 1) {
-    reqs.lsaBarrierCount =
-        std::max(reqs.lsaBarrierCount, requirements.global_barrier_count);
-    return reqs;
-  }
-
-  // Across multiple LSA domains NCCL implements a full-team barrier as an LSA
-  // inner barrier plus a GIN rail barrier. NCCL allocates the barrier's private
-  // signals and counters from barrierCount; callers do not need public leases.
-  reqs.barrierCount = requirements.global_barrier_count;
-  switch (capabilities.gin_connection_type) {
-    case NcclCapabilities::GinConnectionType::kFull:
-      reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
-      break;
-    case NcclCapabilities::GinConnectionType::kRail:
-      reqs.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
-      break;
-    case NcclCapabilities::GinConnectionType::kNone:
-      return Unimplemented(
-          "Full-team device barrier spans %d LSA domains, but NCCL reports no "
-          "GIN connectivity",
-          capabilities.lsa_team_count);
+  if (gin != GinRequirement::kNone) {
+    // FULL-first is required because NCCL freezes the shared ginState on first
+    // activation. FULL is a semantic superset of RAIL; the reverse is false.
+    reqs.ginConnectionType = capabilities.supports_full_gin
+                                 ? NCCL_GIN_CONNECTION_FULL
+                                 : NCCL_GIN_CONNECTION_RAIL;
   }
 #else
-  return Unimplemented(
-      "Full-team device barriers require NCCL >= 2.29.7 (current: %d)",
-      NCCL_VERSION_CODE);
+  if (gin != GinRequirement::kNone) {
+    return Unimplemented(
+        "GIN device communication requires NCCL >= 2.29.7 (current: %d)",
+        NCCL_VERSION_CODE);
+  }
 #endif
 
-  return reqs;
+  if (network_feature_enabled) {
+    plan.enabled_features |= GpuDeviceCommunicator::kNetworkDeviceOperations;
+  }
+
+  bool handler_visible_gin = peer_access_uses_gin || network_feature_enabled;
+  if (handler_visible_gin) {
+#if NCCL_VERSION_CODE >= 22907
+    plan.topology = reqs.ginConnectionType == NCCL_GIN_CONNECTION_FULL
+                        ? DeviceCommTopology::kAllPeers
+                        : DeviceCommTopology::kHierarchical;
+#else
+    return Unimplemented(
+        "Handler-visible GIN requires NCCL >= 2.29.7 (current: %d)",
+        NCCL_VERSION_CODE);
+#endif
+  }
+
+  return plan;
+}
+
+absl::StatusOr<GpuDeviceCommunicator::Info> BuildNcclDeviceCommInfo(
+    const GpuDeviceCommunicator::Requirements& requirements,
+    const NcclDeviceCommPlan& plan, const NcclCapabilities& capabilities,
+    const ncclDevComm& dev_comm) {
+  if (dev_comm.nRanks <= 0 || dev_comm.rank < 0 ||
+      dev_comm.rank >= dev_comm.nRanks) {
+    return FailedPrecondition(
+        "NCCL returned invalid device communicator rank %d of %d",
+        dev_comm.rank, dev_comm.nRanks);
+  }
+  if (dev_comm.lsaSize <= 0 || dev_comm.lsaRank < 0 ||
+      dev_comm.lsaRank >= dev_comm.lsaSize ||
+      dev_comm.nRanks % dev_comm.lsaSize != 0) {
+    return FailedPrecondition(
+        "NCCL returned invalid LSA topology: rank=%d, size=%d, team=%d",
+        dev_comm.lsaRank, dev_comm.lsaSize, dev_comm.nRanks);
+  }
+
+  int local_domain_count = dev_comm.nRanks / dev_comm.lsaSize;
+  if (capabilities.rank >= 0 && capabilities.team_size > 0 &&
+      (dev_comm.rank != capabilities.rank ||
+       dev_comm.nRanks != capabilities.team_size)) {
+    return FailedPrecondition(
+        "NCCL device communicator identity changed after capability query: "
+        "rank %d/%d became %d/%d",
+        capabilities.rank, capabilities.team_size, dev_comm.rank,
+        dev_comm.nRanks);
+  }
+  if (capabilities.lsa_team_count > 0 &&
+      local_domain_count != capabilities.lsa_team_count) {
+    return FailedPrecondition(
+        "NCCL device communicator LSA topology changed after capability query: "
+        "expected %d domains, got %d",
+        capabilities.lsa_team_count, local_domain_count);
+  }
+  if (dev_comm.lsaBarrier.nBarriers < plan.requirements.lsaBarrierCount) {
+    return FailedPrecondition(
+        "NCCL device communicator provides %d LSA barriers, but %d are "
+        "required",
+        dev_comm.lsaBarrier.nBarriers, plan.requirements.lsaBarrierCount);
+  }
+#if NCCL_VERSION_CODE >= 22900
+  if ((plan.enabled_features & GpuDeviceCommunicator::kLocalMulticast) != 0 &&
+      dev_comm.lsaMultimem.mcBasePtr == nullptr) {
+    return FailedPrecondition(
+        "NCCL did not realize the requested LSA Multimem handle");
+  }
+#else
+  if ((plan.enabled_features & GpuDeviceCommunicator::kLocalMulticast) != 0) {
+    return FailedPrecondition(
+        "NCCL cannot realize local multicast with this compile-time version");
+  }
+#endif
+
+#if NCCL_VERSION_CODE >= 22907
+  if (plan.requirements.ginConnectionType != NCCL_GIN_CONNECTION_NONE) {
+    bool expect_railed =
+        plan.requirements.ginConnectionType == NCCL_GIN_CONNECTION_RAIL;
+    if (dev_comm.ginIsRailed != expect_railed) {
+      return FailedPrecondition(
+          "NCCL returned a %s GIN device communicator after XLA requested %s; "
+          "the shared GIN bootstrap state is incompatible",
+          dev_comm.ginIsRailed ? "RAIL" : "FULL",
+          expect_railed ? "RAIL" : "FULL");
+    }
+    if (dev_comm.ginConnectionCount <= 0 || dev_comm.ginContextCount <= 0) {
+      return FailedPrecondition(
+          "NCCL returned a GIN device communicator without usable connections "
+          "or contexts");
+    }
+
+    ASSIGN_OR_RETURN(
+        int barrier_signals,
+        CheckedMultiply("team barriers * realized LSA domain count",
+                        plan.requirements.barrierCount, local_domain_count));
+    ASSIGN_OR_RETURN(
+        int expected_signals,
+        CheckedAdd("user and barrier signal counts",
+                   plan.requirements.ginSignalCount, barrier_signals));
+    if (dev_comm.ginSignalCount < expected_signals ||
+        dev_comm.ginCounterCount < plan.requirements.ginCounterCount) {
+      return FailedPrecondition(
+          "NCCL returned insufficient GIN resources: signals %d/%d, counters "
+          "%d/%d",
+          dev_comm.ginSignalCount, expected_signals, dev_comm.ginCounterCount,
+          plan.requirements.ginCounterCount);
+    }
+  }
+#endif
+
+  GpuDeviceCommunicator::Info info;
+  info.rank = dev_comm.rank;
+  info.team_size = dev_comm.nRanks;
+  info.local_rank = dev_comm.lsaRank;
+  info.local_domain_size = dev_comm.lsaSize;
+  info.local_domain_count = local_domain_count;
+  info.topology = plan.topology;
+  info.enabled_features = plan.enabled_features;
+  info.team_barrier_count = requirements.team_barrier_count;
+  info.local_barrier_count = requirements.local_barrier_count;
+  info.notification_slot_count = requirements.notification_slot_count;
+  info.completion_slot_count = requirements.completion_slot_count;
+  return info;
 }
 
 absl::Status ValidateNcclDeviceAbi(uint64_t compile_time_version,
@@ -1083,13 +1432,14 @@ NcclDeviceCommunicator::NcclDeviceCommunicator(
     std::shared_ptr<NcclCommState> parent_comm,
     se::StreamExecutor* stream_executor,
     std::shared_ptr<tsl::Executor> executor,
-    uint64_t validated_device_abi_version, ncclDevComm dev_comm)
+    uint64_t validated_device_abi_version, ncclDevComm dev_comm, Info info)
     : GpuDeviceCommunicator(kNcclDeviceCommAbiSchema,
                             validated_device_abi_version),
       parent_comm_(parent_comm),
       stream_executor_(stream_executor),
       executor_(std::move(executor)),
-      dev_comm_(dev_comm) {}
+      dev_comm_(dev_comm),
+      info_(std::move(info)) {}
 
 NcclDeviceCommunicator::~NcclDeviceCommunicator() {
   VLOG(3) << absl::StreamFormat("Destroy NCCL device comm %v", *this);
@@ -1123,9 +1473,8 @@ NcclDeviceCommunicator::CreateFrom(const NcclCommunicator& comm,
   DCHECK(comm.stream_executor()) << "StreamExecutor is unavailable";
   auto activation = comm.stream_executor()->Activate();
 
-  ASSIGN_OR_RETURN(
-      ncclDevCommRequirements reqs,
-      BuildNcclDeviceCommRequirements(requirements, comm.capabilities_));
+  ASSIGN_OR_RETURN(NcclDeviceCommPlan plan,
+                   BuildNcclDeviceCommPlan(requirements, comm.capabilities_));
 
   int runtime_version = 0;
   RETURN_IF_ERROR(XLA_NCCL_STATUS(ncclGetVersion(&runtime_version)));
@@ -1135,13 +1484,26 @@ NcclDeviceCommunicator::CreateFrom(const NcclCommunicator& comm,
   ncclDevComm dev_comm{};
   {
     absl::MutexLock lock(comm_state->mutex);
-    RETURN_IF_ERROR(
-        XLA_NCCL_STATUS(ncclDevCommCreate(comm_state->comm, &reqs, &dev_comm)));
+    RETURN_IF_ERROR(XLA_NCCL_STATUS(
+        ncclDevCommCreate(comm_state->comm, &plan.requirements, &dev_comm)));
   }
 
-  return absl::WrapUnique(
-      new NcclDeviceCommunicator(comm_state, comm.stream_executor(),
-                                 comm.executor(), runtime_version, dev_comm));
+  absl::StatusOr<Info> info =
+      BuildNcclDeviceCommInfo(requirements, plan, comm.capabilities_, dev_comm);
+  if (!info.ok()) {
+    absl::MutexLock lock(comm_state->mutex);
+    if (absl::Status cleanup =
+            XLA_NCCL_STATUS(ncclDevCommDestroy(comm_state->comm, &dev_comm));
+        !cleanup.ok()) {
+      LOG(ERROR) << "Failed to destroy invalid NCCL device communicator: "
+                 << cleanup;
+    }
+    return info.status();
+  }
+
+  return absl::WrapUnique(new NcclDeviceCommunicator(
+      comm_state, comm.stream_executor(), comm.executor(), runtime_version,
+      dev_comm, std::move(*info)));
 }
 
 PlatformCommunicatorHandle NcclDeviceCommunicator::platform_comm() const {

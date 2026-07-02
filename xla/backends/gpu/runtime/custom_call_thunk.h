@@ -19,6 +19,7 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -91,10 +92,14 @@ class CustomCallThunk : public TracedCommand {
                         absl::string_view target_name,
                         absl::string_view profile_annotation, ThunkId thunk_id,
                         absl::Span<const NullableShapedSlice> operands,
-                        absl::Span<const NullableShapedSlice> results)
+                        absl::Span<const NullableShapedSlice> results,
+                        bool uses_device_communication,
+                        std::shared_ptr<FfiDeviceCommunicationProfile>
+                            device_communication_profile)
         : owner(owner),
           collective_resources(target_name, profile_annotation, thunk_id,
-                               operands, results) {}
+                               operands, results, uses_device_communication,
+                               std::move(device_communication_profile)) {}
 
     const CustomCallThunk* owner;
     ffi::ExecutionState prepare;
@@ -276,6 +281,10 @@ class CustomCallThunk : public TracedCommand {
   // Device-communication handlers declaratively ask XLA to acquire a default
   // communication team and register all collective-memory operands/results.
   bool uses_device_communication_ = false;
+
+  // Shared by all execution-scoped resource adapters for this callsite. It
+  // freezes the normalized Prepare request across concurrent invocations.
+  std::shared_ptr<FfiDeviceCommunicationProfile> device_communication_profile_;
 
   // TODO(ezhulenev): Currently we assume that HloModule that owns this
   // computation is owned by a GpuExecutable and stays alive for as long as

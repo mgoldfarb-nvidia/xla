@@ -73,6 +73,7 @@ cc_library(
 cc_library(
     name = "c_api_gpu_collectives_nccl",
     hdrs = ["c_api_gpu_collectives_nccl.h"],
+    deps = [":c_api_gpu_collectives"],
 )
 
 cc_library(

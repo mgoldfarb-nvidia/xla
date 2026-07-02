@@ -33,11 +33,15 @@ limitations under the License.
 namespace {
 
 using xla::ffi::AnyBuffer;
+using xla::ffi::CommunicationTopology;
+using xla::ffi::DeviceCommunicationInfo;
+using xla::ffi::DeviceCommunicationRequirements;
 using xla::ffi::Error;
 using xla::ffi::ErrorCode;
 using xla::ffi::ErrorOr;
 using xla::ffi::Ffi;
 using xla::ffi::GpuCollectives;
+using xla::ffi::GpuDeviceCommunication;
 using xla::ffi::Initialized;
 using xla::ffi::PlatformStream;
 using xla::ffi::Result;
@@ -174,8 +178,37 @@ Error ValidateExactAlias(AnyBuffer operand, Result<AnyBuffer> result) {
   return Error::Success();
 }
 
+Error Prepare(GpuDeviceCommunication communication) {
+  DeviceCommunicationRequirements requirements;
+  requirements.team_barriers = 1;
+  return communication.Request(requirements);
+}
+
+Error ValidateCommunicationInfo(const GpuDeviceCommunication& communication) {
+  DeviceCommunicationInfo info;
+  Error error = communication.GetInfo(&info);
+  if (error.failure()) return error;
+
+  if (info.rank < 0 || info.rank >= info.team_size || info.local_rank < 0 ||
+      info.local_rank >= info.local_domain_size || info.team_size <= 0 ||
+      info.local_domain_size <= 0 || info.local_domain_count <= 0) {
+    return FailedPrecondition(
+        "device communication returned invalid resolved topology");
+  }
+  if (info.topology != CommunicationTopology::kLocalDomain ||
+      !info.enabled_features.empty() || info.team_barrier_count < 1 ||
+      info.local_barrier_count != 0 || info.notification_slot_count != 0 ||
+      info.completion_slot_count != 0) {
+    return FailedPrecondition(
+        "device communication did not realize the requested default profile");
+  }
+  return Error::Success();
+}
+
 ErrorOr<std::unique_ptr<CollectiveState>> Initialize(
     AnyBuffer operand, Result<AnyBuffer>, GpuCollectives collectives) {
+  Error error = ValidateCommunicationInfo(collectives);
+  if (error.failure()) return Unexpected(std::move(error));
   return SnapshotCollectiveState(collectives, {operand});
 }
 
@@ -264,6 +297,9 @@ Error ExecuteTwoBuffers(AnyBuffer first_operand, AnyBuffer second_operand,
   return Error::Success();
 }
 
+XLA_FFI_DEFINE_HANDLER(kPrepare, Prepare,
+                       Ffi::BindPrepare().Ctx<GpuDeviceCommunication>());
+
 XLA_FFI_DEFINE_HANDLER(kInitialize, Initialize,
                        Ffi::BindInitialize()
                            .Arg<AnyBuffer>()
@@ -310,7 +346,7 @@ XlaGpuCollectivesFfiRegister(const XLA_FFI_Api* api) {
           api, "__xla_test_gpu_collectives_public_dso", "gpu",
           XLA_FFI_Handler_Bundle{
               /*instantiate=*/nullptr,
-              /*prepare=*/nullptr,
+              /*prepare=*/kPrepare,
               /*initialize=*/kInitialize,
               /*execute=*/kExecute,
           },

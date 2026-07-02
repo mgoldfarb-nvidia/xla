@@ -275,6 +275,8 @@ CustomCallThunk::CustomCallThunk(
       execution_state_(std::move(execution_state)),
       uses_device_communication_(
           traits & XLA_FFI_HANDLER_TRAITS_USES_DEVICE_COMMUNICATION),
+      device_communication_profile_(
+          std::make_shared<FfiDeviceCommunicationProfile>()),
       called_computation_(called_computation),
       cpu_target_machine_options_(std::move(cpu_target_machine_options)) {}
 
@@ -290,7 +292,8 @@ CustomCallThunk::GetOrCreatePrepareAndInitState(
       this->thunk_info().thunk_id, std::in_place_type<PrepareAndInitState>,
       this, target_name_, this->thunk_info().profile_annotation,
       this->thunk_info().thunk_id, absl::MakeConstSpan(operands_),
-      absl::MakeConstSpan(results_));
+      absl::MakeConstSpan(results_), uses_device_communication_,
+      device_communication_profile_);
   auto* state = tsl::any_cast<PrepareAndInitState>(&it->second);
   if (state == nullptr) {
     return absl::InternalError(
@@ -461,6 +464,7 @@ absl::Status CustomCallThunk::Prepare(const PrepareParams& params) {
   const RunId run_id =
       params.collective_params ? params.collective_params->run_id : RunId{-1};
 
+  FfiCollectiveResources* collective_resources = nullptr;
   if (uses_device_communication_) {
     ASSIGN_OR_RETURN(
         PrepareAndInitState * state,
@@ -471,12 +475,12 @@ absl::Status CustomCallThunk::Prepare(const PrepareParams& params) {
         params.collective_memory_requests,
         /*collective_cliques=*/nullptr,
         /*collective_memory=*/nullptr));
-    RETURN_IF_ERROR(state->collective_resources.PrepareDeviceCommunication());
+    collective_resources = &state->collective_resources;
   }
 
   if (const auto* c_bundle = std::get_if<XLA_FFI_Handler_Bundle>(&bundle_);
       c_bundle && c_bundle->prepare) {
-    return ExecuteFfiHandler(
+    RETURN_IF_ERROR(ExecuteFfiHandler(
         run_id, c_bundle->prepare, XLA_FFI_ExecutionStage_PREPARE,
         /*stream=*/nullptr,
         /*execution_scoped_state=*/params.execution_scoped_state,
@@ -487,11 +491,11 @@ absl::Status CustomCallThunk::Prepare(const PrepareParams& params) {
         /*collective_memory_requests=*/params.collective_memory_requests,
         /*collective_cliques=*/nullptr,
         /*collective_memory=*/nullptr,
-        /*computation_streams=*/{});
-  }
-  if (const auto* owned_bundle = std::get_if<OwnedHandlerBundle>(&bundle_);
-      owned_bundle && owned_bundle->prepare) {
-    return ExecuteFfiHandler(
+        /*computation_streams=*/{}));
+  } else if (const auto* owned_bundle =
+                 std::get_if<OwnedHandlerBundle>(&bundle_);
+             owned_bundle && owned_bundle->prepare) {
+    RETURN_IF_ERROR(ExecuteFfiHandler(
         run_id, *owned_bundle->prepare, xla::ffi::ExecutionStage::kPrepare,
         /*stream=*/nullptr,
         /*execution_scoped_state=*/params.execution_scoped_state,
@@ -502,10 +506,12 @@ absl::Status CustomCallThunk::Prepare(const PrepareParams& params) {
         /*collective_memory_requests=*/params.collective_memory_requests,
         /*collective_cliques=*/nullptr,
         /*collective_memory=*/nullptr,
-        /*computation_streams=*/{});
+        /*computation_streams=*/{}));
   }
 
-  return absl::OkStatus();
+  return collective_resources
+             ? collective_resources->FinalizeDeviceCommunication()
+             : absl::OkStatus();
 }
 
 absl::Status CustomCallThunk::Initialize(const InitializeParams& params) {

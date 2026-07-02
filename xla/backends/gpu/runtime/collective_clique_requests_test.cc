@@ -72,8 +72,10 @@ TEST(CollectiveCliqueRequestsTest, RequestDevComms) {
 
   std::vector<std::vector<GlobalDeviceId>> rg0 = {{d0, d1}};
 
-  GpuDeviceCommunicator::Requirements dev_comm0{8};
-  GpuDeviceCommunicator::Requirements dev_comm1{16};
+  GpuDeviceCommunicator::Requirements dev_comm0;
+  dev_comm0.local_barrier_count = 8;
+  GpuDeviceCommunicator::Requirements dev_comm1;
+  dev_comm1.local_barrier_count = 16;
 
   CollectiveCliqueRequests requests;
   TF_ASSERT_OK(requests.RequestClique(k0, rg0, {dev_comm0}));

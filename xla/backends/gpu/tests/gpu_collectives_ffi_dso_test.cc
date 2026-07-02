@@ -121,7 +121,7 @@ void VerifyTwoBufferResults(const std::vector<Literal>& results) {
                                            LiteralSlice(results[1], {1}));
 }
 
-void VerifyHandlerRegistration(const char* handler_name) {
+void VerifyHandlerRegistration(const char* handler_name, bool has_prepare) {
   ASSERT_OK_AND_ASSIGN(ffi::HandlerRegistration registration,
                        ffi::FindHandler(handler_name, "gpu"));
   EXPECT_EQ(registration.metadata.api_version.major_version, 0);
@@ -132,14 +132,18 @@ void VerifyHandlerRegistration(const char* handler_name) {
                                          ffi::Traits::kUsesDeviceCommunication),
       0);
   EXPECT_EQ(registration.bundle.instantiate, nullptr);
-  EXPECT_EQ(registration.bundle.prepare, nullptr);
+  if (has_prepare) {
+    EXPECT_NE(registration.bundle.prepare, nullptr);
+  } else {
+    EXPECT_EQ(registration.bundle.prepare, nullptr);
+  }
   EXPECT_NE(registration.bundle.initialize, nullptr);
   EXPECT_NE(registration.bundle.execute, nullptr);
 }
 
 TEST_F(GpuCollectivesFfiDsoTest,
        PublicApiPluginRunsTwoCallsitesAcrossRepeatedExecutions) {
-  VerifyHandlerRegistration(kHandlerName);
+  VerifyHandlerRegistration(kHandlerName, /*has_prepare=*/true);
 
   if (device_count() < kNumReplicas) {
     GTEST_SKIP() << "Test requires at least " << kNumReplicas << " devices ("
@@ -194,7 +198,7 @@ TEST_F(GpuCollectivesFfiDsoTest,
 
 TEST_F(GpuCollectivesFfiDsoTest,
        PublicApiPluginAccessesTwoTaggedBuffersInOneCall) {
-  VerifyHandlerRegistration(kTwoBufferHandlerName);
+  VerifyHandlerRegistration(kTwoBufferHandlerName, /*has_prepare=*/false);
 
   if (device_count() < kNumReplicas) {
     GTEST_SKIP() << "Test requires at least " << kNumReplicas << " devices ("

@@ -29,6 +29,10 @@ class GpuCollectivesApi {
  public:
   virtual ~GpuCollectivesApi() = default;
 
+  virtual absl::Status RequestDeviceCommunication(
+      XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args* args) = 0;
+  virtual absl::Status GetDeviceCommunicationInfo(
+      XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args* args) = 0;
   virtual absl::Status GetDeviceComm(
       XLA_FFI_GpuCollectives_GetDeviceComm_Args* args) = 0;
   virtual absl::Status GetDeviceMemory(

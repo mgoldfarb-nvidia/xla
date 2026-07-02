@@ -18,12 +18,14 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
 #include "xla/backends/gpu/collectives/gpu_communicator.h"
@@ -42,21 +44,42 @@ limitations under the License.
 
 namespace xla::gpu {
 
+// A normalized device-communication profile frozen for one FFI callsite.
+// CustomCallThunk owns one instance and shares it with every execution-scoped
+// FfiCollectiveResources object created for that thunk. This makes a dynamic
+// Prepare request stable across invocations while allowing concurrent prepares.
+class FfiDeviceCommunicationProfile {
+ public:
+  FfiDeviceCommunicationProfile() = default;
+  FfiDeviceCommunicationProfile(const FfiDeviceCommunicationProfile&) = delete;
+  FfiDeviceCommunicationProfile& operator=(
+      const FfiDeviceCommunicationProfile&) = delete;
+
+  absl::Status Freeze(const GpuDeviceCommunicator::Requirements& requirements);
+
+ private:
+  absl::Mutex mutex_;
+  std::optional<GpuDeviceCommunicator::Requirements> requirements_
+      ABSL_GUARDED_BY(mutex_);
+};
+
 // Execution-scoped implementation of the public GPU device-communication API.
 //
 // A handler declares device communication once with an FFI trait. XLA then
 // acquires a default full-execution communication team and registers every FFI
-// operand/result assigned to collective memory. The public API is deliberately
-// read-only: handlers can retrieve opaque kernel arguments, but cannot select
-// providers or configure backend resources. Device work must collectively
-// quiesce remote accesses before returning so XLA can safely release resources
-// after local stream completion.
+// operand/result assigned to collective memory. During Prepare, handlers may
+// request a provider-neutral resource profile. XLA freezes the normalized
+// profile per callsite and realizes it before Initialize. Device work must
+// collectively quiesce remote accesses before returning so XLA can safely
+// release resources after local stream completion.
 class FfiCollectiveResources final : public ffi::GpuCollectivesApi {
  public:
-  FfiCollectiveResources(absl::string_view target_name,
-                         absl::string_view profile_annotation, ThunkId thunk_id,
-                         absl::Span<const NullableShapedSlice> operands,
-                         absl::Span<const NullableShapedSlice> results);
+  FfiCollectiveResources(
+      absl::string_view target_name, absl::string_view profile_annotation,
+      ThunkId thunk_id, absl::Span<const NullableShapedSlice> operands,
+      absl::Span<const NullableShapedSlice> results,
+      bool uses_device_communication,
+      std::shared_ptr<FfiDeviceCommunicationProfile> profile = nullptr);
 
   FfiCollectiveResources(const FfiCollectiveResources&) = delete;
   FfiCollectiveResources& operator=(const FfiCollectiveResources&) = delete;
@@ -73,12 +96,15 @@ class FfiCollectiveResources final : public ffi::GpuCollectivesApi {
       const CollectiveCliques* collective_cliques,
       const CollectiveMemory* collective_memory);
 
-  // Declares all resources for the minimal initial contract. This is invoked
-  // by the thunk based on handler metadata, before the handler's optional
-  // Prepare callback. It provisions one full-team synchronization slot per
-  // callsite. Backends can implement the slot hierarchically across local
-  // accessibility and device-network domains.
-  absl::Status PrepareDeviceCommunication();
+  // Finalizes the explicit request made by the handler during Prepare, or the
+  // legacy default when no explicit request was made, then declares all
+  // resources. This must run after the handler's optional Prepare callback.
+  absl::Status FinalizeDeviceCommunication();
+
+  absl::Status RequestDeviceCommunication(
+      XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args* args) override;
+  absl::Status GetDeviceCommunicationInfo(
+      XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args* args) override;
 
   absl::Status GetDeviceComm(
       XLA_FFI_GpuCollectives_GetDeviceComm_Args* args) override;
@@ -110,16 +136,30 @@ class FfiCollectiveResources final : public ffi::GpuCollectivesApi {
     GpuDeviceCommunicator::Requirements requirements;
   };
 
+  static GpuDeviceCommunicator::Requirements DefaultRequirements();
+  static absl::StatusOr<GpuDeviceCommunicator::Requirements>
+  NormalizeRequirements(
+      const XLA_FFI_GpuDeviceCommunication_Requirements& requirements);
+  static absl::Status ValidateResolvedInfo(
+      const GpuDeviceCommunicator::Requirements& requirements,
+      const GpuDeviceCommunicator::Info& info);
+
   absl::Status CheckStageForGet(absl::string_view operation) const;
+  absl::StatusOr<GpuDeviceCommunicator*> GetCommunicator(
+      absl::string_view operation) const;
 
   absl::StatusOr<BufferView> FindBufferView(const XLA_FFI_Buffer& buffer) const;
-  static absl::Status ValidateKernelArgDestination(
-      void* destination, size_t destination_size, size_t packed_size);
+  static absl::Status ValidateKernelArgDestination(void* destination,
+                                                   size_t destination_size,
+                                                   size_t packed_size);
 
   uint64_t resource_domain_;
   bool has_valid_resource_domain_;
+  bool uses_device_communication_;
+  std::shared_ptr<FfiDeviceCommunicationProfile> profile_;
 
   std::vector<StaticBuffer> static_buffers_;
+  std::optional<GpuDeviceCommunicator::Requirements> requested_requirements_;
   std::optional<CollectiveRecord> collective_;
   std::vector<BufferAllocation::Index> registered_allocations_;
   bool prepared_ = false;

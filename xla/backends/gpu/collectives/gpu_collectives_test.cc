@@ -334,7 +334,7 @@ TEST(GpuCollectivesTest, CreateDeviceComm) {
   }
 
   GpuDeviceCommunicator::Requirements reqs;
-  reqs.lsa_barrier_count = 8;
+  reqs.local_barrier_count = 8;
 
   // Because creating device comms is a collective operation, we must call
   // it from a thead pool to avoid deadlocks.

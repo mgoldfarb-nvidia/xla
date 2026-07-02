@@ -28,6 +28,96 @@ limitations under the License.
 
 namespace xla::ffi {
 
+enum class PeerAccess : uint8_t {
+  kLocalDomain = XLA_FFI_GPU_PEER_ACCESS_LOCAL_DOMAIN,
+  kHierarchical = XLA_FFI_GPU_PEER_ACCESS_HIERARCHICAL,
+  kDirectAnyPeer = XLA_FFI_GPU_PEER_ACCESS_DIRECT_ANY_PEER,
+};
+
+enum class DeviceCommunicationFeature : uint64_t {
+  kLocalMulticast = XLA_FFI_GPU_DEVICE_COMM_FEATURE_LOCAL_MULTICAST,
+  kNetworkDeviceOperations =
+      XLA_FFI_GPU_DEVICE_COMM_FEATURE_NETWORK_DEVICE_OPERATIONS,
+};
+
+// Type-safe set of optional device-communication features.
+class DeviceCommunicationFeatures {
+ public:
+  constexpr DeviceCommunicationFeatures() = default;
+  constexpr DeviceCommunicationFeatures(  // NOLINT
+      DeviceCommunicationFeature feature)
+      : bits_(static_cast<uint64_t>(feature)) {}
+  explicit constexpr DeviceCommunicationFeatures(uint64_t bits) : bits_(bits) {}
+
+  constexpr uint64_t bits() const { return bits_; }
+  constexpr bool empty() const { return bits_ == 0; }
+  constexpr bool contains(DeviceCommunicationFeature feature) const {
+    return (bits_ & static_cast<uint64_t>(feature)) != 0;
+  }
+
+  constexpr DeviceCommunicationFeatures& operator|=(
+      DeviceCommunicationFeatures other) {
+    bits_ |= other.bits_;
+    return *this;
+  }
+
+  friend constexpr DeviceCommunicationFeatures operator|(
+      DeviceCommunicationFeatures lhs, DeviceCommunicationFeatures rhs) {
+    return DeviceCommunicationFeatures(lhs.bits_ | rhs.bits_);
+  }
+
+  friend constexpr bool operator==(DeviceCommunicationFeatures lhs,
+                                   DeviceCommunicationFeatures rhs) {
+    return lhs.bits_ == rhs.bits_;
+  }
+
+  friend constexpr bool operator!=(DeviceCommunicationFeatures lhs,
+                                   DeviceCommunicationFeatures rhs) {
+    return !(lhs == rhs);
+  }
+
+ private:
+  uint64_t bits_ = 0;
+};
+
+constexpr DeviceCommunicationFeatures operator|(
+    DeviceCommunicationFeature lhs, DeviceCommunicationFeature rhs) {
+  return DeviceCommunicationFeatures(lhs) | DeviceCommunicationFeatures(rhs);
+}
+
+// An all-zero value requests local-domain access with no auxiliary resources.
+// It is distinct from the trait-only legacy default, which adds one team
+// barrier when the handler makes no explicit request.
+struct DeviceCommunicationRequirements {
+  PeerAccess peer_access = PeerAccess::kLocalDomain;
+  DeviceCommunicationFeatures required_features;
+  DeviceCommunicationFeatures preferred_features;
+  uint32_t local_barriers = 0;
+  uint32_t team_barriers = 0;
+  uint32_t notification_slots = 0;
+  uint32_t completion_slots = 0;
+};
+
+enum class CommunicationTopology : uint8_t {
+  kLocalDomain = XLA_FFI_GPU_TOPOLOGY_LOCAL_DOMAIN,
+  kHierarchical = XLA_FFI_GPU_TOPOLOGY_HIERARCHICAL,
+  kAllPeers = XLA_FFI_GPU_TOPOLOGY_ALL_PEERS,
+};
+
+struct DeviceCommunicationInfo {
+  int64_t rank = 0;
+  int64_t team_size = 0;
+  int64_t local_rank = 0;
+  int64_t local_domain_size = 0;
+  int64_t local_domain_count = 0;
+  CommunicationTopology topology = CommunicationTopology::kLocalDomain;
+  DeviceCommunicationFeatures enabled_features;
+  uint32_t team_barrier_count = 0;
+  uint32_t local_barrier_count = 0;
+  uint32_t notification_slot_count = 0;
+  uint32_t completion_slot_count = 0;
+};
+
 // Header-only wrapper for the GPU device-communication C extension. XLA owns
 // resource selection, registration, and lifetime; handlers can retrieve the
 // resulting device communicator and each of any number of tagged device-memory
@@ -38,13 +128,112 @@ class GpuCollectives {
   GpuCollectives(const XLA_FFI_Api* api, XLA_FFI_ExecutionContext* ctx)
       : api_(api), ctx_(ctx), extension_(FindExtension(api)) {}
 
-  bool available() const { return CheckExtension().has_value(); }
+  // Returns true when the complete version 1.0 operation prefix is available.
+  // Individual version 1.1 operations perform their own compatibility checks.
+  bool available() const {
+    return CheckExtension(XLA_FFI_STRUCT_SIZE(XLA_FFI_GpuCollectives_Extension,
+                                              get_device_memory),
+                          /*required_minor_version=*/0)
+        .has_value();
+  }
+
+  // Declares the communication semantics and logical resources required by the
+  // handler. This operation is valid only during Prepare.
+  Error Request(const DeviceCommunicationRequirements& requirements) const {
+    ErrorOr<const XLA_FFI_GpuCollectives_Extension*> extension =
+        CheckExtension(XLA_FFI_STRUCT_SIZE(XLA_FFI_GpuCollectives_Extension,
+                                           request_device_communication),
+                       /*required_minor_version=*/1);
+    if (!extension.has_value()) return extension.error();
+    if ((*extension)->request_device_communication == nullptr) {
+      return Unimplemented("RequestDeviceCommunication is unavailable");
+    }
+
+    XLA_FFI_GpuDeviceCommunication_Requirements c_requirements = {};
+    c_requirements.struct_size =
+        XLA_FFI_GpuDeviceCommunication_Requirements_STRUCT_SIZE;
+    c_requirements.peer_access =
+        static_cast<XLA_FFI_GpuPeerAccess>(requirements.peer_access);
+    c_requirements.required_features = requirements.required_features.bits();
+    c_requirements.preferred_features = requirements.preferred_features.bits();
+    c_requirements.local_barrier_count = requirements.local_barriers;
+    c_requirements.team_barrier_count = requirements.team_barriers;
+    c_requirements.notification_slot_count = requirements.notification_slots;
+    c_requirements.completion_slot_count = requirements.completion_slots;
+
+    XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args args = {};
+    args.struct_size =
+        XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args_STRUCT_SIZE;
+    args.ctx = ctx_;
+    args.requirements = &c_requirements;
+
+    XLA_FFI_Error* error = (*extension)->request_device_communication(&args);
+    return error ? TakeError(error) : Error::Success();
+  }
+
+  // Returns immutable information about resources acquired after Prepare. This
+  // operation is valid during Initialize and Execute.
+  Error GetInfo(DeviceCommunicationInfo* info) const {
+    ErrorOr<const XLA_FFI_GpuCollectives_Extension*> extension =
+        CheckExtension(XLA_FFI_STRUCT_SIZE(XLA_FFI_GpuCollectives_Extension,
+                                           get_device_communication_info),
+                       /*required_minor_version=*/1);
+    if (!extension.has_value()) return extension.error();
+    if ((*extension)->get_device_communication_info == nullptr) {
+      return Unimplemented("GetDeviceCommunicationInfo is unavailable");
+    }
+    if (info == nullptr) {
+      return Error::InvalidArgument("info must not be null");
+    }
+
+    XLA_FFI_GpuDeviceCommunication_Info c_info = {};
+    c_info.struct_size = XLA_FFI_GpuDeviceCommunication_Info_STRUCT_SIZE;
+
+    XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args args = {};
+    args.struct_size =
+        XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args_STRUCT_SIZE;
+    args.ctx = ctx_;
+    args.info = &c_info;
+
+    XLA_FFI_Error* error = (*extension)->get_device_communication_info(&args);
+    if (error != nullptr) return TakeError(error);
+
+    CommunicationTopology topology;
+    switch (c_info.topology) {
+      case XLA_FFI_GPU_TOPOLOGY_LOCAL_DOMAIN:
+        topology = CommunicationTopology::kLocalDomain;
+        break;
+      case XLA_FFI_GPU_TOPOLOGY_HIERARCHICAL:
+        topology = CommunicationTopology::kHierarchical;
+        break;
+      case XLA_FFI_GPU_TOPOLOGY_ALL_PEERS:
+        topology = CommunicationTopology::kAllPeers;
+        break;
+      default:
+        return Unimplemented("Unknown device-communication topology");
+    }
+
+    info->rank = c_info.rank;
+    info->team_size = c_info.team_size;
+    info->local_rank = c_info.local_rank;
+    info->local_domain_size = c_info.local_domain_size;
+    info->local_domain_count = c_info.local_domain_count;
+    info->topology = topology;
+    info->enabled_features =
+        DeviceCommunicationFeatures(c_info.enabled_features);
+    info->team_barrier_count = c_info.team_barrier_count;
+    info->local_barrier_count = c_info.local_barrier_count;
+    info->notification_slot_count = c_info.notification_slot_count;
+    info->completion_slot_count = c_info.completion_slot_count;
+    return Error::Success();
+  }
 
   Error GetDeviceComm(uint64_t expected_abi_schema,
                       uint64_t expected_abi_version, void* destination,
                       size_t destination_size) const {
-    ErrorOr<const XLA_FFI_GpuCollectives_Extension*> extension =
-        CheckExtension();
+    ErrorOr<const XLA_FFI_GpuCollectives_Extension*> extension = CheckExtension(
+        XLA_FFI_STRUCT_SIZE(XLA_FFI_GpuCollectives_Extension, get_device_comm),
+        /*required_minor_version=*/0);
     if (!extension.has_value()) return extension.error();
     if ((*extension)->get_device_comm == nullptr) {
       return Unimplemented("GetDeviceComm is unavailable");
@@ -80,9 +269,8 @@ class GpuCollectives {
         static_cast<int64_t>(dimensions.size()),
         const_cast<int64_t*>(dimensions.begin()),
     };
-    return GetDeviceMemory(&c_buffer, expected_abi_schema,
-                           expected_abi_version, destination, destination_size,
-                           offset);
+    return GetDeviceMemory(&c_buffer, expected_abi_schema, expected_abi_version,
+                           destination, destination_size, offset);
   }
 
   Error GetDeviceMemory(const XLA_FFI_Buffer* buffer,
@@ -90,7 +278,9 @@ class GpuCollectives {
                         uint64_t expected_abi_version, void* destination,
                         size_t destination_size, uint64_t* offset) const {
     ErrorOr<const XLA_FFI_GpuCollectives_Extension*> extension =
-        CheckExtension();
+        CheckExtension(XLA_FFI_STRUCT_SIZE(XLA_FFI_GpuCollectives_Extension,
+                                           get_device_memory),
+                       /*required_minor_version=*/0);
     if (!extension.has_value()) return extension.error();
     if ((*extension)->get_device_memory == nullptr) {
       return Unimplemented("GetDeviceMemory is unavailable");
@@ -141,23 +331,25 @@ class GpuCollectives {
     return nullptr;
   }
 
-  ErrorOr<const XLA_FFI_GpuCollectives_Extension*> CheckExtension() const {
+  ErrorOr<const XLA_FFI_GpuCollectives_Extension*> CheckExtension(
+      size_t required_struct_size, int32_t required_minor_version) const {
     if (extension_ == nullptr) {
       return Unexpected(
           Unimplemented("GPU device-communication extension not found"));
     }
-    if (extension_->extension_base.struct_size <
-        XLA_FFI_GpuCollectives_Extension_STRUCT_SIZE) {
+    if (extension_->extension_base.struct_size < required_struct_size) {
       return Unexpected(Unimplemented(
-          "GPU device-communication extension table is too small"));
+          "GPU device-communication operation is unavailable in this extension "
+          "table"));
     }
     if (extension_->api_major_version != XLA_FFI_GPU_COLLECTIVES_API_MAJOR) {
       return Unexpected(Unimplemented(
           "Incompatible GPU device-communication extension major version"));
     }
-    if (extension_->api_minor_version < XLA_FFI_GPU_COLLECTIVES_API_MINOR) {
+    if (extension_->api_minor_version < required_minor_version) {
       return Unexpected(Unimplemented(
-          "GPU device-communication extension minor version is too old"));
+          "GPU device-communication operation requires a newer extension minor "
+          "version"));
     }
     return extension_;
   }
@@ -188,6 +380,10 @@ class GpuCollectives {
   XLA_FFI_ExecutionContext* ctx_;
   const XLA_FFI_GpuCollectives_Extension* extension_;
 };
+
+// Preferred semantic name for new handlers. GpuCollectives remains the class
+// name to preserve source compatibility with version 1.0 clients.
+using GpuDeviceCommunication = GpuCollectives;
 
 template <>
 struct CtxDecoding<GpuCollectives> {

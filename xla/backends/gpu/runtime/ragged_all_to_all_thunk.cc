@@ -407,8 +407,9 @@ CollectiveCliqueRequests::CliqueRequirements
 RaggedAllToAllThunk::GetCliqueRequirements(const GpuCliqueKey& clique_key) {
   CollectiveCliqueRequests::CliqueRequirements clique_reqs;
   if (config_.use_multi_gpu_barrier_with_nccl_in_one_shot_kernel) {
-    clique_reqs.dev_comm =
-        GpuDeviceCommunicator::Requirements{/*lsa_barrier_count=*/1};
+    GpuDeviceCommunicator::Requirements requirements;
+    requirements.local_barrier_count = 1;
+    clique_reqs.dev_comm = requirements;
   }
   return clique_reqs;
 }
@@ -461,11 +462,11 @@ absl::StatusOr<RaggedAllToAllStreamState*> RaggedAllToAllThunk::InitializeOnce(
     if (config_.fast_interconnect_slice_size_override.has_value()) {
       state->lsa_size = config_.fast_interconnect_slice_size_override.value();
     } else {
-      ASSIGN_OR_RETURN(
-          auto* dev_comm,
-          params.collective_cliques->GetDeviceComm(
-              state->clique_key, state->rank,
-              GpuDeviceCommunicator::Requirements{/*lsa_barrier_count=*/1}));
+      GpuDeviceCommunicator::Requirements requirements;
+      requirements.local_barrier_count = 1;
+      ASSIGN_OR_RETURN(auto* dev_comm,
+                       params.collective_cliques->GetDeviceComm(
+                           state->clique_key, state->rank, requirements));
 
       state->lsa_size = dev_comm->lsa_size();
     }

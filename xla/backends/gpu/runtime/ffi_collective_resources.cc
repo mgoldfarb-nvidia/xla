@@ -20,6 +20,7 @@ limitations under the License.
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -56,8 +57,12 @@ namespace xla::gpu {
 namespace {
 
 constexpr int64_t kCollectiveMemorySpace = 1;
-constexpr int32_t kDeviceCommunicationGlobalBarrierSlots = 1;
 constexpr uint64_t kFfiResourceDomainNamespace = uint64_t{1} << 63;
+
+static_assert(GpuDeviceCommunicator::kLocalMulticast ==
+              XLA_FFI_GPU_DEVICE_COMM_FEATURE_LOCAL_MULTICAST);
+static_assert(GpuDeviceCommunicator::kNetworkDeviceOperations ==
+              XLA_FFI_GPU_DEVICE_COMM_FEATURE_NETWORK_DEVICE_OPERATIONS);
 
 uint64_t ResourceDomain(absl::string_view target_name,
                         absl::string_view profile_annotation,
@@ -82,13 +87,34 @@ absl::Status CheckStructSize(absl::string_view name, size_t expected,
 
 }  // namespace
 
+absl::Status FfiDeviceCommunicationProfile::Freeze(
+    const GpuDeviceCommunicator::Requirements& requirements) {
+  absl::MutexLock lock(mutex_);
+  if (!requirements_.has_value()) {
+    requirements_ = requirements;
+    return absl::OkStatus();
+  }
+  if (!(*requirements_ == requirements)) {
+    return FailedPrecondition(
+        "Device-communication requirements changed across invocations: "
+        "frozen=%v, requested=%v. Request a stable upper bound instead.",
+        *requirements_, requirements);
+  }
+  return absl::OkStatus();
+}
+
 FfiCollectiveResources::FfiCollectiveResources(
     absl::string_view target_name, absl::string_view profile_annotation,
     ThunkId thunk_id, absl::Span<const NullableShapedSlice> operands,
-    absl::Span<const NullableShapedSlice> results)
+    absl::Span<const NullableShapedSlice> results,
+    bool uses_device_communication,
+    std::shared_ptr<FfiDeviceCommunicationProfile> profile)
     : resource_domain_(
           ResourceDomain(target_name, profile_annotation, thunk_id)),
-      has_valid_resource_domain_(thunk_id.value() != 0) {
+      has_valid_resource_domain_(thunk_id.value() != 0),
+      uses_device_communication_(uses_device_communication),
+      profile_(profile ? std::move(profile)
+                       : std::make_shared<FfiDeviceCommunicationProfile>()) {
   static_buffers_.reserve(operands.size() + results.size());
   auto add_static_buffer = [&](const NullableShapedSlice& shaped_slice) {
     if (!shaped_slice.has_value() ||
@@ -124,12 +150,181 @@ absl::Status FfiCollectiveResources::BeginInvocation(
   return absl::OkStatus();
 }
 
-absl::Status FfiCollectiveResources::PrepareDeviceCommunication() {
+GpuDeviceCommunicator::Requirements
+FfiCollectiveResources::DefaultRequirements() {
+  GpuDeviceCommunicator::Requirements requirements;
+  requirements.team_barrier_count = 1;
+  return requirements;
+}
+
+absl::StatusOr<GpuDeviceCommunicator::Requirements>
+FfiCollectiveResources::NormalizeRequirements(
+    const XLA_FFI_GpuDeviceCommunication_Requirements& requirements) {
+  RETURN_IF_ERROR(CheckStructSize(
+      "XLA_FFI_GpuDeviceCommunication_Requirements",
+      XLA_FFI_GpuDeviceCommunication_Requirements_STRUCT_SIZE_V1_1,
+      requirements.struct_size));
+
+  GpuDeviceCommunicator::Requirements normalized;
+  switch (requirements.peer_access) {
+    case XLA_FFI_GPU_PEER_ACCESS_LOCAL_DOMAIN:
+      normalized.peer_access = GpuDeviceCommunicator::PeerAccess::kLocalDomain;
+      break;
+    case XLA_FFI_GPU_PEER_ACCESS_HIERARCHICAL:
+      normalized.peer_access = GpuDeviceCommunicator::PeerAccess::kHierarchical;
+      break;
+    case XLA_FFI_GPU_PEER_ACCESS_DIRECT_ANY_PEER:
+      normalized.peer_access =
+          GpuDeviceCommunicator::PeerAccess::kDirectAnyPeer;
+      break;
+    default:
+      return InvalidArgument("Unknown GPU peer access value: %d",
+                             static_cast<int>(requirements.peer_access));
+  }
+
+  GpuDeviceCommunicator::Features unknown_required =
+      requirements.required_features & ~GpuDeviceCommunicator::kKnownFeatures;
+  if (unknown_required != 0) {
+    return Unimplemented(
+        "Unknown required GPU device-communication feature bits: 0x%x",
+        unknown_required);
+  }
+  normalized.required_features = requirements.required_features;
+  normalized.preferred_features = (requirements.preferred_features &
+                                   GpuDeviceCommunicator::kKnownFeatures) &
+                                  ~normalized.required_features;
+
+  auto checked_count = [](absl::string_view name,
+                          uint32_t count) -> absl::StatusOr<int32_t> {
+    if (count > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+      return InvalidArgument("%s exceeds the supported maximum: %d", name,
+                             count);
+    }
+    return static_cast<int32_t>(count);
+  };
+  ASSIGN_OR_RETURN(
+      normalized.local_barrier_count,
+      checked_count("local_barrier_count", requirements.local_barrier_count));
+  ASSIGN_OR_RETURN(
+      normalized.team_barrier_count,
+      checked_count("team_barrier_count", requirements.team_barrier_count));
+  ASSIGN_OR_RETURN(normalized.notification_slot_count,
+                   checked_count("notification_slot_count",
+                                 requirements.notification_slot_count));
+  ASSIGN_OR_RETURN(normalized.completion_slot_count,
+                   checked_count("completion_slot_count",
+                                 requirements.completion_slot_count));
+  return normalized;
+}
+
+absl::Status FfiCollectiveResources::RequestDeviceCommunication(
+    XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args* args) {
+  if (args == nullptr) {
+    return InvalidArgument("RequestDeviceCommunication args must not be null");
+  }
+  RETURN_IF_ERROR(CheckStructSize(
+      "XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args",
+      XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args_STRUCT_SIZE_V1_1,
+      args->struct_size));
+  if (stage_ != XLA_FFI_ExecutionStage_PREPARE) {
+    return FailedPrecondition(
+        "RequestDeviceCommunication is only available during FFI Prepare");
+  }
+  if (!uses_device_communication_) {
+    return FailedPrecondition(
+        "RequestDeviceCommunication requires a handler declared with "
+        "USES_DEVICE_COMMUNICATION");
+  }
+  if (args->requirements == nullptr) {
+    return InvalidArgument(
+        "RequestDeviceCommunication requires non-null requirements");
+  }
+
+  ASSIGN_OR_RETURN(GpuDeviceCommunicator::Requirements normalized,
+                   NormalizeRequirements(*args->requirements));
+  if (requested_requirements_.has_value() &&
+      !(*requested_requirements_ == normalized)) {
+    return InvalidArgument(
+        "Conflicting device-communication requests in one FFI Prepare: "
+        "first=%v, requested=%v",
+        *requested_requirements_, normalized);
+  }
+  requested_requirements_ = normalized;
+  return absl::OkStatus();
+}
+
+absl::Status FfiCollectiveResources::ValidateResolvedInfo(
+    const GpuDeviceCommunicator::Requirements& requirements,
+    const GpuDeviceCommunicator::Info& info) {
+  GpuDeviceCommunicator::Features missing_required =
+      requirements.required_features & ~info.enabled_features;
+  if (missing_required != 0) {
+    return Internal(
+        "Device communicator omitted required feature bits from resolved "
+        "information: 0x%x",
+        missing_required);
+  }
+  if (info.team_barrier_count < 0 || info.local_barrier_count < 0 ||
+      info.notification_slot_count < 0 || info.completion_slot_count < 0) {
+    return Internal("Device communicator returned negative resource counts");
+  }
+  if (info.team_barrier_count < requirements.team_barrier_count ||
+      info.local_barrier_count < requirements.local_barrier_count ||
+      info.notification_slot_count < requirements.notification_slot_count ||
+      info.completion_slot_count < requirements.completion_slot_count) {
+    return Internal(
+        "Device communicator under-provisioned logical resources: "
+        "requested=%v, resolved={team_barriers: %d, local_barriers: %d, "
+        "notifications: %d, completions: %d}",
+        requirements, info.team_barrier_count, info.local_barrier_count,
+        info.notification_slot_count, info.completion_slot_count);
+  }
+  if (info.team_size <= 0 || info.rank < 0 || info.rank >= info.team_size ||
+      info.local_domain_size <= 0 || info.local_domain_size > info.team_size ||
+      info.local_domain_count <= 0 || info.local_rank < 0 ||
+      info.local_rank >= info.local_domain_size) {
+    return Internal("Device communicator returned invalid topology dimensions");
+  }
+
+  bool local_domain_covers_team =
+      info.local_domain_size == info.team_size && info.local_domain_count == 1;
+  if ((info.local_domain_size == info.team_size) !=
+      (info.local_domain_count == 1)) {
+    return Internal(
+        "Device communicator returned inconsistent local-domain topology");
+  }
+  switch (requirements.peer_access) {
+    case GpuDeviceCommunicator::PeerAccess::kLocalDomain:
+      break;
+    case GpuDeviceCommunicator::PeerAccess::kHierarchical:
+      if (!local_domain_covers_team &&
+          info.topology == GpuDeviceCommunicator::Topology::kLocalDomain) {
+        return Internal(
+            "Device communicator did not satisfy hierarchical peer access");
+      }
+      break;
+    case GpuDeviceCommunicator::PeerAccess::kDirectAnyPeer:
+      if (!local_domain_covers_team &&
+          info.topology != GpuDeviceCommunicator::Topology::kAllPeers) {
+        return Internal(
+            "Device communicator did not satisfy direct-any-peer access");
+      }
+      break;
+  }
+  return absl::OkStatus();
+}
+
+absl::Status FfiCollectiveResources::FinalizeDeviceCommunication() {
   if (stage_ != XLA_FFI_ExecutionStage_PREPARE) {
     return FailedPrecondition(
         "Device communication can only be prepared during FFI Prepare");
   }
   if (prepared_) return absl::OkStatus();
+  if (!uses_device_communication_) {
+    return FailedPrecondition(
+        "Device communication requires a handler declared with "
+        "USES_DEVICE_COMMUNICATION");
+  }
   if (!has_valid_resource_domain_) {
     return FailedPrecondition(
         "Device communication requires a non-zero thunk id for callsite "
@@ -137,8 +332,7 @@ absl::Status FfiCollectiveResources::PrepareDeviceCommunication() {
   }
   if (collective_params_ == nullptr ||
       collective_params_->device_assn == nullptr ||
-      collective_clique_requests_ == nullptr ||
-      collective_memory_requests_ == nullptr) {
+      collective_clique_requests_ == nullptr) {
     return FailedPrecondition(
         "Device communication requires GPU collective Prepare resources");
   }
@@ -158,13 +352,17 @@ absl::Status FfiCollectiveResources::PrepareDeviceCommunication() {
       allocations.push_back(buffer.allocation);
     }
   }
-  if (allocations.empty()) {
+  if (!allocations.empty() && collective_memory_requests_ == nullptr) {
     return FailedPrecondition(
-        "Device-communication handler has no collective-memory tagged "
-        "operands or results");
+        "Tagged device-communication buffers require collective-memory "
+        "Prepare resources");
   }
 
   const DeviceAssignment& device_assignment = *collective_params_->device_assn;
+  if (device_assignment.replica_count() <= 0 ||
+      device_assignment.computation_count() <= 0) {
+    return InvalidArgument("Device communication team must not be empty");
+  }
   if (device_assignment.replica_count() >
       std::numeric_limits<int64_t>::max() /
           device_assignment.computation_count()) {
@@ -192,9 +390,10 @@ absl::Status FfiCollectiveResources::PrepareDeviceCommunication() {
       GetGpuCliqueKey(*collective_params_, replica_groups, kGroupMode,
                       CommunicationId(resource_domain_)));
 
-  GpuDeviceCommunicator::Requirements requirements{
-      /*lsa_barrier_count=*/0,
-      /*global_barrier_count=*/kDeviceCommunicationGlobalBarrierSlots};
+  GpuDeviceCommunicator::Requirements requirements =
+      requested_requirements_.value_or(DefaultRequirements());
+  RETURN_IF_ERROR(profile_->Freeze(requirements));
+
   CollectiveCliqueRequests::CliqueRequirements clique_requirements;
   clique_requirements.barrier_reqs =
       CollectiveCliqueRequests::BarrierRequirements{
@@ -229,6 +428,72 @@ absl::Status FfiCollectiveResources::CheckStageForGet(
   return absl::OkStatus();
 }
 
+absl::StatusOr<GpuDeviceCommunicator*> FfiCollectiveResources::GetCommunicator(
+    absl::string_view operation) const {
+  RETURN_IF_ERROR(CheckStageForGet(operation));
+  if (collective_params_ == nullptr || collective_cliques_ == nullptr) {
+    return FailedPrecondition("%s requires acquired collective resources",
+                              operation);
+  }
+
+  const CollectiveRecord& record = *collective_;
+  return collective_cliques_->GetDeviceComm(
+      record.key, collective_params_->global_device_id, record.requirements);
+}
+
+absl::Status FfiCollectiveResources::GetDeviceCommunicationInfo(
+    XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args* args) {
+  if (args == nullptr) {
+    return InvalidArgument("GetDeviceCommunicationInfo args must not be null");
+  }
+  RETURN_IF_ERROR(CheckStructSize(
+      "XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args",
+      XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args_STRUCT_SIZE_V1_1,
+      args->struct_size));
+  if (args->info == nullptr) {
+    return InvalidArgument("GetDeviceCommunicationInfo info must not be null");
+  }
+  RETURN_IF_ERROR(
+      CheckStructSize("XLA_FFI_GpuDeviceCommunication_Info",
+                      XLA_FFI_GpuDeviceCommunication_Info_STRUCT_SIZE_V1_1,
+                      args->info->struct_size));
+
+  ASSIGN_OR_RETURN(GpuDeviceCommunicator * communicator,
+                   GetCommunicator("GetDeviceCommunicationInfo"));
+  const GpuDeviceCommunicator::Info& source = communicator->info();
+  const CollectiveRecord& record = *collective_;
+  RETURN_IF_ERROR(ValidateResolvedInfo(record.requirements, source));
+
+  XLA_FFI_GpuCommunicationTopology topology;
+  switch (source.topology) {
+    case GpuDeviceCommunicator::Topology::kLocalDomain:
+      topology = XLA_FFI_GPU_TOPOLOGY_LOCAL_DOMAIN;
+      break;
+    case GpuDeviceCommunicator::Topology::kHierarchical:
+      topology = XLA_FFI_GPU_TOPOLOGY_HIERARCHICAL;
+      break;
+    case GpuDeviceCommunicator::Topology::kAllPeers:
+      topology = XLA_FFI_GPU_TOPOLOGY_ALL_PEERS;
+      break;
+    default:
+      return Internal("Device communicator returned an unknown topology");
+  }
+
+  XLA_FFI_GpuDeviceCommunication_Info* destination = args->info;
+  destination->rank = source.rank;
+  destination->team_size = source.team_size;
+  destination->local_rank = source.local_rank;
+  destination->local_domain_size = source.local_domain_size;
+  destination->local_domain_count = source.local_domain_count;
+  destination->topology = topology;
+  destination->enabled_features = source.enabled_features;
+  destination->team_barrier_count = source.team_barrier_count;
+  destination->local_barrier_count = source.local_barrier_count;
+  destination->notification_slot_count = source.notification_slot_count;
+  destination->completion_slot_count = source.completion_slot_count;
+  return absl::OkStatus();
+}
+
 absl::Status FfiCollectiveResources::ValidateKernelArgDestination(
     void* destination, size_t destination_size, size_t packed_size) {
   if (destination == nullptr) {
@@ -248,25 +513,17 @@ absl::Status FfiCollectiveResources::ValidateKernelArgDestination(
 
 absl::Status FfiCollectiveResources::GetDeviceComm(
     XLA_FFI_GpuCollectives_GetDeviceComm_Args* args) {
-  RETURN_IF_ERROR(CheckStageForGet("GetDeviceComm"));
   if (args == nullptr) {
     return InvalidArgument("GetDeviceComm args must not be null");
   }
-  if (collective_params_ == nullptr || collective_cliques_ == nullptr) {
-    return FailedPrecondition(
-        "GetDeviceComm requires acquired collective resources");
-  }
 
-  const CollectiveRecord& record = *collective_;
   ASSIGN_OR_RETURN(GpuDeviceCommunicator * communicator,
-                   collective_cliques_->GetDeviceComm(
-                       record.key, collective_params_->global_device_id,
-                       record.requirements));
+                   GetCommunicator("GetDeviceComm"));
   if (args->destination == nullptr) {
     return InvalidArgument("Kernel argument destination must not be null");
   }
-  RETURN_IF_ERROR(communicator->CheckKernelArgAbi(
-      args->expected_abi_schema, args->expected_abi_version));
+  RETURN_IF_ERROR(communicator->CheckKernelArgAbi(args->expected_abi_schema,
+                                                  args->expected_abi_version));
 
   se::PackedKernelArg packed = communicator->PackKernelArg();
   RETURN_IF_ERROR(ValidateKernelArgDestination(

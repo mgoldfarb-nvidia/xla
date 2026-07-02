@@ -147,7 +147,7 @@ TEST(CollectiveOpsFfiKernelsTest, CollectiveKernelLaunch) {
 
   // In this test we use kernels that use LSA for communication.
   GpuDeviceCommunicator::Requirements reqs;
-  reqs.lsa_barrier_count = 1;
+  reqs.local_barrier_count = 1;
 
   // Create device communicators to be passed to kernels.
   auto fdev_comm0 =

@@ -21,6 +21,7 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 
 #include "absl/container/inlined_vector.h"
@@ -81,39 +82,98 @@ class GpuDeviceCommunicator {
  public:
   virtual ~GpuDeviceCommunicator() = default;
 
+  // Minimum peer reachability required by a device-communication algorithm.
+  // Operation semantics are defined by the provider device ABI.
+  enum class PeerAccess : uint8_t {
+    kLocalDomain = 0,
+    kHierarchical = 1,
+    kDirectAnyPeer = 2,
+  };
+
+  // Handler-visible topology realized by a device communicator.
+  enum class Topology : uint8_t {
+    kLocalDomain = 0,
+    kHierarchical = 1,
+    kAllPeers = 2,
+  };
+
+  using Features = uint64_t;
+  static constexpr Features kLocalMulticast = uint64_t{1} << 0;
+  static constexpr Features kNetworkDeviceOperations = uint64_t{1} << 1;
+  static constexpr Features kKnownFeatures =
+      kLocalMulticast | kNetworkDeviceOperations;
+
   // Requirements for constructing a device communicator object.
   struct Requirements {
     template <typename Sink>
     friend void AbslStringify(Sink& sink, const Requirements& reqs) {
-      absl::Format(&sink, "{lsa_barrier_count: %d, global_barrier_count: %d}",
-                   reqs.lsa_barrier_count, reqs.global_barrier_count);
+      absl::Format(&sink,
+                   "{peer_access: %d, required_features: 0x%x, "
+                   "preferred_features: 0x%x, local_barrier_count: %d, "
+                   "team_barrier_count: %d, notification_slot_count: %d, "
+                   "completion_slot_count: %d}",
+                   static_cast<int>(reqs.peer_access), reqs.required_features,
+                   reqs.preferred_features, reqs.local_barrier_count,
+                   reqs.team_barrier_count, reqs.notification_slot_count,
+                   reqs.completion_slot_count);
     }
 
     bool operator==(const Requirements& other) const {
-      return other.lsa_barrier_count == lsa_barrier_count &&
-             other.global_barrier_count == global_barrier_count;
+      return peer_access == other.peer_access &&
+             required_features == other.required_features &&
+             preferred_features == other.preferred_features &&
+             local_barrier_count == other.local_barrier_count &&
+             team_barrier_count == other.team_barrier_count &&
+             notification_slot_count == other.notification_slot_count &&
+             completion_slot_count == other.completion_slot_count;
     }
 
     bool operator<(const Requirements& other) const {
-      if (other.global_barrier_count != global_barrier_count) {
-        return other.global_barrier_count < global_barrier_count;
-      }
-      return other.lsa_barrier_count < lsa_barrier_count;
+      // Preserve the existing strongest/largest-first creation order. Besides
+      // minimizing churn, this is the conservative order for providers with
+      // communicator-family state fixed by the first device communicator.
+      return std::tie(other.peer_access, other.required_features,
+                      other.preferred_features, other.local_barrier_count,
+                      other.team_barrier_count, other.notification_slot_count,
+                      other.completion_slot_count) <
+             std::tie(peer_access, required_features, preferred_features,
+                      local_barrier_count, team_barrier_count,
+                      notification_slot_count, completion_slot_count);
     }
 
-    // Barrier counts reserve prefixes of one shared slot namespace. A local
-    // and a full-team barrier with the same index use the same local barrier
-    // resources and must not be active concurrently.
+    PeerAccess peer_access = PeerAccess::kLocalDomain;
+    Features required_features = 0;
+    Features preferred_features = 0;
 
-    // The number of barriers to allocate for load/store accessible
-    // communication.
-    int32_t lsa_barrier_count = 0;
+    // Local and team barriers use independent logical namespaces. Provider
+    // adapters are responsible for mapping them to disjoint physical slots.
+    int32_t local_barrier_count = 0;
 
-    // The number of barriers to allocate across the full communication team.
+    // The number of barriers to allocate across the communication team.
     // Backends may implement this hierarchically, for example with an LSA
     // barrier inside each local accessibility domain and device networking
     // between domains.
-    int32_t global_barrier_count = 0;
+    int32_t team_barrier_count = 0;
+
+    int32_t notification_slot_count = 0;
+    int32_t completion_slot_count = 0;
+  };
+
+  // Immutable properties and logical resources of a realized device
+  // communicator. Topology reports only handler-visible data-plane access;
+  // provider networking used solely to implement a team barrier is hidden.
+  struct Info {
+    int64_t rank = 0;
+    int64_t team_size = 0;
+    int64_t local_rank = 0;
+    int64_t local_domain_size = 0;
+    int64_t local_domain_count = 0;
+    Topology topology = Topology::kLocalDomain;
+    Features enabled_features = 0;
+    int32_t team_barrier_count = 0;
+    int32_t local_barrier_count = 0;
+    int32_t notification_slot_count = 0;
+    int32_t completion_slot_count = 0;
   };
 
   // Returns a platform-specific handle to the underlying communicator object.
@@ -124,15 +184,17 @@ class GpuDeviceCommunicator {
   // Returns the size of the load/store accessible communication.
   virtual int64_t lsa_size() const = 0;
 
+  virtual const Info& info() const = 0;
+
   virtual std::string ToString() const = 0;
 
   // Checks that device code expecting the given provider ABI can interpret the
   // opaque bytes returned by PackKernelArg.
   absl::Status CheckKernelArgAbi(uint64_t expected_schema,
                                  uint64_t expected_version) const {
-    return xla::internal::CheckKernelArgAbi(
-        device_abi_schema_, device_abi_version_, expected_schema,
-        expected_version);
+    return xla::internal::CheckKernelArgAbi(device_abi_schema_,
+                                            device_abi_version_,
+                                            expected_schema, expected_version);
   }
 
   // Packs device communicator as a device kernel argument.
@@ -144,8 +206,7 @@ class GpuDeviceCommunicator {
   }
 
  protected:
-  GpuDeviceCommunicator(uint64_t device_abi_schema,
-                        uint64_t device_abi_version)
+  GpuDeviceCommunicator(uint64_t device_abi_schema, uint64_t device_abi_version)
       : device_abi_schema_(device_abi_schema),
         device_abi_version_(device_abi_version) {}
 

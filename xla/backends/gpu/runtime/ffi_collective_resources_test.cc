@@ -18,7 +18,9 @@ limitations under the License.
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <tuple>
 #include <vector>
 
@@ -67,8 +69,9 @@ class FfiCollectiveResourcesTestPeer {
                            view->allocation_size);
   }
 
-  static absl::Status ValidateKernelArgDestination(
-      void* destination, size_t destination_size, size_t packed_size) {
+  static absl::Status ValidateKernelArgDestination(void* destination,
+                                                   size_t destination_size,
+                                                   size_t packed_size) {
     return FfiCollectiveResources::ValidateKernelArgDestination(
         destination, destination_size, packed_size);
   }
@@ -79,6 +82,23 @@ class FfiCollectiveResourcesTestPeer {
       if (buffer.memory_space == 1) ++count;
     }
     return count;
+  }
+
+  static absl::StatusOr<GpuDeviceCommunicator::Requirements>
+  NormalizeRequirements(
+      const XLA_FFI_GpuDeviceCommunication_Requirements& requirements) {
+    return FfiCollectiveResources::NormalizeRequirements(requirements);
+  }
+
+  static std::optional<GpuDeviceCommunicator::Requirements>
+  RequestedRequirements(const FfiCollectiveResources& resources) {
+    return resources.requested_requirements_;
+  }
+
+  static absl::Status ValidateResolvedInfo(
+      const GpuDeviceCommunicator::Requirements& requirements,
+      const GpuDeviceCommunicator::Info& info) {
+    return FfiCollectiveResources::ValidateResolvedInfo(requirements, info);
   }
 };
 
@@ -92,7 +112,8 @@ FfiCollectiveResources MakeResources(
     ThunkId thunk_id, absl::Span<const NullableShapedSlice> operands = {},
     absl::Span<const NullableShapedSlice> results = {}) {
   return FfiCollectiveResources("target", "profile", thunk_id, operands,
-                                results);
+                                results,
+                                /*uses_device_communication=*/true);
 }
 
 Shape MakeU8Shape(int64_t size, int64_t memory_space) {
@@ -105,7 +126,8 @@ TEST(FfiCollectiveResourcesTest, CallsiteDomainIsStableAndIsolated) {
   FfiCollectiveResources first = MakeResources(ThunkId(7));
   FfiCollectiveResources same_callsite = MakeResources(ThunkId(7));
   FfiCollectiveResources other_callsite = MakeResources(ThunkId(8));
-  FfiCollectiveResources other_target("other", "profile", ThunkId(7), {}, {});
+  FfiCollectiveResources other_target("other", "profile", ThunkId(7), {}, {},
+                                      /*uses_device_communication=*/true);
 
   EXPECT_EQ(first.resource_domain(), same_callsite.resource_domain());
   EXPECT_NE(first.resource_domain(), other_callsite.resource_domain());
@@ -130,6 +152,220 @@ TEST(FfiCollectiveResourcesTest, DiscoversCollectiveMemoryTags) {
   FfiCollectiveResources resources =
       MakeResources(ThunkId(1), operands, results);
   EXPECT_EQ(FfiCollectiveResourcesTestPeer::TaggedBufferCount(resources), 2);
+}
+
+TEST(FfiCollectiveResourcesTest, NormalizesExplicitRequirements) {
+  XLA_FFI_GpuDeviceCommunication_Requirements requirements = {};
+  requirements.struct_size =
+      XLA_FFI_GpuDeviceCommunication_Requirements_STRUCT_SIZE;
+  requirements.peer_access = XLA_FFI_GPU_PEER_ACCESS_HIERARCHICAL;
+  requirements.required_features =
+      XLA_FFI_GPU_DEVICE_COMM_FEATURE_LOCAL_MULTICAST;
+  requirements.preferred_features =
+      XLA_FFI_GPU_DEVICE_COMM_FEATURE_LOCAL_MULTICAST |
+      XLA_FFI_GPU_DEVICE_COMM_FEATURE_NETWORK_DEVICE_OPERATIONS |
+      (uint64_t{1} << 63);
+  requirements.local_barrier_count = 2;
+  requirements.team_barrier_count = 3;
+  requirements.notification_slot_count = 4;
+  requirements.completion_slot_count = 5;
+
+  ASSERT_OK_AND_ASSIGN(
+      GpuDeviceCommunicator::Requirements normalized,
+      FfiCollectiveResourcesTestPeer::NormalizeRequirements(requirements));
+  EXPECT_EQ(normalized.peer_access,
+            GpuDeviceCommunicator::PeerAccess::kHierarchical);
+  EXPECT_EQ(normalized.required_features,
+            GpuDeviceCommunicator::kLocalMulticast);
+  EXPECT_EQ(normalized.preferred_features,
+            GpuDeviceCommunicator::kNetworkDeviceOperations);
+  EXPECT_EQ(normalized.local_barrier_count, 2);
+  EXPECT_EQ(normalized.team_barrier_count, 3);
+  EXPECT_EQ(normalized.notification_slot_count, 4);
+  EXPECT_EQ(normalized.completion_slot_count, 5);
+}
+
+TEST(FfiCollectiveResourcesTest, RejectsInvalidRequirements) {
+  XLA_FFI_GpuDeviceCommunication_Requirements requirements = {};
+  requirements.struct_size =
+      XLA_FFI_GpuDeviceCommunication_Requirements_STRUCT_SIZE;
+  requirements.peer_access = XLA_FFI_GPU_PEER_ACCESS_LOCAL_DOMAIN;
+  requirements.required_features = uint64_t{1} << 63;
+  EXPECT_THAT(
+      FfiCollectiveResourcesTestPeer::NormalizeRequirements(requirements),
+      StatusIs(absl::StatusCode::kUnimplemented,
+               HasSubstr("Unknown required")));
+
+  requirements.required_features = 0;
+  requirements.peer_access = static_cast<XLA_FFI_GpuPeerAccess>(99);
+  EXPECT_THAT(
+      FfiCollectiveResourcesTestPeer::NormalizeRequirements(requirements),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("Unknown GPU peer access")));
+
+  requirements.peer_access = XLA_FFI_GPU_PEER_ACCESS_LOCAL_DOMAIN;
+  requirements.team_barrier_count =
+      static_cast<uint32_t>(std::numeric_limits<int32_t>::max()) + 1;
+  EXPECT_THAT(
+      FfiCollectiveResourcesTestPeer::NormalizeRequirements(requirements),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("team_barrier_count")));
+}
+
+TEST(FfiCollectiveResourcesTest,
+     RequestIsIdempotentAfterNormalizationAndRejectsConflict) {
+  FfiCollectiveResources resources = MakeResources(ThunkId(1));
+  ASSERT_OK(resources.BeginInvocation(XLA_FFI_ExecutionStage_PREPARE, nullptr,
+                                      nullptr, nullptr, nullptr, nullptr,
+                                      nullptr));
+
+  XLA_FFI_GpuDeviceCommunication_Requirements requirements = {};
+  requirements.struct_size =
+      XLA_FFI_GpuDeviceCommunication_Requirements_STRUCT_SIZE;
+  requirements.peer_access = XLA_FFI_GPU_PEER_ACCESS_DIRECT_ANY_PEER;
+  requirements.required_features =
+      XLA_FFI_GPU_DEVICE_COMM_FEATURE_NETWORK_DEVICE_OPERATIONS;
+  requirements.preferred_features =
+      XLA_FFI_GPU_DEVICE_COMM_FEATURE_NETWORK_DEVICE_OPERATIONS |
+      (uint64_t{1} << 63);
+  requirements.team_barrier_count = 2;
+  XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args request = {};
+  request.struct_size =
+      XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args_STRUCT_SIZE;
+  request.requirements = &requirements;
+
+  ASSERT_OK(resources.RequestDeviceCommunication(&request));
+  ASSERT_OK(resources.RequestDeviceCommunication(&request));
+  ASSERT_TRUE(FfiCollectiveResourcesTestPeer::RequestedRequirements(resources)
+                  .has_value());
+  EXPECT_EQ(FfiCollectiveResourcesTestPeer::RequestedRequirements(resources)
+                ->preferred_features,
+            0);
+
+  requirements.team_barrier_count = 3;
+  EXPECT_THAT(
+      resources.RequestDeviceCommunication(&request),
+      StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("Conflicting")));
+}
+
+TEST(FfiCollectiveResourcesTest, RequestRequiresHandlerTrait) {
+  FfiCollectiveResources resources("target", "profile", ThunkId(1), {}, {},
+                                   /*uses_device_communication=*/false);
+  ASSERT_OK(resources.BeginInvocation(XLA_FFI_ExecutionStage_PREPARE, nullptr,
+                                      nullptr, nullptr, nullptr, nullptr,
+                                      nullptr));
+
+  XLA_FFI_GpuDeviceCommunication_Requirements requirements = {};
+  requirements.struct_size =
+      XLA_FFI_GpuDeviceCommunication_Requirements_STRUCT_SIZE;
+  XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args request = {};
+  request.struct_size =
+      XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args_STRUCT_SIZE;
+  request.requirements = &requirements;
+  EXPECT_THAT(resources.RequestDeviceCommunication(&request),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("USES_DEVICE_COMMUNICATION")));
+}
+
+TEST(FfiCollectiveResourcesTest, FreezesNormalizedProfileAcrossInvocations) {
+  FfiDeviceCommunicationProfile profile;
+  GpuDeviceCommunicator::Requirements first;
+  first.team_barrier_count = 1;
+  EXPECT_THAT(profile.Freeze(first), IsOk());
+  EXPECT_THAT(profile.Freeze(first), IsOk());
+
+  GpuDeviceCommunicator::Requirements changed = first;
+  changed.team_barrier_count = 2;
+  EXPECT_THAT(profile.Freeze(changed),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("changed across invocations")));
+}
+
+TEST(FfiCollectiveResourcesTest, ValidatesResolvedPeerAccess) {
+  GpuDeviceCommunicator::Requirements requirements;
+  GpuDeviceCommunicator::Info info;
+  info.rank = 0;
+  info.team_size = 4;
+  info.local_rank = 0;
+  info.local_domain_size = 2;
+  info.local_domain_count = 2;
+  info.topology = GpuDeviceCommunicator::Topology::kLocalDomain;
+
+  EXPECT_THAT(
+      FfiCollectiveResourcesTestPeer::ValidateResolvedInfo(requirements, info),
+      IsOk());
+
+  requirements.peer_access = GpuDeviceCommunicator::PeerAccess::kHierarchical;
+  EXPECT_THAT(
+      FfiCollectiveResourcesTestPeer::ValidateResolvedInfo(requirements, info),
+      StatusIs(absl::StatusCode::kInternal,
+               HasSubstr("hierarchical peer access")));
+  info.topology = GpuDeviceCommunicator::Topology::kHierarchical;
+  EXPECT_THAT(
+      FfiCollectiveResourcesTestPeer::ValidateResolvedInfo(requirements, info),
+      IsOk());
+
+  requirements.peer_access = GpuDeviceCommunicator::PeerAccess::kDirectAnyPeer;
+  EXPECT_THAT(
+      FfiCollectiveResourcesTestPeer::ValidateResolvedInfo(requirements, info),
+      StatusIs(absl::StatusCode::kInternal,
+               HasSubstr("direct-any-peer access")));
+  info.topology = GpuDeviceCommunicator::Topology::kAllPeers;
+  EXPECT_THAT(
+      FfiCollectiveResourcesTestPeer::ValidateResolvedInfo(requirements, info),
+      IsOk());
+
+  info.local_domain_size = info.team_size;
+  EXPECT_THAT(
+      FfiCollectiveResourcesTestPeer::ValidateResolvedInfo(requirements, info),
+      StatusIs(absl::StatusCode::kInternal,
+               HasSubstr("inconsistent local-domain topology")));
+
+  // A local-domain provider satisfies either wider reachability mode when its
+  // single local domain already contains the complete communication team.
+  info.local_domain_count = 1;
+  info.topology = GpuDeviceCommunicator::Topology::kLocalDomain;
+  requirements.peer_access = GpuDeviceCommunicator::PeerAccess::kHierarchical;
+  EXPECT_THAT(
+      FfiCollectiveResourcesTestPeer::ValidateResolvedInfo(requirements, info),
+      IsOk());
+  requirements.peer_access = GpuDeviceCommunicator::PeerAccess::kDirectAnyPeer;
+  EXPECT_THAT(
+      FfiCollectiveResourcesTestPeer::ValidateResolvedInfo(requirements, info),
+      IsOk());
+}
+
+TEST(FfiCollectiveResourcesTest, ValidatesResolvedFeaturesAndCounts) {
+  GpuDeviceCommunicator::Requirements requirements;
+  requirements.required_features = GpuDeviceCommunicator::kLocalMulticast;
+  requirements.local_barrier_count = 1;
+  requirements.team_barrier_count = 2;
+  requirements.notification_slot_count = 3;
+  requirements.completion_slot_count = 4;
+
+  GpuDeviceCommunicator::Info info;
+  info.rank = 0;
+  info.team_size = 1;
+  info.local_rank = 0;
+  info.local_domain_size = 1;
+  info.local_domain_count = 1;
+  EXPECT_THAT(
+      FfiCollectiveResourcesTestPeer::ValidateResolvedInfo(requirements, info),
+      StatusIs(absl::StatusCode::kInternal,
+               HasSubstr("omitted required feature")));
+
+  info.enabled_features = GpuDeviceCommunicator::kLocalMulticast;
+  EXPECT_THAT(
+      FfiCollectiveResourcesTestPeer::ValidateResolvedInfo(requirements, info),
+      StatusIs(absl::StatusCode::kInternal, HasSubstr("under-provisioned")));
+
+  info.local_barrier_count = 1;
+  info.team_barrier_count = 2;
+  info.notification_slot_count = 3;
+  info.completion_slot_count = 4;
+  EXPECT_THAT(
+      FfiCollectiveResourcesTestPeer::ValidateResolvedInfo(requirements, info),
+      IsOk());
 }
 
 TEST(FfiCollectiveResourcesTest,
@@ -191,17 +427,15 @@ TEST(FfiCollectiveResourcesTest,
   ASSERT_OK(resources.BeginInvocation(XLA_FFI_ExecutionStage_PREPARE, &buffers,
                                       &collective_params, &clique_requests,
                                       &memory_requests, nullptr, nullptr));
-  ASSERT_OK(resources.PrepareDeviceCommunication());
+  ASSERT_OK(resources.FinalizeDeviceCommunication());
 
   ASSERT_EQ(clique_requests.size(), 1);
   std::vector<CollectiveCliqueRequests::CliqueRequest> clique_request =
       clique_requests.OrderedRequestedCliques();
   ASSERT_EQ(clique_request.size(), 1);
-  EXPECT_EQ(
-      clique_request[0].dev_comms,
-      (absl::btree_set<GpuDeviceCommunicator::Requirements>{
-          GpuDeviceCommunicator::Requirements{/*lsa_barrier_count=*/0,
-                                              /*global_barrier_count=*/1}}));
+  EXPECT_EQ(clique_request[0].dev_comms,
+            (absl::btree_set<GpuDeviceCommunicator::Requirements>{
+                GpuDeviceCommunicator::Requirements{.team_barrier_count = 1}}));
   std::vector<CollectiveMemoryRequests::CollectiveAllocations> memory_request =
       memory_requests.OrderedSymmetricAllocations();
   ASSERT_EQ(memory_request.size(), 1);
@@ -238,6 +472,59 @@ TEST(FfiCollectiveResourcesTest,
   EXPECT_THAT(
       FfiCollectiveResourcesTestPeer::FindBufferView(resources, buffer),
       StatusIs(absl::StatusCode::kFailedPrecondition, HasSubstr("not tagged")));
+
+  // A handler that only uses communicator resources must not be forced to add
+  // a dummy tagged buffer.
+  FfiCollectiveResources communicator_only = MakeResources(ThunkId(2));
+  CollectiveCliqueRequests communicator_only_cliques;
+  ASSERT_OK(communicator_only.BeginInvocation(
+      XLA_FFI_ExecutionStage_PREPARE, &buffers, &collective_params,
+      &communicator_only_cliques,
+      /*collective_memory_requests=*/nullptr, nullptr, nullptr));
+  ASSERT_OK(communicator_only.FinalizeDeviceCommunication());
+  ASSERT_EQ(communicator_only_cliques.size(), 1);
+  auto communicator_only_requests =
+      communicator_only_cliques.OrderedRequestedCliques();
+  ASSERT_EQ(communicator_only_requests.size(), 1);
+  EXPECT_THAT(communicator_only_requests[0].dev_comms,
+              ::testing::ElementsAre(GpuDeviceCommunicator::Requirements{
+                  .team_barrier_count = 1}));
+
+  FfiCollectiveResources explicitly_requested = MakeResources(ThunkId(3));
+  CollectiveCliqueRequests explicit_cliques;
+  CollectiveMemoryRequests explicit_memory(buffers);
+  ASSERT_OK(explicitly_requested.BeginInvocation(
+      XLA_FFI_ExecutionStage_PREPARE, &buffers, &collective_params,
+      &explicit_cliques, &explicit_memory, nullptr, nullptr));
+  XLA_FFI_GpuDeviceCommunication_Requirements explicit_requirements = {};
+  explicit_requirements.struct_size =
+      XLA_FFI_GpuDeviceCommunication_Requirements_STRUCT_SIZE;
+  explicit_requirements.peer_access = XLA_FFI_GPU_PEER_ACCESS_HIERARCHICAL;
+  explicit_requirements.required_features =
+      XLA_FFI_GPU_DEVICE_COMM_FEATURE_NETWORK_DEVICE_OPERATIONS;
+  explicit_requirements.local_barrier_count = 2;
+  explicit_requirements.team_barrier_count = 3;
+  explicit_requirements.notification_slot_count = 4;
+  explicit_requirements.completion_slot_count = 5;
+  XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args explicit_request = {};
+  explicit_request.struct_size =
+      XLA_FFI_GpuCollectives_RequestDeviceCommunication_Args_STRUCT_SIZE;
+  explicit_request.requirements = &explicit_requirements;
+  ASSERT_OK(explicitly_requested.RequestDeviceCommunication(&explicit_request));
+  ASSERT_OK(explicitly_requested.FinalizeDeviceCommunication());
+  auto explicit_clique_requests = explicit_cliques.OrderedRequestedCliques();
+  ASSERT_EQ(explicit_clique_requests.size(), 1);
+  GpuDeviceCommunicator::Requirements expected_explicit;
+  expected_explicit.peer_access =
+      GpuDeviceCommunicator::PeerAccess::kHierarchical;
+  expected_explicit.required_features =
+      GpuDeviceCommunicator::kNetworkDeviceOperations;
+  expected_explicit.local_barrier_count = 2;
+  expected_explicit.team_barrier_count = 3;
+  expected_explicit.notification_slot_count = 4;
+  expected_explicit.completion_slot_count = 5;
+  EXPECT_THAT(explicit_clique_requests[0].dev_comms,
+              ::testing::ElementsAre(expected_explicit));
 }
 
 TEST(FfiCollectiveResourcesTest,
@@ -362,7 +649,7 @@ TEST(FfiCollectiveResourcesTest, RequiresDeclarativePreparationBeforeAccess) {
   EXPECT_THAT(resources.GetDeviceComm(&get),
               StatusIs(absl::StatusCode::kFailedPrecondition,
                        HasSubstr("USES_DEVICE_COMMUNICATION")));
-  EXPECT_THAT(resources.PrepareDeviceCommunication(),
+  EXPECT_THAT(resources.FinalizeDeviceCommunication(),
               StatusIs(absl::StatusCode::kFailedPrecondition,
                        HasSubstr("only be prepared during FFI Prepare")));
 }
@@ -372,7 +659,7 @@ TEST(FfiCollectiveResourcesTest, PreparationRequiresCallsiteAndGpuResources) {
   ASSERT_OK(no_callsite.BeginInvocation(XLA_FFI_ExecutionStage_PREPARE, nullptr,
                                         nullptr, nullptr, nullptr, nullptr,
                                         nullptr));
-  EXPECT_THAT(no_callsite.PrepareDeviceCommunication(),
+  EXPECT_THAT(no_callsite.FinalizeDeviceCommunication(),
               StatusIs(absl::StatusCode::kFailedPrecondition,
                        HasSubstr("non-zero thunk id")));
 
@@ -380,7 +667,7 @@ TEST(FfiCollectiveResourcesTest, PreparationRequiresCallsiteAndGpuResources) {
   ASSERT_OK(no_resources.BeginInvocation(XLA_FFI_ExecutionStage_PREPARE,
                                          nullptr, nullptr, nullptr, nullptr,
                                          nullptr, nullptr));
-  EXPECT_THAT(no_resources.PrepareDeviceCommunication(),
+  EXPECT_THAT(no_resources.FinalizeDeviceCommunication(),
               StatusIs(absl::StatusCode::kFailedPrecondition,
                        HasSubstr("GPU collective Prepare resources")));
 }

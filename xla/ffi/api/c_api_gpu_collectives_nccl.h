@@ -17,6 +17,7 @@ limitations under the License.
 #define XLA_FFI_API_C_API_GPU_COLLECTIVES_NCCL_H_
 
 #include <stdint.h>
+#include "xla/ffi/api/c_api_gpu_collectives.h"
 
 // Stable schemas for NCCL device kernel arguments returned by the generic GPU
 // device-communication API. These constants identify the concrete device ABI;
@@ -28,17 +29,23 @@ limitations under the License.
 // destination is an ncclWindow_t with destination_size ==
 // sizeof(ncclWindow_t).
 //
-// XLA provisions synchronization slot 0 as a full-team barrier. A device
-// kernel can use the NCCL LSA barrier when ncclDevComm::lsaSize equals
-// ncclDevComm::nRanks. Otherwise, it constructs ncclGin from the device
-// communicator and a context index, then uses NCCL's world ncclBarrierSession,
-// which composes the LSA and rail GIN barriers. XLA enables GIN while creating
-// the device communicator and registers every tagged symmetric window during
-// resource preparation; no FFI-side GIN registration or configuration is
-// required.
+// Team barrier logical slot i maps to NCCL barrier index i. Local barrier
+// logical slots are placed after all team slots; use the helper below to map a
+// local logical slot to its NCCL LSA barrier index. Notification slot i maps to
+// GIN signal i and completion slot i maps to GIN counter i within each selected
+// GIN context. XLA enables GIN when the semantic requirements need it and
+// registers every tagged symmetric window during resource preparation; no
+// FFI-side GIN registration is required.
 #define XLA_FFI_GpuCollective_NCCL_DEVICE_COMM_ABI_SCHEMA \
   UINT64_C(0x4e43434c44433031)  // ASCII "NCCLDC01"
 #define XLA_FFI_GpuCollective_NCCL_SYMMETRIC_MEMORY_ABI_SCHEMA \
   UINT64_C(0x4e43434c574e3031)  // ASCII "NCCLWN01"
+
+// The caller must validate logical_local_slot < info->local_barrier_count.
+static inline uint32_t XLA_FFI_GpuCollective_NcclLocalBarrierIndex(
+    const XLA_FFI_GpuDeviceCommunication_Info* info,
+    uint32_t logical_local_slot) {
+  return info->team_barrier_count + logical_local_slot;
+}
 
 #endif  // XLA_FFI_API_C_API_GPU_COLLECTIVES_NCCL_H_

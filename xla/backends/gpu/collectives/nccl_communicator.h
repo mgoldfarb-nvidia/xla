@@ -62,14 +62,31 @@ inline constexpr uint64_t kNcclDeviceCommAbiSchema =
 
 struct NcclCapabilities;
 
+// NCCL-specific realization of provider-neutral device communication
+// requirements. The requirements object is passed verbatim to NCCL, while
+// topology and enabled_features describe only the data plane visible to the
+// handler (and intentionally hide GIN used solely for a team barrier).
+struct NcclDeviceCommPlan {
+  ncclDevCommRequirements requirements{};
+  GpuDeviceCommunicator::Topology topology =
+      GpuDeviceCommunicator::Topology::kLocalDomain;
+  GpuDeviceCommunicator::Features enabled_features = 0;
+};
+
 // Validates and converts XLA's device communicator requirements to the
-// compile-time NCCL device API. Full-team barriers use only LSA when the
-// communicator has one LSA team, and otherwise use NCCL GIN to compose a
-// hierarchical barrier. This function does not access a GPU or an NCCL
-// communicator.
-absl::StatusOr<ncclDevCommRequirements> BuildNcclDeviceCommRequirements(
+// compile-time NCCL device API and resolves the handler-visible topology. This
+// function does not access a GPU or an NCCL communicator.
+absl::StatusOr<NcclDeviceCommPlan> BuildNcclDeviceCommPlan(
     const GpuDeviceCommunicator::Requirements& requirements,
     const NcclCapabilities& capabilities);
+
+// Validates the concrete ncclDevComm returned by NCCL and constructs immutable
+// provider-neutral information for FFI handlers. In particular, this catches a
+// returned communicator that does not satisfy the requested sticky GIN mode.
+absl::StatusOr<GpuDeviceCommunicator::Info> BuildNcclDeviceCommInfo(
+    const GpuDeviceCommunicator::Requirements& requirements,
+    const NcclDeviceCommPlan& plan, const NcclCapabilities& capabilities,
+    const ncclDevComm& dev_comm);
 
 // Validates exact compatibility between the NCCL ABI used to compile XLA and
 // the loaded NCCL runtime. This function does not access a GPU and is exposed
@@ -78,19 +95,18 @@ absl::Status ValidateNcclDeviceAbi(uint64_t compile_time_version,
                                    uint64_t runtime_version);
 
 struct NcclCapabilities {
-  enum class GinConnectionType { kNone, kFull, kRail };
-
   bool supports_device_comm = false;
   bool supports_one_sided_comm = false;
+  bool supports_multimem = false;
+  bool supports_full_gin = false;
+  bool supports_rail_gin = false;
+
+  int rank = -1;
+  int team_size = 0;
 
   // Number of load/store accessibility domains in this communicator. A
   // full-team device barrier needs GIN when this is greater than one.
   int lsa_team_count = 0;
-
-  // Best GIN connectivity supported by every rank in the communicator. Full
-  // connectivity is preferred; rail connectivity is sufficient for NCCL's
-  // hierarchical full-team barrier.
-  GinConnectionType gin_connection_type = GinConnectionType::kNone;
 
   // Reason one-sided comm is not supported, cached at construction. Empty
   // if one-sided comm is supported.
@@ -344,6 +360,8 @@ class NcclDeviceCommunicator : public GpuDeviceCommunicator {
   // Returns the size of the load/store accessible communication.
   int64_t lsa_size() const final { return dev_comm_.lsaSize; };
 
+  const Info& info() const final { return info_; }
+
   std::string ToString() const final;
 
   se::PackedKernelArg PackKernelArg() const final;
@@ -353,12 +371,13 @@ class NcclDeviceCommunicator : public GpuDeviceCommunicator {
                          se::StreamExecutor* stream_executor,
                          std::shared_ptr<tsl::Executor> executor,
                          uint64_t validated_device_abi_version,
-                         ncclDevComm dev_comm);
+                         ncclDevComm dev_comm, Info info);
 
   std::shared_ptr<NcclCommState> parent_comm_;
   se::StreamExecutor* stream_executor_;
   std::shared_ptr<tsl::Executor> executor_;
   ncclDevComm dev_comm_;
+  Info info_;
 };
 
 }  // namespace xla::gpu
