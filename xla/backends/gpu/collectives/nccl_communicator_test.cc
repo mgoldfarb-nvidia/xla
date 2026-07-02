@@ -13,8 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <cstddef>
 #include <functional>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -27,10 +29,14 @@ limitations under the License.
 #include "xla/backends/gpu/collectives/collectives_test_util.h"
 #include "xla/backends/gpu/collectives/gpu_collectives.h"
 #include "xla/backends/gpu/collectives/gpu_communicator.h"
+#include "xla/core/collectives/rank_id.h"
 #include "xla/core/collectives/reduction_kind.h"
+#include "xla/core/collectives/registered_memory.h"
+#include "xla/core/collectives/symmetric_memory.h"
 #include "xla/future.h"
 #include "xla/runtime/device_id.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
+#include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/memory_allocation.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform_manager.h"
@@ -144,6 +150,90 @@ TEST(NcclCommunicatorTest, AsyncApiCalls) {
   for (auto& f : futures) {
     EXPECT_OK(f.Await());
   }
+}
+
+// Non-blocking NCCL communicators require every NCCL API call to execute on
+// the communicator's owning thread and require host API output handles to be
+// consumed only after ncclCommGetAsyncError reports completion.
+TEST(NcclCommunicatorTest, NonBlockingDeviceResourceCreation) {
+  ASSERT_OK_AND_ASSIGN(se::Platform * platform,
+                       se::PlatformManager::PlatformWithName("CUDA"));
+
+  if (platform->VisibleDeviceCount() < 2) {
+    GTEST_SKIP() << "Test requires at least 2 GPUs";
+  }
+
+  ASSERT_OK_AND_ASSIGN(std::vector<se::StreamExecutor*> executors,
+                       CreateExecutors(platform, 2));
+
+  if (!executors[0]->CanEnablePeerAccessTo(executors[1])) {
+    GTEST_SKIP() << "Test requires peer access between devices";
+  }
+
+  if (!executors[0]
+           ->GetDeviceDescription()
+           .cuda_compute_capability()
+           .IsAtLeastHopper()) {
+    GTEST_SKIP() << "Test requires at least Hopper architecture";
+  }
+
+  ASSERT_OK_AND_ASSIGN(auto comms, CreateCommunicators(executors, {kD0, kD1},
+                                                       /*blocking=*/false));
+  ASSERT_OK_AND_ASSIGN(std::size_t num_ranks0, comms[0]->NumRanks());
+  ASSERT_OK_AND_ASSIGN(std::size_t num_ranks1, comms[1]->NumRanks());
+  EXPECT_EQ(num_ranks0, 2);
+  EXPECT_EQ(num_ranks1, 2);
+
+  if (!comms[0]->SupportsDeviceComm() || !comms[1]->SupportsDeviceComm()) {
+    GTEST_SKIP() << "GPU communicators do not support device-initiated comms";
+  }
+
+  ASSERT_OK_AND_ASSIGN(auto allocators, CreateMemoryAllocators(executors));
+  ASSERT_OK_AND_ASSIGN(auto sym_allocs, Allocate(allocators, 1024));
+  ASSERT_OK_AND_ASSIGN(auto registered_allocs, Allocate(allocators, 1024));
+
+  tsl::thread::ThreadPool pool(tsl::Env::Default(), "nccl_test", 2);
+  tsl::Executor& exec = *pool.AsExecutor();
+
+  auto symmetric_memory_futures =
+      CreateSymmetricMemory(exec, comms, sym_allocs);
+  ASSERT_OK_AND_ASSIGN(
+      auto symmetric_memory,
+      AwaitSymmetricMemory(std::move(symmetric_memory_futures)));
+  EXPECT_EQ(symmetric_memory.size(), 2);
+  EXPECT_NE(symmetric_memory[0]->PackKernelArg(), nullptr);
+  EXPECT_NE(symmetric_memory[1]->PackKernelArg(), nullptr);
+  ASSERT_OK_AND_ASSIGN(se::DeviceAddressBase peer0,
+                       symmetric_memory[0]->peer_addr(RankId(1)));
+  ASSERT_OK_AND_ASSIGN(se::DeviceAddressBase peer1,
+                       symmetric_memory[1]->peer_addr(RankId(0)));
+  EXPECT_NE(peer0.opaque(), nullptr);
+  EXPECT_NE(peer1.opaque(), nullptr);
+
+  auto registered0 = MakeFutureOn(exec, [&] {
+    return comms[0]->CreateRegisteredMemory(registered_allocs[0]->address());
+  });
+  auto registered1 = MakeFutureOn(exec, [&] {
+    return comms[1]->CreateRegisteredMemory(registered_allocs[1]->address());
+  });
+  ASSERT_OK_AND_ASSIGN(auto registered_memory0, std::move(registered0).Await());
+  ASSERT_OK_AND_ASSIGN(auto registered_memory1, std::move(registered1).Await());
+  EXPECT_EQ(registered_memory0->addr().opaque(),
+            registered_allocs[0]->address().opaque());
+  EXPECT_EQ(registered_memory1->addr().opaque(),
+            registered_allocs[1]->address().opaque());
+
+  GpuDeviceCommunicator::Requirements requirements;
+  requirements.local_barrier_count = 1;
+  auto device_comm0 = MakeFutureOn(
+      exec, [&] { return comms[0]->CreateDeviceComm(requirements); });
+  auto device_comm1 = MakeFutureOn(
+      exec, [&] { return comms[1]->CreateDeviceComm(requirements); });
+
+  ASSERT_OK_AND_ASSIGN(auto dev_comm0, std::move(device_comm0).Await());
+  ASSERT_OK_AND_ASSIGN(auto dev_comm1, std::move(device_comm1).Await());
+  EXPECT_TRUE(dev_comm0->platform_comm().handle);
+  EXPECT_TRUE(dev_comm1->platform_comm().handle);
 }
 
 }  // namespace

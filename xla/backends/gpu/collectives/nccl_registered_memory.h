@@ -18,12 +18,15 @@ limitations under the License.
 
 #include <memory>
 #include <string>
+#include <thread>
 
 #include "absl/status/statusor.h"
 #include "third_party/nccl/nccl.h"
 #include "xla/backends/gpu/collectives/nccl_types.h"
 #include "xla/core/collectives/registered_memory.h"
 #include "xla/stream_executor/device_address.h"
+#include "xla/stream_executor/stream_executor.h"
+#include "xla/tsl/concurrency/executor.h"
 
 namespace xla::gpu {
 
@@ -42,7 +45,9 @@ class NcclRegisteredMemory final : public RegisteredMemory {
 
   static absl::StatusOr<std::unique_ptr<NcclRegisteredMemory>> Create(
       std::shared_ptr<NcclCommState> comm_state,
-      stream_executor::DeviceAddressBase addr);
+      stream_executor::DeviceAddressBase addr,
+      std::shared_ptr<tsl::Executor> executor,
+      stream_executor::StreamExecutor* stream_executor);
 
   stream_executor::DeviceAddressBase addr() const final;
 
@@ -50,11 +55,16 @@ class NcclRegisteredMemory final : public RegisteredMemory {
 
  private:
   NcclRegisteredMemory(std::shared_ptr<NcclCommState> comm, void* handle,
-                       stream_executor::DeviceAddressBase addr);
+                       stream_executor::DeviceAddressBase addr,
+                       std::shared_ptr<tsl::Executor> executor,
+                       stream_executor::StreamExecutor* stream_executor);
 
   std::shared_ptr<NcclCommState> comm_;
   void* handle_;
   stream_executor::DeviceAddressBase addr_;
+  std::shared_ptr<tsl::Executor> executor_;
+  stream_executor::StreamExecutor* stream_executor_;
+  std::thread::id owner_thread_id_;
 };
 
 }  // namespace xla::gpu

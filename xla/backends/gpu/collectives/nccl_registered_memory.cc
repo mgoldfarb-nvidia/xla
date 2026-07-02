@@ -17,45 +17,107 @@ limitations under the License.
 
 #include <memory>
 #include <string>
+#include <thread>
+#include <utility>
 
+#include "absl/functional/any_invocable.h"
 #include "absl/log/log.h"
 #include "absl/memory/memory.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/synchronization/mutex.h"
+#include "xla/tsl/platform/status_macros.h"
+#include "xla/backends/gpu/collectives/cancellation_token.h"
 #include "xla/backends/gpu/collectives/nccl_errors.h"
 #include "xla/backends/gpu/collectives/nccl_types.h"
+#include "xla/future.h"
 #include "xla/stream_executor/device_address.h"
+#include "xla/stream_executor/stream_executor.h"
+#include "xla/tsl/concurrency/executor.h"
 
 // Include NCCL after XLA headers.
 #include "third_party/nccl/nccl.h"
 
 namespace xla::gpu {
 
+namespace {
+
+Future<> Execute(absl::AnyInvocable<absl::Status() &&> f,
+                 const std::shared_ptr<tsl::Executor>& executor,
+                 std::thread::id owner_thread_id) {
+  return executor != nullptr && std::this_thread::get_id() != owner_thread_id
+             ? MakeFutureOn<void>(*executor, std::move(f))
+             : Future<>(std::move(f)());
+}
+
+}  // namespace
+
 NcclRegisteredMemory::NcclRegisteredMemory(
     std::shared_ptr<NcclCommState> comm, void* handle,
-    stream_executor::DeviceAddressBase addr)
-    : comm_(comm), handle_(handle), addr_(addr) {}
+    stream_executor::DeviceAddressBase addr,
+    std::shared_ptr<tsl::Executor> executor,
+    stream_executor::StreamExecutor* stream_executor)
+    : comm_(std::move(comm)),
+      handle_(handle),
+      addr_(addr),
+      executor_(std::move(executor)),
+      stream_executor_(stream_executor),
+      owner_thread_id_(std::this_thread::get_id()) {}
 
 absl::StatusOr<std::unique_ptr<NcclRegisteredMemory>>
 NcclRegisteredMemory::Create(std::shared_ptr<NcclCommState> comm_state,
-                             stream_executor::DeviceAddressBase addr) {
+                             stream_executor::DeviceAddressBase addr,
+                             std::shared_ptr<tsl::Executor> executor,
+                             stream_executor::StreamExecutor* stream_executor) {
+  if (stream_executor == nullptr) {
+    return absl::InvalidArgumentError(
+        "StreamExecutor is required to create NCCL registered memory");
+  }
+  auto activation = stream_executor->Activate();
+  CancellationToken never_cancelled;
+
   void* handle = nullptr;
   {
     absl::MutexLock lock(comm_state->mutex);
     VLOG(3) << absl::StrFormat(
         "Create NCCL registered memory on comm=%p from: ptr=%p; size=%ld",
         comm_state->comm, addr.opaque(), addr.size());
-    XLA_NCCL_RETURN_IF_ERROR(ncclCommRegister(comm_state->comm, addr.opaque(),
-                                              addr.size(), &handle));
+    ncclResult_t nccl_status =
+        ncclCommRegister(comm_state->comm, addr.opaque(), addr.size(), &handle);
+    RETURN_IF_ERROR(XLA_NCCL_STATUS(nccl_status));
+    if (nccl_status == ncclInProgress) {
+      // NCCL retains `&handle` until completion, so this poll cannot be
+      // cancelled without invalidating an output pointer still owned by NCCL.
+      RETURN_IF_ERROR(
+          ::xla::gpu::PollUntilDone(comm_state->comm, never_cancelled));
+    }
   }
-  return absl::WrapUnique(new NcclRegisteredMemory(comm_state, handle, addr));
+  return absl::WrapUnique(new NcclRegisteredMemory(
+      comm_state, handle, addr, std::move(executor), stream_executor));
 }
 
 NcclRegisteredMemory::~NcclRegisteredMemory() {
-  VLOG(3) << absl::StrFormat("Destroy %v", *this);
-  absl::MutexLock lock(comm_->mutex);
-  XLA_NCCL_LOG_IF_ERROR(ncclCommDeregister(comm_->comm, handle_));
+  absl::Status status =
+      Execute(
+          [this] {
+            auto activation = stream_executor_->Activate();
+            VLOG(3) << absl::StrFormat("Destroy %v", *this);
+            absl::MutexLock lock(comm_->mutex);
+            ncclResult_t nccl_status = ncclCommDeregister(comm_->comm, handle_);
+            RETURN_IF_ERROR(XLA_NCCL_STATUS(nccl_status));
+            if (nccl_status == ncclInProgress) {
+              CancellationToken never_cancelled;
+              RETURN_IF_ERROR(
+                  ::xla::gpu::PollUntilDone(comm_->comm, never_cancelled));
+            }
+            return absl::OkStatus();
+          },
+          executor_, owner_thread_id_)
+          .Await();
+  if (!status.ok()) {
+    LOG(ERROR) << "Failed to destroy NCCL registered memory: " << status;
+  }
 }
 
 stream_executor::DeviceAddressBase NcclRegisteredMemory::addr() const {

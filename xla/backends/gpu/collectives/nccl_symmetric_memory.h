@@ -19,6 +19,7 @@ limitations under the License.
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -68,12 +69,15 @@ class NcclSymmetricMemory final : public SymmetricMemory {
   NcclSymmetricMemory(std::shared_ptr<NcclCommState> comm_state,
                       ncclWindow_t win, stream_executor::DeviceAddressBase addr,
                       std::shared_ptr<tsl::Executor> executor,
+                      stream_executor::StreamExecutor* stream_executor,
                       uint64_t validated_device_abi_version);
 
   std::shared_ptr<NcclCommState> comm_state_;
   ncclWindow_t win_;
   stream_executor::DeviceAddressBase addr_;
   std::shared_ptr<tsl::Executor> executor_;
+  stream_executor::StreamExecutor* stream_executor_;
+  std::thread::id owner_thread_id_;
 };
 
 }  // namespace xla::gpu

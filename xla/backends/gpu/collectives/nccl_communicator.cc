@@ -23,6 +23,7 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -585,12 +586,13 @@ absl::Status NcclCapabilities::GetOneSidedCommUnsupportedError(
 NcclCommunicator::NcclCommunicator(se::StreamExecutor* stream_executor,
                                    std::shared_ptr<NcclCommState> comm,
                                    std::unique_ptr<tsl::Executor> executor,
-                                   std::shared_ptr<CancellationToken> cancel)
+                                   std::shared_ptr<CancellationToken> cancel,
+                                   NcclCapabilities capabilities)
     : stream_executor_(stream_executor),
       comm_(std::move(comm)),
       executor_(std::move(executor)),
-      cancel_(std::move(cancel)) {
-  capabilities_ = GetCapabilities(comm_);
+      cancel_(std::move(cancel)),
+      capabilities_(std::move(capabilities)) {
   VLOG(1) << absl::StreamFormat("[%d] Created NCCL communicator %v",
                                 stream_executor_->device_ordinal(), *this);
 }
@@ -628,7 +630,8 @@ NcclCommunicator::CreateRegisteredMemory(se::DeviceAddressBase addr) {
           return FailedPrecondition("NcclCommunicator aborted");
         }
 
-        return NcclRegisteredMemory::Create(comm_, addr);
+        return NcclRegisteredMemory::Create(comm_, addr, executor_,
+                                            stream_executor_);
       });
 }
 
@@ -670,8 +673,11 @@ absl::StatusOr<std::unique_ptr<NcclCommunicator>> NcclCommunicator::Create(
     // calling thread.
     ASSIGN_OR_RETURN(ncclComm_t comm, f());
     auto comm_state = std::make_shared<NcclCommState>(comm);
+    auto activation = stream_executor->Activate();
+    NcclCapabilities capabilities = GetCapabilities(comm_state);
     return absl::WrapUnique(new NcclCommunicator(stream_executor, comm_state,
-                                                 nullptr, std::move(cancel)));
+                                                 nullptr, std::move(cancel),
+                                                 std::move(capabilities)));
   }
 
   // If this NcclCommunicator is asynchronous, then all operations on the
@@ -681,8 +687,15 @@ absl::StatusOr<std::unique_ptr<NcclCommunicator>> NcclCommunicator::Create(
   ASSIGN_OR_RETURN(ncclComm_t comm,
                    MakeFutureOn<ncclComm_t>(*executor, f).Await());
   auto comm_state = std::make_shared<NcclCommState>(comm);
-  return absl::WrapUnique(new NcclCommunicator(
-      stream_executor, comm_state, std::move(executor), std::move(cancel)));
+  ASSIGN_OR_RETURN(
+      NcclCapabilities capabilities,
+      MakeFutureOn<NcclCapabilities>(*executor, [stream_executor, comm_state] {
+        auto activation = stream_executor->Activate();
+        return GetCapabilities(comm_state);
+      }).Await());
+  return absl::WrapUnique(
+      new NcclCommunicator(stream_executor, comm_state, std::move(executor),
+                           std::move(cancel), std::move(capabilities)));
 }
 
 NcclCommunicator::~NcclCommunicator() {
@@ -1438,6 +1451,7 @@ NcclDeviceCommunicator::NcclDeviceCommunicator(
       parent_comm_(parent_comm),
       stream_executor_(stream_executor),
       executor_(std::move(executor)),
+      owner_thread_id_(std::this_thread::get_id()),
       dev_comm_(dev_comm),
       info_(std::move(info)) {}
 
@@ -1449,14 +1463,22 @@ NcclDeviceCommunicator::~NcclDeviceCommunicator() {
     auto activation = stream_executor_->Activate();
     {
       absl::MutexLock lock(parent_comm_->mutex);
-      return XLA_NCCL_STATUS(
-          ncclDevCommDestroy(parent_comm_->comm, &dev_comm_));
+      ncclResult_t nccl_status =
+          ncclDevCommDestroy(parent_comm_->comm, &dev_comm_);
+      RETURN_IF_ERROR(XLA_NCCL_STATUS(nccl_status));
+      if (nccl_status == ncclInProgress) {
+        CancellationToken never_cancelled;
+        RETURN_IF_ERROR(
+            ::xla::gpu::PollUntilDone(parent_comm_->comm, never_cancelled));
+      }
+      return absl::OkStatus();
     }
   };
 
-  auto future = executor_
-                    ? MakeFutureOn<void>(*executor_, std::move(destroy_fn))
-                    : Future<>(std::move(destroy_fn)());
+  auto future =
+      executor_ != nullptr && std::this_thread::get_id() != owner_thread_id_
+          ? MakeFutureOn<void>(*executor_, std::move(destroy_fn))
+          : Future<>(std::move(destroy_fn)());
   absl::Status s = future.Await();
   if (!s.ok()) {
     LOG(ERROR) << "Failed to destroy device comm: " << s;
@@ -1484,17 +1506,30 @@ NcclDeviceCommunicator::CreateFrom(const NcclCommunicator& comm,
   ncclDevComm dev_comm{};
   {
     absl::MutexLock lock(comm_state->mutex);
-    RETURN_IF_ERROR(XLA_NCCL_STATUS(
-        ncclDevCommCreate(comm_state->comm, &plan.requirements, &dev_comm)));
+    ncclResult_t status =
+        ncclDevCommCreate(comm_state->comm, &plan.requirements, &dev_comm);
+    RETURN_IF_ERROR(XLA_NCCL_STATUS(status));
+    if (status == ncclInProgress) {
+      // The output object is not valid until the operation has completed.
+      // NCCL retains a pointer to `dev_comm` until completion, so cancellation
+      // must not let this stack frame return while the operation is pending.
+      CancellationToken never_cancelled;
+      RETURN_IF_ERROR(
+          ::xla::gpu::PollUntilDone(comm_state->comm, never_cancelled));
+    }
   }
 
   absl::StatusOr<Info> info =
       BuildNcclDeviceCommInfo(requirements, plan, comm.capabilities_, dev_comm);
   if (!info.ok()) {
     absl::MutexLock lock(comm_state->mutex);
-    if (absl::Status cleanup =
-            XLA_NCCL_STATUS(ncclDevCommDestroy(comm_state->comm, &dev_comm));
-        !cleanup.ok()) {
+    ncclResult_t nccl_status = ncclDevCommDestroy(comm_state->comm, &dev_comm);
+    absl::Status cleanup = XLA_NCCL_STATUS(nccl_status);
+    if (cleanup.ok() && nccl_status == ncclInProgress) {
+      CancellationToken never_cancelled;
+      cleanup = ::xla::gpu::PollUntilDone(comm_state->comm, never_cancelled);
+    }
+    if (!cleanup.ok()) {
       LOG(ERROR) << "Failed to destroy invalid NCCL device communicator: "
                  << cleanup;
     }

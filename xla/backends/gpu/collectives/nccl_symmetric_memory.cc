@@ -18,6 +18,7 @@ limitations under the License.
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "absl/functional/any_invocable.h"
@@ -27,6 +28,8 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/synchronization/mutex.h"
+#include "xla/tsl/platform/status_macros.h"
+#include "xla/backends/gpu/collectives/cancellation_token.h"
 #include "xla/backends/gpu/collectives/nccl_errors.h"
 #include "xla/backends/gpu/collectives/nccl_types.h"
 #include "xla/core/collectives/rank_id.h"
@@ -44,9 +47,20 @@ namespace xla::gpu {
 namespace {
 
 Future<> Execute(absl::AnyInvocable<absl::Status() &&> f,
-                 std::shared_ptr<tsl::Executor> executor) {
-  return executor ? MakeFutureOn<void>(*executor, std::move(f))
-                  : Future<>(std::move(f)());
+                 const std::shared_ptr<tsl::Executor>& executor,
+                 std::thread::id owner_thread_id) {
+  return executor != nullptr && std::this_thread::get_id() != owner_thread_id
+             ? MakeFutureOn<void>(*executor, std::move(f))
+             : Future<>(std::move(f)());
+}
+
+template <typename T>
+absl::StatusOr<T> ExecuteAwait(absl::AnyInvocable<absl::StatusOr<T>() &&> f,
+                               const std::shared_ptr<tsl::Executor>& executor,
+                               std::thread::id owner_thread_id) {
+  return executor != nullptr && std::this_thread::get_id() != owner_thread_id
+             ? MakeFutureOn<T>(*executor, std::move(f)).Await()
+             : std::move(f)();
 }
 
 void LogInterconnectStatus(stream_executor::StreamExecutor* stream_executor) {
@@ -84,18 +98,27 @@ NcclSymmetricMemory::NcclSymmetricMemory(
     std::shared_ptr<NcclCommState> comm_state, ncclWindow_t win,
     stream_executor::DeviceAddressBase addr,
     std::shared_ptr<tsl::Executor> executor,
+    stream_executor::StreamExecutor* stream_executor,
     uint64_t validated_device_abi_version)
     : SymmetricMemory(kNcclWindowAbiSchema, validated_device_abi_version),
       comm_state_(comm_state),
       win_(win),
       addr_(addr),
-      executor_(executor) {}
+      executor_(std::move(executor)),
+      stream_executor_(stream_executor),
+      owner_thread_id_(std::this_thread::get_id()) {}
 
 absl::StatusOr<std::unique_ptr<NcclSymmetricMemory>>
 NcclSymmetricMemory::Create(std::shared_ptr<NcclCommState> comm_state,
                             stream_executor::DeviceAddressBase addr,
                             const std::shared_ptr<tsl::Executor> executor,
                             stream_executor::StreamExecutor* stream_executor) {
+  if (stream_executor == nullptr) {
+    return absl::InvalidArgumentError(
+        "StreamExecutor is required to create NCCL symmetric memory");
+  }
+  auto activation = stream_executor->Activate();
+
   int runtime_version = 0;
   XLA_NCCL_RETURN_IF_ERROR(ncclGetVersion(&runtime_version));
   if (absl::Status status =
@@ -104,40 +127,60 @@ NcclSymmetricMemory::Create(std::shared_ptr<NcclCommState> comm_state,
     return status;
   }
 
-  ncclWindow_t win;
-  ncclResult_t nccl_status;
+  ncclWindow_t win = nullptr;
+  absl::Status registration_status;
+  CancellationToken never_cancelled;
   {
     VLOG(3) << absl::StrFormat(
         "Create NCCL symmetric memory on comm=%p from: ptr=%p; size=%ld",
         comm_state->comm, addr.opaque(), addr.size());
     absl::MutexLock lock(comm_state->mutex);
-    nccl_status =
+    ncclResult_t status =
         ncclCommWindowRegister(comm_state->comm, addr.opaque(), addr.size(),
                                &win, NCCL_WIN_COLL_SYMMETRIC);
+    registration_status = XLA_NCCL_STATUS(status);
+    if (registration_status.ok() && status == ncclInProgress) {
+      // ncclCommWindowRegister may return ncclInProgress for a non-blocking
+      // communicator. Do not publish the window until NCCL has initialized it.
+      // NCCL retains `&win` until completion, so this poll cannot be cancelled
+      // without invalidating an output pointer still owned by NCCL.
+      registration_status =
+          ::xla::gpu::PollUntilDone(comm_state->comm, never_cancelled);
+    }
   }
 
-  if (nccl_status != ncclSuccess) {
+  if (!registration_status.ok()) {
     LogInterconnectStatus(stream_executor);
-    return XLA_NCCL_STATUS(nccl_status);
+    return registration_status;
   }
 
-  return absl::WrapUnique(new NcclSymmetricMemory(comm_state, win, addr,
-                                                  executor, runtime_version));
+  return absl::WrapUnique(new NcclSymmetricMemory(
+      comm_state, win, addr, executor, stream_executor, runtime_version));
 }
 
 NcclSymmetricMemory::~NcclSymmetricMemory() {
   absl::Status status =
       Execute(
           [&] {
+            auto activation = stream_executor_->Activate();
             VLOG(3) << absl::StrFormat(
                 "Destroy %v with addr=%p, size=%ld executor=%p", *this,
                 addr_.opaque(), addr_.size(), executor_.get());
             absl::MutexLock lock(comm_state_->mutex);
-            XLA_NCCL_LOG_IF_ERROR(
-                ncclCommWindowDeregister(comm_state_->comm, win_));
+            ncclResult_t nccl_status =
+                ncclCommWindowDeregister(comm_state_->comm, win_);
+            RETURN_IF_ERROR(XLA_NCCL_STATUS(nccl_status));
+            if (nccl_status == ncclInProgress) {
+              // Teardown must not release the window while NCCL still owns it.
+              // Do not use the clique cancellation token: cancellation is
+              // precisely when deterministic teardown matters most.
+              CancellationToken never_cancelled;
+              RETURN_IF_ERROR(::xla::gpu::PollUntilDone(comm_state_->comm,
+                                                        never_cancelled));
+            }
             return absl::OkStatus();
           },
-          executor_)
+          executor_, owner_thread_id_)
           .Await();
   if (!status.ok()) {
     LOG(ERROR) << "Failed to destroy NCCL symmetric memory: " << status;
@@ -150,33 +193,62 @@ stream_executor::DeviceAddressBase NcclSymmetricMemory::addr() const {
 
 absl::StatusOr<stream_executor::DeviceAddressBase>
 NcclSymmetricMemory::multimem_addr() const {
+  return ExecuteAwait<stream_executor::DeviceAddressBase>(
+      [this]() -> absl::StatusOr<stream_executor::DeviceAddressBase> {
+        auto activation = stream_executor_->Activate();
 #if (NCCL_VERSION_CODE >= 22900) || defined(USE_NCCL_HOST_API)
-  void* multimem = nullptr;
-  XLA_NCCL_RETURN_IF_ERROR(ncclGetLsaMultimemDevicePointer(win_, 0, &multimem));
-  if (multimem) {
-    return stream_executor::DeviceAddressBase(multimem, addr_.size());
-  }
+        void* multimem = nullptr;
+        {
+          absl::MutexLock lock(comm_state_->mutex);
+          ncclResult_t nccl_status =
+              ncclGetLsaMultimemDevicePointer(win_, 0, &multimem);
+          RETURN_IF_ERROR(XLA_NCCL_STATUS(nccl_status));
+          if (nccl_status == ncclInProgress) {
+            CancellationToken never_cancelled;
+            RETURN_IF_ERROR(
+                ::xla::gpu::PollUntilDone(comm_state_->comm, never_cancelled));
+          }
+        }
+        if (multimem) {
+          return stream_executor::DeviceAddressBase(multimem, addr_.size());
+        }
 #endif
-  return absl::UnimplementedError(
-      "Multimem not supported on this NCCL version or device");
+        return absl::UnimplementedError(
+            "Multimem not supported on this NCCL version or device");
+      },
+      executor_, owner_thread_id_);
 }
 
 absl::StatusOr<stream_executor::DeviceAddressBase>
 NcclSymmetricMemory::peer_addr(RankId peer) const {
+  return ExecuteAwait<stream_executor::DeviceAddressBase>(
+      [this, peer]() -> absl::StatusOr<stream_executor::DeviceAddressBase> {
+        auto activation = stream_executor_->Activate();
 #if (NCCL_VERSION_CODE >= 22902) || defined(USE_NCCL_HOST_API)
-  void* peer_addr = nullptr;
-  XLA_NCCL_RETURN_IF_ERROR(
-      ncclGetPeerDevicePointer(win_, 0, peer.value(), &peer_addr));
-  if (peer_addr) {
-    return stream_executor::DeviceAddressBase(peer_addr, addr_.size());
-  }
-  return absl::FailedPreconditionError(absl::StrFormat(
-      "Peer rank %d is not load/store accessible from this rank",
-      peer.value()));
+        void* peer_addr = nullptr;
+        {
+          absl::MutexLock lock(comm_state_->mutex);
+          ncclResult_t nccl_status =
+              ncclGetPeerDevicePointer(win_, 0, peer.value(), &peer_addr);
+          RETURN_IF_ERROR(XLA_NCCL_STATUS(nccl_status));
+          if (nccl_status == ncclInProgress) {
+            CancellationToken never_cancelled;
+            RETURN_IF_ERROR(
+                ::xla::gpu::PollUntilDone(comm_state_->comm, never_cancelled));
+          }
+        }
+        if (peer_addr) {
+          return stream_executor::DeviceAddressBase(peer_addr, addr_.size());
+        }
+        return absl::FailedPreconditionError(absl::StrFormat(
+            "Peer rank %d is not load/store accessible from this rank",
+            peer.value()));
 #else
-  return absl::UnimplementedError(
-      "Peer address requires ncclGetPeerDevicePointer (NCCL >= 2.29.2)");
+        return absl::UnimplementedError(
+            "Peer address requires ncclGetPeerDevicePointer (NCCL >= 2.29.2)");
 #endif
+      },
+      executor_, owner_thread_id_);
 }
 
 std::string NcclSymmetricMemory::ToString() const {

@@ -482,7 +482,7 @@ TEST(NcclDeviceRequirementsTest, RejectsInvalidGinResourceCounts) {
   dev_comm.nRanks = 8;
   dev_comm.lsaRank = 0;
   dev_comm.lsaSize = 4;
-  dev_comm.ginConnectionCount = -1;
+  dev_comm.ginConnectionCount = 0;
   dev_comm.ginContextCount = 4;
   dev_comm.ginIsRailed = false;
 

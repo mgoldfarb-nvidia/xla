@@ -21,6 +21,7 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "absl/container/inlined_vector.h"
@@ -229,7 +230,8 @@ class NcclCommunicator : public GpuCommunicator {
   NcclCommunicator(se::StreamExecutor* stream_executor,
                    std::shared_ptr<NcclCommState> comm,
                    std::unique_ptr<tsl::Executor> executor,
-                   std::shared_ptr<CancellationToken> cancel);
+                   std::shared_ptr<CancellationToken> cancel,
+                   NcclCapabilities capabilities);
 
   absl::Status GroupLaunch(absl::FunctionRef<absl::Status()> group);
 
@@ -376,6 +378,7 @@ class NcclDeviceCommunicator : public GpuDeviceCommunicator {
   std::shared_ptr<NcclCommState> parent_comm_;
   se::StreamExecutor* stream_executor_;
   std::shared_ptr<tsl::Executor> executor_;
+  std::thread::id owner_thread_id_;
   ncclDevComm dev_comm_;
   Info info_;
 };
