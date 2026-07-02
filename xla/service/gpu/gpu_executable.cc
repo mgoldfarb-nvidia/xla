@@ -55,6 +55,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/collective_memory_requests.h"
 #include "xla/backends/gpu/runtime/collective_params.h"
 #include "xla/backends/gpu/runtime/command_buffer_conversion_pass.h"
+#include "xla/backends/gpu/runtime/deferred_gpu_execution_completion.h"
 #include "xla/backends/gpu/runtime/execution_stream_id.h"
 #include "xla/backends/gpu/runtime/sequential_thunk.h"
 #include "xla/backends/gpu/runtime/thunk.h"
@@ -90,7 +91,6 @@ limitations under the License.
 #include "xla/service/hlo_value.h"
 #include "xla/service/llvm_ir/buffer_assignment_util.h"
 #include "xla/service/maybe_owning_device_address.h"
-#include "xla/service/rendezvous.h"
 #include "xla/service/riegeli_dump_writer.h"
 #include "xla/service/service_executable_run_options.h"
 #include "xla/service/shaped_buffer.h"
@@ -539,12 +539,21 @@ absl::Status MaybeSyncAndProfile(const ServiceExecutableRunOptions* run_options,
 
 absl::Status RendezvousAfterInitialization(
     const ServiceExecutableRunOptions& run_options,
-    const DebugOptions* absl_nullable debug_options);
+    const DebugOptions* absl_nullable debug_options,
+    absl::Status initialization_status);
+
+absl::Status RendezvousAfterCollectiveResourceInitialization(
+    const ServiceExecutableRunOptions& run_options,
+    const DebugOptions* absl_nullable debug_options,
+    absl::Span<const GlobalDeviceId> participant_devices,
+    absl::Status initialization_status, size_t num_participants);
 
 absl::Status BarrierAfterExecutable(
     const ServiceExecutableRunOptions& run_options,
     const DebugOptions* absl_nullable debug_options,
-    absl::Span<se::Stream* const> streams_to_sync, size_t num_participants);
+    absl::Span<se::Stream* const> streams_to_sync,
+    absl::Span<const GlobalDeviceId> participant_devices,
+    size_t num_participants);
 
 absl::Status SynchronizeExecutionStreams(
     absl::Span<se::Stream* const> streams) {
@@ -560,6 +569,47 @@ absl::Status SynchronizeExecutionStreams(
       });
 }
 
+struct DeferredExecutionResources {
+  ThunkExecutor* thunk_executor = nullptr;
+  std::unique_ptr<CollectiveMemory> collective_memory;
+  std::unique_ptr<Thunk::ExecutionScopedState> execution_scoped_state;
+  std::unique_ptr<CollectiveParams> collective_params;
+  std::unique_ptr<CollectiveCliques> collective_cliques;
+  std::vector<StreamPool::Ptr> communication_streams;
+  std::vector<StreamPool::Ptr> compute_streams;
+  StreamPool::Ptr command_buffer_trace_stream;
+  std::unique_ptr<se::EventBasedTimer> execution_timer;
+  std::shared_ptr<void> progress_tracker;
+  std::shared_ptr<HangWatchdog::Guard> watchdog_guard;
+
+  void Release() {
+    if (thunk_executor != nullptr && execution_scoped_state != nullptr) {
+      absl::Status status =
+          thunk_executor->FinalizeOnError(execution_scoped_state.get());
+      if (!status.ok()) {
+        LOG(ERROR) << "Failed to finalize thunk execution after deferred GPU "
+                      "completion: "
+                   << status;
+      }
+    }
+
+    // Stop the watchdog before releasing the state it can inspect.
+    watchdog_guard.reset();
+
+    // Collective memory owns provider windows tied to clique lifetime.
+    collective_memory.reset();
+    execution_scoped_state.reset();
+    collective_params.reset();
+    collective_cliques.reset();
+
+    execution_timer.reset();
+    progress_tracker.reset();
+    command_buffer_trace_stream.reset();
+    communication_streams.clear();
+    compute_streams.clear();
+  }
+};
+
 absl::Status GpuExecutable::ExecuteThunksImpl(
     const DebugOptions* debug_options, const std::string& module_name,
     ModuleIdentifier module_id, ThunkExecutor& thunk_executor,
@@ -570,7 +620,8 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
         persistent_alloc_indices,
     GpuExecutable::NumAdditionalStreams num_additional_streams,
     CollectiveMemoryCache& collective_memory_cache,
-    bool collective_use_minimal_resource) {
+    bool collective_use_minimal_resource,
+    DeferredGpuExecution* deferred_execution) {
   bool mock_collectives =
       run_options->run_options().gpu_executable_run_options()
           ? run_options->run_options()
@@ -631,47 +682,8 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
     // that never finish and stall the stream execution.
     HangWatchdog::CancelCallback pre_abort;
     if (tracker.has_value()) {
-      pre_abort = [&tracker, progress_tracking_n, device_ordinal] {
-        auto log_progress = [&](auto label, auto thunks) {
-          LOG(ERROR) << absl::StreamFormat("[%d] %s: size=%d", device_ordinal,
-                                           label, thunks.size());
-          // We want to report all thunks in chronological order for
-          // readability according to the time they were executed.
-          absl::c_sort(thunks, [](const auto& a, const auto& b) {
-            return a.executed < b.executed;
-          });
-          for (auto& thunk : thunks) {
-            std::string loop_info;
-            for (const auto& state : thunk.loop_nest) {
-              absl::StrAppend(&loop_info,
-                              absl::StrFormat(" [%s iter=%d]", state.loop_name,
-                                              state.loop_iteration));
-            }
-            LOG(ERROR) << absl::StreamFormat(
-                "  - exec[%d] thunk[%d/%d] %v: %s at %s%s", thunk.exec_idx,
-                thunk.thunk_idx, tracker->num_thunks(), thunk.kind, thunk.name,
-                absl::FormatTime("%Y-%m-%d %H:%M:%S.%E6f", thunk.executed,
-                                 absl::LocalTimeZone()),
-                loop_info);
-          }
-        };
-
-        size_t num_executions = tracker->num_executions();
-        LOG(ERROR) << absl::StreamFormat(
-            "[%d] Completed thunks: %d/%d (unique thunks: %d)", device_ordinal,
-            tracker->NumCompletedThunks(), num_executions,
-            tracker->num_thunks());
-        LOG(ERROR) << absl::StreamFormat(
-            "[%d] Pending thunks: %d/%d (unique thunks: %d)", device_ordinal,
-            tracker->NumPendingThunks(), num_executions, tracker->num_thunks());
-
-        log_progress("Last completed thunks",
-                     tracker->LastCompletedThunks(progress_tracking_n));
-        log_progress("First pending thunks",
-                     tracker->FirstPendingThunks(progress_tracking_n));
-        log_progress("Last pending thunks",
-                     tracker->LastPendingThunks(progress_tracking_n));
-      };
+      pre_abort = tracker->MakeProgressReportCallback(progress_tracking_n,
+                                                      device_ordinal);
     }
 
     guard = HangWatchdog::Global().Watch(
@@ -757,11 +769,35 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
     RETURN_IF_ERROR(thunk_executor.Prepare(prepare_params));
   }
 
+  // Symmetric windows are registered over this execution's backing buffers.
+  // Any thunk that requests one therefore requires module-completion ordering
+  // before CollectiveMemory can deregister the window or release the buffer.
+  for (const auto& request :
+       collective_memory_requests.OrderedSymmetricAllocations()) {
+    RETURN_IF_ERROR(collective_clique_requests.RequestModuleExecutionBarrier(
+        request.clique));
+  }
+
   XLA_VLOG_DEVICE(3, run_options->device_ordinal()) << absl::StreamFormat(
       "Prepared GPU executable module: %s for execution: "
       "#collective=[cliques=%d, symmetric=%d]",
       module_name, collective_clique_requests.size(),
       collective_memory_requests.symmetric_size());
+
+  // A remote completion agreement is per execution, and concurrent launches
+  // can reach it in different orders on different processes. A globally
+  // coordinated launch id gives each execution an independent agreement scope
+  // and prevents mis-paired rounds. Reject missing ids before any
+  // device-communication work is submitted.
+  if (collective_clique_requests.BarrierRequiresRemoteParticipants() &&
+      collective_params.launch_id == 0) {
+    absl::Status status = FailedPrecondition(
+        "Non-local device communication requires a non-zero, globally "
+        "coordinated execution launch id that is unique among concurrently "
+        "in-flight distributed launches");
+    status.Update(thunk_executor.FinalizeOnError(&execution_scoped_state));
+    return status;
+  }
 
   std::vector<std::unique_ptr<CliqueKey>>* clique_keys =
       run_options->run_options().clique_keys();
@@ -772,19 +808,303 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
     }
   }
 
+  // Device-communication resource initialization must converge process
+  // locally before any participant starts executing. A rank that fails while
+  // acquiring a later overlapping clique otherwise returns early while a
+  // successful sibling can proceed and later wait forever in the module
+  // completion rendezvous.
+  absl::flat_hash_set<GlobalDeviceId> requested_barrier_devices =
+      collective_clique_requests.GetDevicesRequiringBarrier();
+  std::vector<GlobalDeviceId> barrier_participant_devices(
+      requested_barrier_devices.begin(), requested_barrier_devices.end());
+  absl::c_sort(barrier_participant_devices);
+  bool barrier_requires_remote_participants =
+      collective_clique_requests.BarrierRequiresRemoteParticipants();
+
   // Acquire collective cliques requested by thunks.
   CollectiveCliques collective_cliques;
+  absl::Status collective_resource_status;
   if (!mock_collectives) {
-    ASSIGN_OR_RETURN(collective_cliques,
-                     AcquireCollectiveCliques(collective_params,
-                                              collective_clique_requests));
+    absl::StatusOr<CollectiveCliques> collective_cliques_or =
+        AcquireCollectiveCliques(collective_params, collective_clique_requests);
+    if (collective_cliques_or.ok()) {
+      collective_cliques = std::move(*collective_cliques_or);
+    } else {
+      collective_resource_status = collective_cliques_or.status();
+    }
   }
 
-  // Acquire collective memories requested by thunks.
-  ASSIGN_OR_RETURN(CollectiveMemory collective_memory,
-                   AcquireCollectiveMemory(
-                       collective_params, collective_cliques,
-                       collective_memory_requests, collective_memory_cache));
+  // Acquire collective memories only after all cliques for this rank are
+  // available. AcquireCollectiveMemory poisons every acquired clique on a
+  // local failure; the process-local rendezvous below broadcasts that failure
+  // so successful siblings poison their disjoint cliques as well.
+  std::optional<CollectiveMemory> collective_memory;
+  if (collective_resource_status.ok()) {
+    absl::StatusOr<CollectiveMemory> collective_memory_or =
+        AcquireCollectiveMemory(collective_params, collective_cliques,
+                                collective_memory_requests,
+                                collective_memory_cache);
+    if (collective_memory_or.ok()) {
+      collective_memory.emplace(std::move(*collective_memory_or));
+    } else {
+      collective_resource_status = collective_memory_or.status();
+    }
+  }
+
+  if (requested_barrier_devices.contains(collective_params.global_device_id)) {
+    bool joined_resource_rendezvous = false;
+    absl::Status converged_status = MaybeRunGpuExecutableCompletionBarrier(
+        requested_barrier_devices, collective_params.global_device_id,
+        collective_params.global_device_id_map, absl::OkStatus(),
+        [&](size_t num_local_barrier_participants) {
+          joined_resource_rendezvous = true;
+          return RendezvousAfterCollectiveResourceInitialization(
+              *run_options, debug_options, barrier_participant_devices,
+              collective_resource_status, num_local_barrier_participants);
+        });
+    if (joined_resource_rendezvous) {
+      collective_resource_status = std::move(converged_status);
+    } else {
+      // Preserve a local acquisition failure as the primary status if an
+      // inconsistent device map prevents entering the rendezvous.
+      collective_resource_status.Update(std::move(converged_status));
+    }
+  }
+
+  std::vector<se::Stream*> completion_streams = {
+      main_stream, command_buffer_trace_stream,
+      run_options->run_options().device_to_host_stream(),
+      run_options->run_options().host_to_device_stream()};
+  completion_streams.insert(completion_streams.end(),
+                            communication_streams.streams.begin(),
+                            communication_streams.streams.end());
+  completion_streams.insert(completion_streams.end(),
+                            compute_streams.streams.begin(),
+                            compute_streams.streams.end());
+
+  // Moves every execution-scoped object that asynchronous local or remote
+  // device work can still reference into one deferred lease. The PJRT caller
+  // appends backing-buffer, result, executable, and main-stream ownership
+  // before arming the lease.
+  auto retain_execution_resources = [&]() {
+    std::shared_ptr<void> retained_tracker;
+    if (tracker.has_value()) {
+      retained_tracker = tracker->DeactivateAndRetain();
+    }
+
+    auto resources = std::make_shared<DeferredExecutionResources>();
+    resources->thunk_executor = &thunk_executor;
+    if (collective_memory.has_value()) {
+      resources->collective_memory =
+          std::make_unique<CollectiveMemory>(std::move(*collective_memory));
+    }
+    resources->execution_scoped_state =
+        std::make_unique<Thunk::ExecutionScopedState>(
+            std::move(execution_scoped_state));
+    resources->collective_params =
+        std::make_unique<CollectiveParams>(std::move(collective_params));
+    resources->collective_cliques =
+        std::make_unique<CollectiveCliques>(std::move(collective_cliques));
+    resources->communication_streams = std::move(communication_streams.owners);
+    resources->compute_streams = std::move(compute_streams.owners);
+    resources->command_buffer_trace_stream =
+        std::move(borrowed_command_buffer_trace_stream);
+    resources->execution_timer = std::move(execution_timer);
+    resources->progress_tracker = std::move(retained_tracker);
+    resources->watchdog_guard = std::move(guard);
+    return resources;
+  };
+
+  if (!collective_resource_status.ok()) {
+    absl::Status status =
+        collective_cliques.PoisonAll(collective_resource_status);
+
+    // A host-side communicator abort does not prove that a remote device
+    // kernel has stopped accessing this rank's buffers. Retain the full
+    // execution lease for process lifetime just like a post-launch remote
+    // failure. All-local participants converged above and can unwind safely.
+    if (barrier_requires_remote_participants) {
+      GpuExecutableErrorCleanupDisposition disposition =
+          GetGpuExecutableErrorCleanupDisposition(
+              GpuExecutableCompletionBarrierState::kRemote,
+              deferred_execution != nullptr,
+              deferred_execution != nullptr &&
+                  deferred_execution->completion_cleanup_enabled());
+      if (disposition != GpuExecutableErrorCleanupDisposition::kQuarantine) {
+        LOG(FATAL) << "Collective resource initialization failed before "
+                      "remote device-communication quiescence, but this "
+                      "execution API cannot retain its buffers and executable";
+        return status;
+      }
+      CHECK(deferred_execution != nullptr);
+      auto resources = retain_execution_resources();
+      absl::Status defer_status = deferred_execution->Defer(
+          main_stream, completion_streams, [resources]() mutable {
+            resources->Release();
+            resources.reset();
+          });
+      if (!defer_status.ok()) {
+        LOG(FATAL) << "Failed to retain resources after unsafe collective "
+                      "resource initialization failure: "
+                   << defer_status;
+      }
+      absl::Status quarantine_status =
+          deferred_execution->Quarantine(absl::FailedPreconditionError(
+              "remote device-communication quiescence is unknown after "
+              "collective resource initialization failure"));
+      if (!quarantine_status.ok()) {
+        LOG(FATAL) << "Failed to quarantine unsafe collective resource "
+                      "initialization failure: "
+                   << quarantine_status;
+      }
+      return status;
+    }
+
+    status.Update(thunk_executor.FinalizeOnError(&execution_scoped_state));
+    return status;
+  }
+  TF_RET_CHECK(collective_memory.has_value());
+
+  // Collective kernel thunks may require all local participants to finish
+  // before any participant releases symmetric-memory registrations or an
+  // executable module containing multimem handlers. Preserve that ordering on
+  // both success and failure paths.
+  auto run_completion_barrier = [&]() {
+    absl::Status local_status = MaybeRunGpuExecutableCompletionBarrier(
+        requested_barrier_devices, collective_params.global_device_id,
+        collective_params.global_device_id_map, absl::OkStatus(),
+        [&](size_t num_local_barrier_participants) {
+          XLA_VLOG_DEVICE(1, collective_params.global_device_id.value())
+              << "Barrier after executable required by participants: ("
+              << absl::StrJoin(requested_barrier_devices, ", ") << ")";
+          return BarrierAfterExecutable(
+              *run_options, debug_options, completion_streams,
+              barrier_participant_devices, num_local_barrier_participants);
+        });
+    if (!barrier_requires_remote_participants) {
+      return local_status;
+    }
+
+    // The process-local barrier proves only that local streams have stopped
+    // using communication-enabled memory. A provider-native clique barrier is
+    // required before any process can release registrations, buffers, or
+    // modules that a remote rank could still access.
+    return collective_cliques.RunCompletionBarriers(collective_params,
+                                                    collective_clique_requests,
+                                                    main_stream, local_status);
+  };
+
+  // On an error, retain everything asynchronous device work can still
+  // reference until all execution streams reach a proven-safe tail, and only
+  // then finalize host state. The caller adds buffer/output and executable
+  // ownership and arms the resulting lease before returning the error.
+  auto defer_execution_error =
+      [&](absl::Status status, std::optional<bool> completion_barrier_result =
+                                   std::nullopt) -> absl::Status {
+    GpuExecutableCompletionBarrierState barrier_state =
+        GpuExecutableCompletionBarrierState::kNotRequired;
+
+    // An execution failure before clique-wide completion can strand another
+    // rank in a device-communication kernel. Abort every affected communicator
+    // before any stream synchronization or local rendezvous. A completion
+    // barrier that already succeeded proved remote quiescence and must not
+    // poison an otherwise reusable clique for a later local profiling error.
+    if (!requested_barrier_devices.empty() &&
+        !completion_barrier_result.value_or(false)) {
+      status = collective_cliques.PoisonCompletionBarriers(
+          collective_clique_requests, status);
+    }
+
+    // Every local participant must join the value-carrying completion
+    // rendezvous even after one participant fails. Otherwise a successful
+    // sibling can wait forever as the only local caller. The communicator was
+    // poisoned above, so remote/device work is first driven to a terminal
+    // error; the local rendezvous then broadcasts one cleanup decision.
+    if (!requested_barrier_devices.empty() &&
+        !completion_barrier_result.has_value()) {
+      absl::Status barrier_status = run_completion_barrier();
+      if (!barrier_status.ok()) {
+        LOG(ERROR) << "GPU executable completion barrier failed while "
+                      "handling an execution error: "
+                   << barrier_status;
+      }
+      status.Update(barrier_status);
+      completion_barrier_result = barrier_status.ok();
+    }
+
+    // A per-device stream tail is not enough for device communication: a
+    // different GPU may still be remotely accessing this GPU's memory or
+    // executing a kernel backed by this executable's module. A successful
+    // local plus provider barrier proves quiescence. A failed local barrier or
+    // a failed/aborted non-local barrier requires permanent quarantine.
+    if (!requested_barrier_devices.empty() &&
+        completion_barrier_result.value_or(false)) {
+      barrier_state = GpuExecutableCompletionBarrierState::kSucceeded;
+    } else if (barrier_requires_remote_participants) {
+      barrier_state = GpuExecutableCompletionBarrierState::kRemote;
+    } else if (!requested_barrier_devices.empty()) {
+      barrier_state = *completion_barrier_result
+                          ? GpuExecutableCompletionBarrierState::kSucceeded
+                          : GpuExecutableCompletionBarrierState::kFailed;
+    }
+
+    GpuExecutableErrorCleanupDisposition disposition =
+        GetGpuExecutableErrorCleanupDisposition(
+            barrier_state, deferred_execution != nullptr,
+            deferred_execution != nullptr &&
+                deferred_execution->completion_cleanup_enabled());
+
+    if (disposition == GpuExecutableErrorCleanupDisposition::kFatal) {
+      LOG(FATAL) << "GPU execution failed before device-communication "
+                    "quiescence, but this execution API cannot retain its "
+                    "buffers and executable safely";
+      return status;
+    }
+
+    if (disposition == GpuExecutableErrorCleanupDisposition::kSynchronous) {
+      status.Update(SynchronizeExecutionStreams(completion_streams));
+      status.Update(thunk_executor.FinalizeOnError(&execution_scoped_state));
+      return status;
+    }
+
+    auto resources = retain_execution_resources();
+
+    absl::Status defer_status = deferred_execution->Defer(
+        main_stream, completion_streams, [resources]() mutable {
+          resources->Release();
+          resources.reset();
+        });
+    status.Update(defer_status);
+    if (!defer_status.ok()) {
+      if (disposition == GpuExecutableErrorCleanupDisposition::kQuarantine) {
+        LOG(FATAL) << "Failed to retain resources after an unsafe "
+                      "device-communication execution failure: "
+                   << defer_status;
+      }
+      // Defer can fail only for an internal lifecycle violation. Drain before
+      // allowing the local resource owner to unwind.
+      status.Update(SynchronizeExecutionStreams(completion_streams));
+      resources->Release();
+    } else if (disposition ==
+               GpuExecutableErrorCleanupDisposition::kQuarantine) {
+      // Local stream completion cannot prove that another rank has stopped
+      // remotely accessing this rank's memory when the clique spans processes
+      // or an all-local completion barrier failed. Retain the entire lease for
+      // process lifetime; failure handling is expected to terminate or replace
+      // the failed clique session.
+      absl::Status quarantine_status =
+          deferred_execution->Quarantine(absl::FailedPreconditionError(
+              "device-communication quiescence is unknown after GPU "
+              "execution or completion-barrier failure"));
+      if (!quarantine_status.ok()) {
+        LOG(FATAL) << "Failed to quarantine an unsafe "
+                      "device-communication execution: "
+                   << quarantine_status;
+      }
+    }
+    return status;
+  };
+
   {  // Initialize thunks using prepared resources before execution.
     Thunk::InitializeParams initialize_params{
         executor,
@@ -794,42 +1114,33 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
         command_buffer_trace_stream,
         &collective_params,
         &collective_cliques,
-        &collective_memory,
+        &*collective_memory,
         run_options->run_options().ffi_execution_context(),
         run_options->local_device_count(),
         &execution_scoped_state};
     initialize_params.persistent_alloc_indices = persistent_alloc_indices;
 
     tsl::profiler::TraceMe trace_initialize("Thunks::Initialize");
-    RETURN_IF_ERROR(thunk_executor.Initialize(initialize_params));
-  }
-
-  // Join a round of rendezvous after thunk initialization. We do this only in
-  // presence of newly acquired collective cliques which means that we have
-  // collective operations and clique initialization is famous for introducing
-  // deadlocks if we try to execute it concurrently with other potentially
-  // memory-allocating operations.
-  if (!collective_cliques.empty()) {
-    RETURN_IF_ERROR(RendezvousAfterInitialization(*run_options, debug_options));
+    absl::Status initialize_status =
+        thunk_executor.Initialize(initialize_params);
+    // Every local participant joins with its Initialize result. A failing rank
+    // must not skip directly to the completion rendezvous while successful
+    // siblings are still waiting in the initialization phase.
+    if (!collective_cliques.empty()) {
+      initialize_status = RendezvousAfterInitialization(
+          *run_options, debug_options, std::move(initialize_status));
+    }
+    if (!initialize_status.ok()) {
+      return defer_execution_error(std::move(initialize_status));
+    }
   }
 
   // Prepare parameters for thunks execution.
   Thunk::ExecuteParams execute_params = Thunk::ExecuteParams::Create(
       *run_options, buffer_allocations, main_stream,
       command_buffer_trace_stream, &collective_params, &collective_cliques,
-      &collective_memory, std::move(compute_streams.streams),
+      &*collective_memory, std::move(compute_streams.streams),
       &execution_scoped_state, persistent_alloc_indices);
-
-  std::vector<se::Stream*> completion_streams = {
-      main_stream, execute_params.command_buffer_trace_stream,
-      execute_params.device_to_host_stream,
-      execute_params.host_to_device_stream};
-  completion_streams.insert(completion_streams.end(),
-                            collective_params.async_streams.begin(),
-                            collective_params.async_streams.end());
-  completion_streams.insert(completion_streams.end(),
-                            execute_params.additional_compute_streams.begin(),
-                            execute_params.additional_compute_streams.end());
 
   XLA_VLOG_DEVICE(1, run_options->device_ordinal())
       << "Start GpuExecutable::ExecuteOnStream module: " << module_name;
@@ -837,63 +1148,39 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
   XLA_VLOG_DEVICE(1, run_options->device_ordinal())
       << "End GpuExecutable::ExecuteOnStream module: " << module_name;
 
-  // An execution error can skip async-done thunks, leaving device work and
-  // AsyncExecution host state outstanding. Drain every stream before closing
-  // those scopes so buffers, collective memory, and clique resources cannot be
-  // released while an asynchronous kernel is still using them.
   if (!execute_status.ok()) {
-    execute_status.Update(SynchronizeExecutionStreams(completion_streams));
-    execute_status.Update(
-        thunk_executor.FinalizeOnError(&execution_scoped_state));
+    return defer_execution_error(std::move(execute_status));
   }
 
-  // Collective kernel thunks may request a barrier after the module execution.
-  // This might be needed for several reasons:
+  // The completion barrier might be needed for several reasons:
   // 1. To make sure that at the end of graph execution all reads and writes to
   //    the symmetric buffers are finished.
   // 2. To make sure that cuda module which uses a multimem handler used by
   //    another GPU will be unloaded only after all kernels are finished.
   //    Otherwise module unloading can cause a deadlock.
-  absl::flat_hash_set<GlobalDeviceId> requested_barrier_devices =
-      collective_clique_requests.GetDevicesRequiringBarrier();
-  execute_status = MaybeRunGpuExecutableCompletionBarrier(
-      requested_barrier_devices, collective_params.global_device_id,
-      collective_params.global_device_id_map, std::move(execute_status),
-      [&](size_t num_local_barrier_participants) {
-        XLA_VLOG_DEVICE(1, collective_params.global_device_id.value())
-            << "Barrier after executable required by participants: ("
-            << absl::StrJoin(requested_barrier_devices, ", ") << ")";
-        return BarrierAfterExecutable(*run_options, debug_options,
-                                      completion_streams,
-                                      num_local_barrier_participants);
-      });
+  absl::Status barrier_status = run_completion_barrier();
+  execute_status.Update(barrier_status);
 
-  RETURN_IF_ERROR(execute_status);
-
-  return MaybeSyncAndProfile(run_options, execution_timer.get(),
-                             block_host_until_done ? main_stream : nullptr);
-}
-
-namespace {
-// Wrap RunId into a unique struct to guarantee we do not accidentally try to
-// run multiple unrelated rendezvous for a same key.
-struct InitializationKey {
-  RunId run_id;
-
-  template <typename H>
-  friend H AbslHashValue(H h, const InitializationKey& key) {
-    return H::combine(std::move(h), key.run_id);
+  if (!execute_status.ok()) {
+    return defer_execution_error(std::move(execute_status),
+                                 /*completion_barrier_result=*/
+                                 barrier_status.ok());
   }
-};
 
-bool operator==(const InitializationKey& a, const InitializationKey& b) {
-  return a.run_id == b.run_id;
+  absl::Status completion_status =
+      MaybeSyncAndProfile(run_options, execution_timer.get(),
+                          block_host_until_done ? main_stream : nullptr);
+  if (!completion_status.ok()) {
+    return defer_execution_error(std::move(completion_status),
+                                 /*completion_barrier_result=*/true);
+  }
+  return absl::OkStatus();
 }
-}  // namespace
 
 absl::Status RendezvousAfterInitialization(
     const ServiceExecutableRunOptions& run_options,
-    const DebugOptions* absl_nullable debug_options) {
+    const DebugOptions* absl_nullable debug_options,
+    absl::Status initialization_status) {
   // Thunk initialization can allocate new control data structures on device
   // that can lead to deadlocks if other replicas are executing concurrently
   // (i.e. this happens if we try to instantiate CUDA graph when other replica
@@ -906,7 +1193,7 @@ absl::Status RendezvousAfterInitialization(
   // If we don't have Gpu executable options or device assignment it means we
   // are running in a single Gpu config and don't need a rendezvous.
   if (!gpu_opts || !device_assn) {
-    return absl::OkStatus();
+    return initialization_status;
   }
 
   // Assume that all participants execute locally first, if we have a local
@@ -925,8 +1212,9 @@ absl::Status RendezvousAfterInitialization(
     }
 
     if (num_local_participants == 0) {
-      return absl::InternalError(
-          "Cound't find the number of local participants");
+      initialization_status.Update(absl::InternalError(
+          "Couldn't find the number of local participants"));
+      return initialization_status;
     }
   }
 
@@ -941,13 +1229,50 @@ absl::Status RendezvousAfterInitialization(
          {"num_local_participants", num_local_participants}});
   });
 
-  auto rendezvous_key = InitializationKey{run_options.run_options().run_id()};
   auto rendezvous_name = absl::StrFormat(
       "thunk initialization completion for device ordinal %d; run_id=%d",
       run_options.device_ordinal(), run_options.run_options().run_id().ToInt());
 
-  return Rendezvous(
-      rendezvous_name, rendezvous_key, num_local_participants,
+  return RendezvousGpuExecutableStatuses(
+      rendezvous_name, run_options.run_options().run_id().ToInt(),
+      GpuExecutableRendezvousPhase::kInitialization,
+      /*participant_devices=*/{}, std::move(initialization_status),
+      num_local_participants,
+      absl::Seconds(
+          debug_options
+              ? debug_options->xla_gpu_executable_warn_stuck_timeout_seconds()
+              : 10),
+      absl::Seconds(
+          debug_options
+              ? debug_options->xla_gpu_executable_terminate_timeout_seconds()
+              : 30));
+}
+
+absl::Status RendezvousAfterCollectiveResourceInitialization(
+    const ServiceExecutableRunOptions& run_options,
+    const DebugOptions* absl_nullable debug_options,
+    absl::Span<const GlobalDeviceId> participant_devices,
+    absl::Status initialization_status, size_t num_participants) {
+  XLA_VLOG_DEVICE(1, run_options.device_ordinal()) << absl::StreamFormat(
+      "Join collective resource initialization rendezvous with %d local "
+      "participants",
+      num_participants);
+
+  tsl::profiler::TraceMe trace([&] {
+    return tsl::profiler::TraceMeEncode(
+        "RendezvousAfterCollectiveResourceInitialization",
+        {{"run_id", run_options.run_options().run_id().ToInt()},
+         {"num_local_participants", num_participants}});
+  });
+
+  auto rendezvous_name = absl::StrFormat(
+      "collective resource initialization for device ordinal %d; run_id=%d",
+      run_options.device_ordinal(), run_options.run_options().run_id().ToInt());
+
+  return RendezvousGpuExecutableStatuses(
+      rendezvous_name, run_options.run_options().run_id().ToInt(),
+      GpuExecutableRendezvousPhase::kCollectiveResourceInitialization,
+      participant_devices, std::move(initialization_status), num_participants,
       absl::Seconds(
           debug_options
               ? debug_options->xla_gpu_executable_warn_stuck_timeout_seconds()
@@ -991,7 +1316,9 @@ absl::Status MaybeSyncAndProfile(const ServiceExecutableRunOptions* run_options,
 absl::Status BarrierAfterExecutable(
     const ServiceExecutableRunOptions& run_options,
     const DebugOptions* absl_nullable debug_options,
-    absl::Span<se::Stream* const> streams, const size_t num_participants) {
+    absl::Span<se::Stream* const> streams,
+    absl::Span<const GlobalDeviceId> participant_devices,
+    const size_t num_participants) {
   absl::Status status = SynchronizeExecutionStreams(streams);
 
   XLA_VLOG_DEVICE(1, run_options.device_ordinal()) << absl::StreamFormat(
@@ -1007,14 +1334,15 @@ absl::Status BarrierAfterExecutable(
          {"num_local_participants", num_participants}});
   });
 
-  auto rendezvous_key = InitializationKey{run_options.run_options().run_id()};
   auto rendezvous_name = absl::StrFormat(
       "thunk barrier after module execution completion for device ordinal "
       "%d; run_id=%d",
       run_options.device_ordinal(), run_options.run_options().run_id().ToInt());
 
-  status.Update(Rendezvous(
-      rendezvous_name, rendezvous_key, num_participants,
+  return RendezvousGpuExecutableStatuses(
+      rendezvous_name, run_options.run_options().run_id().ToInt(),
+      GpuExecutableRendezvousPhase::kCompletion, participant_devices,
+      std::move(status), num_participants,
       absl::Seconds(
           debug_options
               ? debug_options->xla_gpu_executable_warn_stuck_timeout_seconds()
@@ -1022,8 +1350,7 @@ absl::Status BarrierAfterExecutable(
       absl::Seconds(
           debug_options
               ? debug_options->xla_gpu_executable_terminate_timeout_seconds()
-              : 30)));
-  return status;
+              : 30));
 }
 
 absl::StatusOr<const GpuExecutable::BufferAllocToDeviceMemoryMap*>
@@ -1216,6 +1543,10 @@ absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
     buffers_in_result.insert(result_buffer);
   }
 
+  // The service Executable API receives non-owning spans and returns no token
+  // on error, so it cannot transfer input lifetime to a deferred lease. Keep
+  // its error path synchronous. The raw-buffer PJRT path below can defer
+  // safely because it retains ref-counted argument and result owners.
   absl::Status execute_status = allocation_scope.ExecuteWithBufferAllocations(
       buffer_allocations, device_ordinal,
       [&](const BufferAllocations& execution_buffers,
@@ -1224,6 +1555,7 @@ absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
         return ExecuteThunks(execution_buffers, run_options,
                              persistent_alloc_indices);
       });
+
   absl::Status teardown_status =
       buffer_allocations.TearDown(buffers_in_result, GetAllocations());
 
@@ -1289,7 +1621,8 @@ absl::Status GpuExecutable::ExecuteThunks(
     const BufferAllocations& buffer_allocations,
     const ServiceExecutableRunOptions* run_options,
     std::optional<absl::Span<const BufferAllocation::Index>>
-        persistent_alloc_indices) {
+        persistent_alloc_indices,
+    DeferredGpuExecution* deferred_execution) {
   tsl::profiler::TraceMe trace([&] {
     return tsl::profiler::TraceMeEncode(
         absl::StrFormat("[%d] GpuExecutable::ExecuteThunks",
@@ -1332,7 +1665,7 @@ absl::Status GpuExecutable::ExecuteThunks(
       unique_id, *thunk_executor_, executable_source, run_options,
       buffer_allocations, block_host_until_done, persistent_alloc_indices,
       num_additional_streams_, collective_memory_cache_,
-      collective_use_minimal_resource));
+      collective_use_minimal_resource, deferred_execution));
   return absl::OkStatus();
 }
 

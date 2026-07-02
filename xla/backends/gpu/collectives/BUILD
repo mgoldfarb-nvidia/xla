@@ -81,7 +81,77 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/synchronization",
+    ],
+)
+
+cc_library(
+    name = "gpu_clique_agreement",
+    srcs = ["gpu_clique_agreement.cc"],
+    hdrs = ["gpu_clique_agreement.h"],
+    deps = [
+        ":gpu_clique_key",
+        "//xla:executable_run_options",
+        "//xla/pjrt/distributed:key_value_store_interface",
+        "//xla/runtime:device_id",
+        "//xla/runtime:process_id",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:btree",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
+        "@tsl//tsl/platform:fingerprint",
+    ],
+)
+
+xla_cc_test(
+    name = "gpu_clique_test",
+    srcs = ["gpu_clique_test.cc"],
+    deps = [
+        ":cancellation_token",
+        ":gpu_clique",
+        ":gpu_clique_key",
+        "//xla/core/collectives:rank_id",
+        "//xla/runtime:device_id",
+        "//xla/tsl/platform:test",
+        "//xla/tsl/platform:test_main",
+        "@com_google_absl//absl/status",
+        "@com_google_googletest//:gtest",
+    ],
+)
+
+xla_cc_test(
+    name = "gpu_clique_agreement_test",
+    srcs = ["gpu_clique_agreement_test.cc"],
+    deps = [
+        ":gpu_clique_agreement",
+        ":gpu_clique_key",
+        "//xla:executable_run_options",
+        "//xla/pjrt/distributed:in_memory_key_value_store",
+        "//xla/pjrt/distributed:key_value_store_interface",
+        "//xla/runtime:device_id",
+        "//xla/runtime:process_id",
+        "//xla/tsl/distributed_runtime:call_options",
+        "//xla/tsl/distributed_runtime/coordination:coordination_service_agent",
+        "//xla/tsl/platform:test",
+        "//xla/tsl/platform:test_main",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest",
     ],
 )
 
@@ -101,6 +171,7 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
         "@tsl//tsl/platform:casts",
     ],
@@ -436,6 +507,7 @@ xla_test(
 
 cc_library(
     name = "gpu_communicator",
+    srcs = ["gpu_communicator.cc"],
     hdrs = ["gpu_communicator.h"],
     deps = [
         "//xla:future",
@@ -453,6 +525,8 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
     ],
 )
@@ -585,6 +659,8 @@ cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        ":cancellation_token",
+        ":gpu_communicator",
         "//xla:shape_util",
         "//xla:util",
         "//xla:xla_data_proto_cc",
@@ -630,12 +706,14 @@ cc_library(
     visibility = ["//visibility:private"],
     deps = [
         ":cancellation_token",
+        ":nccl_types",
         "//xla:util",
         "//xla/tsl/cuda:nccl",
         "//xla/tsl/platform:logging",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:vlog_is_on",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
     ],
 )
@@ -720,11 +798,31 @@ cc_library(
     visibility = ["//visibility:private"],
     deps = [
         ":cancellation_token",
+        ":rccl_types",
         "//xla:util",
         "//xla/tsl/platform:logging",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
+        "@local_config_rocm//rocm:rccl",  # buildcleaner: keep
+        "@local_config_rocm//rocm:rocm_headers",
+    ],
+)
+
+cc_library(
+    name = "rccl_types",
+    hdrs = ["rccl_types.h"],
+    tags = [
+        "gpu",
+        "no-oneapi",
+        "rocm-only",
+    ],
+    deps = [
+        ":cancellation_token",
+        ":gpu_communicator",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/synchronization",
         "@local_config_rocm//rocm:rccl",  # buildcleaner: keep
         "@local_config_rocm//rocm:rocm_headers",
     ],
@@ -770,6 +868,7 @@ cc_library(
         ":nccl_communicator",
         ":nccl_errors",
         ":nccl_group",
+        ":nccl_types",
         "//xla:debug_options_flags",
         "//xla:future",
         "//xla:status_macros",
@@ -849,6 +948,7 @@ cc_library(
         ":rccl_communicator",
         ":rccl_errors",
         ":rccl_group",
+        ":rccl_types",
         "//xla:debug_options_flags",
         "//xla:status_macros",
         "//xla:util",
@@ -941,7 +1041,9 @@ cc_library(
         "//xla/core/collectives:registered_memory",
         "//xla/core/collectives:symmetric_memory",
         "//xla/stream_executor:device_address",
+        "//xla/stream_executor:device_address_handle",
         "//xla/stream_executor:kernel_args",
+        "//xla/stream_executor:memory_allocation",
         "//xla/stream_executor:stream",
         "//xla/stream_executor:stream_executor_h",
         "//xla/tsl/concurrency:executor",
@@ -1022,16 +1124,23 @@ cc_library(
         "//xla/backends/gpu/runtime:__subpackages__",
     ],
     deps = [
+        ":cancellation_token",
         ":rccl_errors",
+        ":rccl_types",
+        "//xla:future",
         "//xla:util",
         "//xla/core/collectives:rank_id",
         "//xla/core/collectives:symmetric_memory",
         "//xla/stream_executor:device_address",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/tsl/concurrency:executor",
+        "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/synchronization",
         "@local_config_rocm//rocm:rccl",  # buildcleaner: keep
         "@local_config_rocm//rocm:rocm_headers",
     ],
@@ -1054,6 +1163,7 @@ cc_library(
         ":rccl_errors",
         ":rccl_group",
         ":rccl_symmetric_memory",
+        ":rccl_types",
         ":single_threaded_executor",
         "//xla:future",
         "//xla:shape_util",
@@ -1063,6 +1173,8 @@ cc_library(
         "//xla/core/collectives:rank_id",
         "//xla/core/collectives:reduction_kind",
         "//xla/stream_executor:device_address",
+        "//xla/stream_executor:device_address_handle",
+        "//xla/stream_executor:memory_allocation",
         "//xla/stream_executor:stream",
         "//xla/stream_executor:stream_executor_h",
         "//xla/tsl/concurrency:executor",
@@ -1081,6 +1193,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
         "@local_config_rocm//rocm:rccl",  # buildcleaner: keep
         "@local_config_rocm//rocm:rocm_headers",

@@ -33,6 +33,13 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 
+// Deallocates every non-null address, returning the first error after trying
+// all of them. Deferred execution cleanup uses this after the GPU stream tail
+// has completed.
+absl::Status DeallocateBufferAddresses(
+    se::DeviceAddressAllocator* memory_allocator, int device_ordinal,
+    absl::Span<const se::DeviceAddressBase> addresses);
+
 // A thread-compatible class that encapsulates the base addresses of the
 // allocated device buffers.
 class BufferAllocations {
@@ -78,6 +85,13 @@ class BufferAllocations {
   // `live_addresses`.
   absl::Status TearDown(const std::set<se::DeviceAddressBase>& live_addresses,
                         absl::Span<const BufferAllocation* const> allocations);
+
+  // Removes and returns the unique addresses TearDown would deallocate. This
+  // transfers cleanup responsibility to a deferred completion lease without
+  // freeing buffers that asynchronous device work may still reference.
+  std::vector<se::DeviceAddressBase> ExtractTearDownAddresses(
+      const std::set<se::DeviceAddressBase>& live_addresses,
+      absl::Span<const BufferAllocation* const> allocations);
 
   std::string ToString() const {
     std::string out;

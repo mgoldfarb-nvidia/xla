@@ -99,6 +99,18 @@ absl::Status CollectiveCliqueRequests::RequestClique(
   return absl::OkStatus();
 }
 
+absl::Status CollectiveCliqueRequests::RequestModuleExecutionBarrier(
+    const GpuCliqueKey& clique_key) {
+  auto it = cliques_.find(clique_key);
+  if (it == cliques_.end()) {
+    return NotFound(
+        "Cannot request a module execution barrier for unknown GPU clique %v",
+        clique_key);
+  }
+  it->second.barrier_after_module_execution_requested = true;
+  return absl::OkStatus();
+}
+
 std::vector<GpuCliqueKey> CollectiveCliqueRequests::RequestedCliques() const {
   std::vector<GpuCliqueKey> clique_keys;
   clique_keys.reserve(cliques_.size());
@@ -148,6 +160,14 @@ CollectiveCliqueRequests::GetDevicesRequiringBarrier() const {
     }
   }
   return result;
+}
+
+bool CollectiveCliqueRequests::BarrierRequiresRemoteParticipants() const {
+  return absl::c_any_of(cliques_, [](const auto& entry) {
+    const CliqueRequest& request = entry.second;
+    return request.barrier_after_module_execution_requested &&
+           !request.key.is_local();
+  });
 }
 
 }  // namespace xla::gpu

@@ -266,9 +266,11 @@ absl::Status CollectiveKernelThunk::Initialize(const InitializeParams& params) {
       << "is not in the clique.";
 
   StreamState* state = nullptr;
+  bool state_created = false;
   {
     absl::MutexLock lock(mutex_);
     if (!per_stream_state_.contains(params.executor)) {
+      state_created = true;
       StreamMemory* memory_state = per_stream_memory_.at(params.executor).get();
       // Step1: We needs 1 atomic flag per block per device on each device.
       // The kernel expects that the signal flags buffer is zeroed out.
@@ -303,7 +305,6 @@ absl::Status CollectiveKernelThunk::Initialize(const InitializeParams& params) {
           params.executor,
           std::make_unique<StreamState>(params.executor->device_ordinal(),
                                         rank.value(), std::move(kernel)));
-
       state = per_stream_state_.at(params.executor).get();
 
       // NB: This is a double buffer allocation. So size of a single buffer is
@@ -320,12 +321,21 @@ absl::Status CollectiveKernelThunk::Initialize(const InitializeParams& params) {
                 /*size_bytes=*/memory_state->signal_buffer_size_bytes);
       }
     }
+    state = per_stream_state_.at(params.executor).get();
   }
 
   StreamMemory* memory_state = nullptr;
   {
     absl::MutexLock lock(mutex_);
     memory_state = per_stream_memory_.at(params.executor).get();
+  }
+
+  // Only multimem metadata embeds execution-scoped window addresses. Other
+  // strategies use persistent scratch addresses and must not rewrite shared
+  // metadata while a prior asynchronous execution can still be running.
+  if (!state_created &&
+      memory_state->strategy != AllReduceStrategy::kMultimem) {
+    return absl::OkStatus();
   }
 
   if (state != nullptr) {
@@ -360,10 +370,15 @@ absl::Status CollectiveKernelThunk::Initialize(const InitializeParams& params) {
           param_to_peers_ptrs,
           CollectParamToPeers(clique_key, state->rank, params.stream,
                               std::move(parameters)));
-      state->metadata = params.executor->Allocate(
-          sizeof(CollectiveKernelMetadata) + param_to_peers_ptrs_size_bytes +
-              multimem_addresses_size_bytes,
-          0);
+      size_t metadata_size = sizeof(CollectiveKernelMetadata) +
+                             param_to_peers_ptrs_size_bytes +
+                             multimem_addresses_size_bytes;
+      if (state->metadata.is_null()) {
+        state->metadata = params.executor->Allocate(metadata_size, 0);
+      }
+      TF_RET_CHECK(!state->metadata.is_null() &&
+                   state->metadata.size() >= metadata_size)
+          << "Collective kernel metadata allocation is too small";
 
       auto [src_mmem, src_mmem_offset] =
           params.collective_memory->FindSymmetricMemory(clique_key, src_addr);
@@ -399,8 +414,14 @@ absl::Status CollectiveKernelThunk::Initialize(const InitializeParams& params) {
 
       const size_t param_to_peers_ptrs_size_bytes =
           parameters.size() * clique_key.num_devices() * sizeof(uint64_t);
-      state->metadata = params.executor->Allocate(
-          sizeof(CollectiveKernelMetadata) + param_to_peers_ptrs_size_bytes, 0);
+      size_t metadata_size =
+          sizeof(CollectiveKernelMetadata) + param_to_peers_ptrs_size_bytes;
+      if (state->metadata.is_null()) {
+        state->metadata = params.executor->Allocate(metadata_size, 0);
+      }
+      TF_RET_CHECK(!state->metadata.is_null() &&
+                   state->metadata.size() >= metadata_size)
+          << "Collective kernel metadata allocation is too small";
 
       ASSIGN_OR_RETURN(
           param_to_peers_ptrs,

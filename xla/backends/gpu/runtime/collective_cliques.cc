@@ -15,22 +15,29 @@ limitations under the License.
 
 #include "xla/backends/gpu/runtime/collective_cliques.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/base/casts.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/string_view.h"
 #include "absl/time/time.h"
+#include "absl/types/span.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/backends/gpu/collectives/gpu_clique.h"
+#include "xla/backends/gpu/collectives/gpu_clique_agreement.h"
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
 #include "xla/backends/gpu/collectives/gpu_cliques.h"
 #include "xla/backends/gpu/collectives/gpu_communicator.h"
@@ -47,9 +54,117 @@ limitations under the License.
 #include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 #include "tsl/platform/casts.h"
+#include "tsl/platform/fingerprint.h"
 #include "tsl/profiler/lib/traceme.h"
 
 namespace xla::gpu {
+namespace {
+
+void AppendField(absl::string_view name, absl::string_view value,
+                 std::string* out) {
+  absl::StrAppend(out, name.size(), ":", name, value.size(), ":", value);
+}
+
+void AppendRequirements(const GpuDeviceCommunicator::Requirements& reqs,
+                        std::string* out) {
+  absl::StrAppend(out, "peer_access=", static_cast<int>(reqs.peer_access),
+                  ";required_features=", reqs.required_features,
+                  ";preferred_features=", reqs.preferred_features,
+                  ";local_barriers=", reqs.local_barrier_count,
+                  ";team_barriers=", reqs.team_barrier_count,
+                  ";notification_slots=", reqs.notification_slot_count,
+                  ";completion_slots=", reqs.completion_slot_count, ";");
+}
+
+absl::Status WithContext(absl::Status status, absl::string_view context) {
+  if (status.ok()) return status;
+  return absl::Status(status.code(),
+                      absl::StrCat(context, ": ", status.message()));
+}
+
+GpuCliqueBarrierToken CompletionBarrierToken(size_t request_id,
+                                             int32_t launch_id) {
+  tsl::Fprint128 fingerprint = tsl::Fingerprint128(
+      absl::StrCat("xla-gpu-module-completion-v1;request=", request_id,
+                   ";launch=", launch_id, ";"));
+  GpuCliqueBarrierToken token{fingerprint.high64, fingerprint.low64};
+  if (token == GpuCliqueBarrierToken{}) token.high = 1;
+  return token;
+}
+
+struct DeviceCommState {
+  GpuDeviceCommunicator::Requirements requirements;
+  size_t request_index;
+  std::unique_ptr<GpuCommunicator::DeviceCommPlan> plan;
+  bool cache_hit = false;
+};
+
+absl::Status PoisonGpuCliques(absl::Span<GpuClique* const> cliques,
+                              const absl::Status& failure) {
+  if (failure.ok()) {
+    return InvalidArgument("Cannot poison GPU cliques with an OK status");
+  }
+
+  absl::Status result = failure;
+  for (GpuClique* clique : cliques) {
+    result.Update(clique->RecordAgreementFailure(failure));
+  }
+
+  // Record cancellation everywhere before starting any provider abort. An
+  // abort can block behind another communicator, so run all of them
+  // concurrently and fail fast if the provider cannot reach a terminal state.
+  std::vector<absl::Status> abort_statuses(cliques.size());
+  {
+    std::vector<std::unique_ptr<tsl::Thread>> threads;
+    threads.reserve(cliques.size());
+    for (size_t i = 0; i < cliques.size(); ++i) {
+      threads.emplace_back(tsl::Env::Default()->StartThread(
+          tsl::ThreadOptions(), "abort-device-communication-clique", [&, i] {
+            abort_statuses[i] = cliques[i]->AbortAfterAgreementFailure();
+          }));
+    }
+  }  // Thread destruction joins every abort.
+
+  for (const absl::Status& abort_status : abort_statuses) {
+    if (!abort_status.ok()) {
+      LOG(FATAL) << "Failed to abort a GPU clique after a terminal failure: "
+                 << abort_status;
+    }
+  }
+  return result;
+}
+
+// If acquiring or initializing a later clique fails, ranks participating only
+// in an earlier disjoint clique must not continue into execution. This guard
+// aborts every clique already acquired by the current rank on any early return.
+class AcquiredCliqueFailureGuard {
+ public:
+  explicit AcquiredCliqueFailureGuard(const AcquiredCliquesMap* cliques)
+      : cliques_(cliques) {}
+
+  ~AcquiredCliqueFailureGuard() {
+    if (!active_ || cliques_->empty()) return;
+    std::vector<GpuClique*> acquired;
+    acquired.reserve(cliques_->size());
+    for (const auto& entry : *cliques_) {
+      acquired.push_back(entry.second->operator->());
+    }
+    PoisonGpuCliques(
+        acquired,
+        absl::AbortedError(
+            "GPU clique acquisition failed before all requested cliques were "
+            "initialized"))
+        .IgnoreError();
+  }
+
+  void Dismiss() { active_ = false; }
+
+ private:
+  const AcquiredCliquesMap* cliques_;
+  bool active_ = true;
+};
+
+}  // namespace
 
 CollectiveCliques::CollectiveCliques(AcquiredCliquesMap cliques_map)
     : cliques_map_(std::move(cliques_map)) {}
@@ -128,6 +243,113 @@ absl::StatusOr<bool> CollectiveCliques::peer_access_enabled(
   return (*clique->second)->peer_access_enabled();
 }
 
+absl::StatusOr<std::string> CollectiveCliques::agreement_session_id(
+    const GpuCliqueKey& clique_key) const {
+  auto clique = cliques_map_.find(clique_key);
+  if (clique == cliques_map_.end()) {
+    return NotFound("No clique found for clique key: %v", clique_key);
+  }
+  return (*clique->second)->agreement_session_id();
+}
+
+absl::Status CollectiveCliques::agreement_status(
+    const GpuCliqueKey& clique_key) const {
+  auto clique = cliques_map_.find(clique_key);
+  if (clique == cliques_map_.end()) {
+    return NotFound("No clique found for clique key: %v", clique_key);
+  }
+  return (*clique->second)->agreement_status();
+}
+
+absl::Status CollectiveCliques::PoisonAll(absl::Status status) const {
+  std::vector<GpuClique*> cliques;
+  cliques.reserve(cliques_map_.size());
+  for (const auto& entry : cliques_map_) {
+    cliques.push_back(entry.second->operator->());
+  }
+  return PoisonGpuCliques(cliques, status);
+}
+
+absl::Status CollectiveCliques::RunCompletionBarriers(
+    const CollectiveParams& params, const CollectiveCliqueRequests& requests,
+    stream_executor::Stream* stream,
+    const absl::Status& local_completion_status) const {
+  if (params.launch_id == 0) {
+    return PoisonCompletionBarriers(
+        requests,
+        FailedPrecondition(
+            "A distributed completion barrier requires a non-zero, globally "
+            "coordinated execution launch id"));
+  }
+  if (stream == nullptr) {
+    return PoisonCompletionBarriers(
+        requests,
+        InvalidArgument("A distributed completion barrier requires a stream"));
+  }
+  if (!local_completion_status.ok()) {
+    return PoisonCompletionBarriers(requests, local_completion_status);
+  }
+
+  // Use the same deterministic order as clique acquisition. A rank can be a
+  // member of multiple overlapping cliques, so an inconsistent order could
+  // otherwise create a distributed wait cycle.
+  for (const CollectiveCliqueRequests::CliqueRequest& request :
+       requests.OrderedRequestedCliques()) {
+    if (!request.barrier_after_module_execution_requested ||
+        request.key.is_local()) {
+      continue;
+    }
+
+    // Never retry an agreement for a poisoned session. A previous transport
+    // error might have been observed as success by a remote process.
+    absl::Status session_status = agreement_status(request.key);
+    if (!session_status.ok()) {
+      return PoisonCompletionBarriers(requests, session_status);
+    }
+
+    absl::StatusOr<GpuCommunicator*> communicator =
+        GetComm(request.key, params.global_device_id);
+    absl::Status status =
+        communicator.ok()
+            ? (*communicator)
+                  ->RunCliqueBarrier(stream, CompletionBarrierToken(
+                                                 request.id, params.launch_id))
+            : communicator.status();
+    if (!status.ok()) {
+      return PoisonCompletionBarriers(requests, status);
+    }
+  }
+
+  return absl::OkStatus();
+}
+
+absl::Status CollectiveCliques::PoisonCompletionBarriers(
+    const CollectiveCliqueRequests& requests,
+    const absl::Status& execution_status) const {
+  if (execution_status.ok()) {
+    return InvalidArgument(
+        "Cannot poison completion barriers with an OK execution status");
+  }
+
+  absl::Status result = execution_status;
+  std::vector<GpuClique*> poisoned_cliques;
+  for (const CollectiveCliqueRequests::CliqueRequest& request :
+       requests.OrderedRequestedCliques()) {
+    if (!request.barrier_after_module_execution_requested) continue;
+
+    auto clique = cliques_map_.find(request.key);
+    if (clique == cliques_map_.end()) {
+      result.Update(
+          NotFound("No clique found for clique key: %v", request.key));
+      continue;
+    }
+    GpuClique* gpu_clique = clique->second->operator->();
+    poisoned_cliques.push_back(gpu_clique);
+  }
+  result.Update(PoisonGpuCliques(poisoned_cliques, execution_status));
+  return result;
+}
+
 absl::StatusOr<CollectiveCliques> AcquireCollectiveCliques(
     const CollectiveParams& params, const CollectiveCliqueRequests& cliques) {
   std::vector<CollectiveCliqueRequests::CliqueRequest> ordered_cliques =
@@ -159,6 +381,7 @@ absl::StatusOr<CollectiveCliques> AcquireCollectiveCliques(
   });
 
   AcquiredCliquesMap cliques_map;
+  AcquiredCliqueFailureGuard acquisition_failure_guard(&cliques_map);
   auto start_micros = tsl::Env::Default()->NowMicros();
 
   for (const CollectiveCliqueRequests::CliqueRequest& r : ordered_cliques) {
@@ -206,6 +429,11 @@ absl::StatusOr<CollectiveCliques> AcquireCollectiveCliques(
                          *rank, cliques_map, max_channels,
                          params.collective_use_minimal_resource));
 
+    // Agreement failures have an uncertain distributed outcome. Do not let a
+    // later execution reuse the same communicator session and accidentally
+    // pair with a stale or partially completed round.
+    RETURN_IF_ERROR((*clique)->agreement_status());
+
     cliques_map[r.key] = std::move(clique);
   }
 
@@ -215,34 +443,155 @@ absl::StatusOr<CollectiveCliques> AcquireCollectiveCliques(
       params.global_device_id, params.run_id, cliques_map.size(),
       absl::FormatDuration(absl::Microseconds(end_micros - start_micros)));
 
-  // After we acquired all GPU cliques, check if they already have required
-  // device communicators, and create them if needed. Creating device
-  // communicators is a collective operation that must be executed by all ranks,
-  // but luckily we already are inside the collective function, so we can safely
-  // create missing communicators here.
+  // Resolve provider plans and cache state on every rank before entering a
+  // provider collective. The initialization protocol makes runtime ABI and
+  // provider capability skew deterministic errors instead of hangs, and only
+  // publishes cache entries after every rank confirms creation.
   for (const CollectiveCliqueRequests::CliqueRequest& r : ordered_cliques) {
     std::optional<RankId> rank = r.key.rank(params.global_device_id);
     std::shared_ptr<LockableGpuClique::Lock> clique = cliques_map.at(r.key);
+    if (r.dev_comms.empty()) continue;
 
+    auto* comm = dynamic_cast<GpuCommunicator*>(*(*clique)->comm(*rank));
+    if (comm == nullptr) {
+      return Internal(
+          "Communicator for rank %v in clique %v is not a GPU "
+          "communicator",
+          *rank, r.key);
+    }
+
+    ASSIGN_OR_RETURN(std::string session_id, (*clique)->agreement_session_id());
+    std::vector<DeviceCommState> states;
+    states.reserve(r.dev_comms.size());
+    absl::Status local_status;
+    std::string manifest = "xla-device-comm-plan-v1;";
+    absl::StrAppend(&manifest, "request_id=", r.id,
+                    ";count=", r.dev_comms.size(), ";");
+
+    size_t request_index = 0;
     for (const GpuDeviceCommunicator::Requirements& reqs : r.dev_comms) {
-      // Device communicator already exists in the GPU clique.
-      if ((*clique)->device_comm(*rank, reqs)) {
-        continue;
+      DeviceCommState& state = states.emplace_back(
+          DeviceCommState{reqs, request_index++, nullptr, false});
+      absl::StatusOr<std::unique_ptr<GpuCommunicator::DeviceCommPlan>> plan =
+          comm->ResolveDeviceCommPlan(reqs);
+      if (!plan.ok()) {
+        local_status.Update(WithContext(
+            plan.status(), absl::StrCat("failed to resolve device communicator "
+                                        "plan #",
+                                        state.request_index)));
+      } else if (*plan == nullptr) {
+        local_status.Update(
+            Internal("Provider returned a null device communicator plan #%d",
+                     state.request_index));
+      } else {
+        state.plan = std::move(*plan);
       }
 
+      std::optional<std::string> cached_plan =
+          (*clique)->device_comm_plan(*rank, reqs);
+      state.cache_hit = cached_plan.has_value();
+      if (state.plan != nullptr && cached_plan.has_value() &&
+          *cached_plan != state.plan->agreement_payload()) {
+        local_status.Update(FailedPrecondition(
+            "Cached device communicator plan #%d differs from the newly "
+            "resolved provider plan",
+            state.request_index));
+      }
+
+      std::string requirements;
+      AppendRequirements(reqs, &requirements);
+      AppendField("requirements", requirements, &manifest);
+      AppendField("resolved", state.plan == nullptr ? "0" : "1", &manifest);
+      AppendField(
+          "provider",
+          state.plan == nullptr ? absl::string_view() : state.plan->provider(),
+          &manifest);
+      AppendField("plan",
+                  state.plan == nullptr ? absl::string_view()
+                                        : state.plan->agreement_payload(),
+                  &manifest);
+      AppendField("priority",
+                  state.plan == nullptr
+                      ? std::string()
+                      : absl::StrCat(state.plan->creation_priority()),
+                  &manifest);
+      AppendField("cache_hit", state.cache_hit ? "1" : "0", &manifest);
+      AppendField("cached_plan",
+                  cached_plan.has_value() ? absl::string_view(*cached_plan)
+                                          : absl::string_view(),
+                  &manifest);
+    }
+
+    bool all_cache_hits = std::all_of(
+        states.begin(), states.end(),
+        [](const DeviceCommState& state) { return state.cache_hit; });
+    if (all_cache_hits) {
+      if (!local_status.ok()) {
+        return (*clique)->RecordAgreementFailure(std::move(local_status));
+      }
+      // Agreement is an initialization protocol. A successful post-create
+      // round established that every rank in this clique session owns the
+      // same resource; repeating KVS rounds on every execution would leak
+      // coordinator keys and add control-plane latency.
+      continue;
+    }
+
+    auto agree_or_poison = [&](GpuCliqueAgreementRequest request) {
+      absl::Status status =
+          AgreeGpuClique(params.clique_agreement, std::move(request));
+      if (!status.ok()) {
+        return (*clique)->RecordAgreementFailure(std::move(status));
+      }
+      return status;
+    };
+
+    RETURN_IF_ERROR(agree_or_poison(GpuCliqueAgreementRequest(
+        params.run_id, params.launch_id, session_id, r.key,
+        "device-communicator-plan", static_cast<int64_t>(r.id),
+        params.global_device_id, local_status, manifest)));
+
+    std::vector<DeviceCommState*> missing;
+    missing.reserve(states.size());
+    for (DeviceCommState& state : states) {
+      if (!state.cache_hit) missing.push_back(&state);
+    }
+    std::stable_sort(missing.begin(), missing.end(),
+                     [](const DeviceCommState* a, const DeviceCommState* b) {
+                       return a->plan->creation_priority() <
+                              b->plan->creation_priority();
+                     });
+
+    for (DeviceCommState* state : missing) {
       XLA_VLOG_DEVICE(2, params.executor->device_ordinal())
           << absl::StreamFormat("Create device communicator: rank=%v clique=%v",
                                 *rank, r.key);
 
-      auto* comm = dynamic_cast<GpuCommunicator*>(*(*clique)->comm(*rank));
-      DCHECK(comm) << "Communicator must be in the acquired clique";
-      ASSIGN_OR_RETURN(std::unique_ptr<GpuDeviceCommunicator> dev_comm,
-                       comm->CreateDeviceComm(reqs));
-      RETURN_IF_ERROR(
-          (*clique)->AddDeviceComm(*rank, reqs, std::move(dev_comm)));
+      absl::StatusOr<std::unique_ptr<GpuDeviceCommunicator>> dev_comm =
+          comm->CreateDeviceComm(*state->plan);
+      absl::Status create_status;
+      if (!dev_comm.ok()) {
+        create_status = WithContext(dev_comm.status(),
+                                    "failed to create device communicator");
+      } else if (*dev_comm == nullptr) {
+        create_status =
+            Internal("Provider returned a null device communicator");
+      }
+      RETURN_IF_ERROR(agree_or_poison(GpuCliqueAgreementRequest(
+          params.run_id, params.launch_id, session_id, r.key,
+          "device-communicator-create",
+          static_cast<int64_t>(state->request_index), params.global_device_id,
+          create_status, std::string(state->plan->agreement_payload()))));
+
+      absl::Status add_status = (*clique)->AddDeviceComm(
+          *rank, state->requirements,
+          std::string(state->plan->agreement_payload()), std::move(*dev_comm));
+      if (!add_status.ok()) {
+        return (*clique)->RecordAgreementFailure(std::move(add_status));
+      }
     }
   }
 
+  acquisition_failure_guard.Dismiss();
   return CollectiveCliques(std::move(cliques_map));
 }
 

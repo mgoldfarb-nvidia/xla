@@ -56,8 +56,10 @@ namespace xla::gpu {
 //
 // Symmetric memory allocated via the underlying collective communication
 // library can span multiple processes running on different hosts, connected via
-// the host network. Multicast objects and peer memory require all devices to be
-// connected with NVLINK (for CUDA platform).
+// the host network. Symmetric registrations are execution-scoped; the GPU
+// executable promotes every symmetric request to module-completion ordering
+// before releasing its window or backing buffer. Multicast objects and peer
+// memory require all devices to be connected with NVLINK (for CUDA platform).
 //
 // For CUDA symmetric memory see official NCCL documentation:
 // https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-reg

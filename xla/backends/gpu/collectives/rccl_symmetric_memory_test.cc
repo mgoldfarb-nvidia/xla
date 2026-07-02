@@ -62,6 +62,7 @@ class RcclSymmetricMemoryTest : public ::testing::Test {
       GTEST_SKIP() << "RCCL communicator initialisation failed: "
                    << ncclGetErrorString(nccl_err);
     }
+    comm_state_ = std::make_shared<RcclCommState>(comm_);
 
     // Allocate a 4 KiB symmetric memory buffer via RCCL. ncclMemAlloc ensures
     // the buffer is mapped at the same virtual address on all ranks, which is
@@ -71,6 +72,7 @@ class RcclSymmetricMemoryTest : public ::testing::Test {
     if (ncclMemAlloc(&buf_ptr_, buf_size_) != ncclSuccess) {
       ncclCommDestroy(comm_);
       comm_ = nullptr;
+      comm_state_.reset();
       GTEST_SKIP() << "ncclMemAlloc(" << kBufSize << ") failed";
     }
   }
@@ -84,9 +86,11 @@ class RcclSymmetricMemoryTest : public ::testing::Test {
       ncclCommDestroy(comm_);
       comm_ = nullptr;
     }
+    comm_state_.reset();
   }
 
   ncclComm_t comm_ = nullptr;
+  std::shared_ptr<RcclCommState> comm_state_;
   void* buf_ptr_ = nullptr;
   size_t buf_size_ = 0;
 };
@@ -94,7 +98,8 @@ class RcclSymmetricMemoryTest : public ::testing::Test {
 // Verifies that RcclSymmetricMemory::Create succeeds for a valid buffer.
 TEST_F(RcclSymmetricMemoryTest, CreateSucceeds) {
   se::DeviceAddressBase addr(buf_ptr_, buf_size_);
-  ASSERT_OK_AND_ASSIGN(auto symm_mem, RcclSymmetricMemory::Create(comm_, addr));
+  ASSERT_OK_AND_ASSIGN(auto symm_mem, RcclSymmetricMemory::Create(
+                                          comm_state_, addr, nullptr, nullptr));
   ASSERT_NE(symm_mem, nullptr);
 }
 
@@ -102,7 +107,8 @@ TEST_F(RcclSymmetricMemoryTest, CreateSucceeds) {
 // registered.
 TEST_F(RcclSymmetricMemoryTest, AddrMatchesRegisteredBuffer) {
   se::DeviceAddressBase addr(buf_ptr_, buf_size_);
-  ASSERT_OK_AND_ASSIGN(auto symm_mem, RcclSymmetricMemory::Create(comm_, addr));
+  ASSERT_OK_AND_ASSIGN(auto symm_mem, RcclSymmetricMemory::Create(
+                                          comm_state_, addr, nullptr, nullptr));
   EXPECT_EQ(symm_mem->addr().opaque(), buf_ptr_);
   EXPECT_EQ(symm_mem->addr().size(), buf_size_);
 }
@@ -110,7 +116,8 @@ TEST_F(RcclSymmetricMemoryTest, AddrMatchesRegisteredBuffer) {
 // Verifies that ToString() contains key diagnostic fields.
 TEST_F(RcclSymmetricMemoryTest, ToStringContainsExpectedFields) {
   se::DeviceAddressBase addr(buf_ptr_, buf_size_);
-  ASSERT_OK_AND_ASSIGN(auto symm_mem, RcclSymmetricMemory::Create(comm_, addr));
+  ASSERT_OK_AND_ASSIGN(auto symm_mem, RcclSymmetricMemory::Create(
+                                          comm_state_, addr, nullptr, nullptr));
   const std::string str = symm_mem->ToString();
   EXPECT_THAT(str, HasSubstr("RcclSymmetricMemory"));
   EXPECT_THAT(str, HasSubstr("comm="));
@@ -124,7 +131,8 @@ TEST_F(RcclSymmetricMemoryTest, ToStringContainsExpectedFields) {
 // remote peers to establish a window with). This test is skipped in that case.
 TEST_F(RcclSymmetricMemoryTest, PackKernelArgReturnsValidWindowHandle) {
   se::DeviceAddressBase addr(buf_ptr_, buf_size_);
-  ASSERT_OK_AND_ASSIGN(auto symm_mem, RcclSymmetricMemory::Create(comm_, addr));
+  ASSERT_OK_AND_ASSIGN(auto symm_mem, RcclSymmetricMemory::Create(
+                                          comm_state_, addr, nullptr, nullptr));
   if (symm_mem->win() == nullptr) {
     GTEST_SKIP()
         << "RCCL returned a null ncclWindow_t (expected on single-rank "
@@ -142,7 +150,8 @@ TEST_F(RcclSymmetricMemoryTest, PackKernelArgReturnsValidWindowHandle) {
 // multimem, so the base-class default is expected.
 TEST_F(RcclSymmetricMemoryTest, MultimemAddrNotSupported) {
   se::DeviceAddressBase addr(buf_ptr_, buf_size_);
-  ASSERT_OK_AND_ASSIGN(auto symm_mem, RcclSymmetricMemory::Create(comm_, addr));
+  ASSERT_OK_AND_ASSIGN(auto symm_mem, RcclSymmetricMemory::Create(
+                                          comm_state_, addr, nullptr, nullptr));
   auto result = symm_mem->multimem_addr();
   EXPECT_THAT(result, Not(IsOk()));
   EXPECT_EQ(result.status().code(), absl::StatusCode::kUnimplemented);
@@ -158,8 +167,10 @@ TEST_F(RcclSymmetricMemoryTest, TwoWindowsHaveDistinctHandles) {
   se::DeviceAddressBase addr1(buf_ptr_, buf_size_);
   se::DeviceAddressBase addr2(buf2_ptr, buf_size_);
 
-  ASSERT_OK_AND_ASSIGN(auto symm1, RcclSymmetricMemory::Create(comm_, addr1));
-  ASSERT_OK_AND_ASSIGN(auto symm2, RcclSymmetricMemory::Create(comm_, addr2));
+  ASSERT_OK_AND_ASSIGN(auto symm1, RcclSymmetricMemory::Create(
+                                       comm_state_, addr1, nullptr, nullptr));
+  ASSERT_OK_AND_ASSIGN(auto symm2, RcclSymmetricMemory::Create(
+                                       comm_state_, addr2, nullptr, nullptr));
 
   if (symm1->win() == nullptr || symm2->win() == nullptr) {
     (void)ncclMemFree(buf2_ptr);

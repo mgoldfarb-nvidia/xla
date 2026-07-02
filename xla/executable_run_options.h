@@ -198,6 +198,8 @@ class ExecutableRunOptions {
   ExecutableRunOptions& set_rng_seed(int rng_seed);
   int rng_seed() const;
 
+  // A non-zero distributed launch id must be identical on all participants
+  // and unique among concurrently in-flight launches.
   ExecutableRunOptions& set_launch_id(int32_t launch_id) {
     launch_id_ = launch_id;
     return *this;

@@ -18,10 +18,12 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "third_party/nccl/nccl.h"
 #include "xla/backends/gpu/collectives/cancellation_token.h"
+#include "xla/backends/gpu/collectives/nccl_types.h"
 #include "xla/util.h"
 
 namespace xla::gpu {
@@ -49,6 +51,24 @@ absl::Status PollUntilDone(ncclComm_t comm, const CancellationToken& cancel) {
   VLOG(1) << "Polled NCCL communicator " << comm << " for " << (stop - start)
           << ": " << s;
   return s;
+}
+
+absl::Status PollUntilDone(NcclCommState& comm_state,
+                           const CancellationToken& cancel) {
+  while (true) {
+    if (cancel.IsCancelled()) {
+      return Cancelled("NcclCommunicator cancelled");
+    }
+    ncclResult_t state = ncclInProgress;
+    {
+      absl::MutexLock lock(comm_state.mutex);
+      if (cancel.IsCancelled() || comm_state.aborted || comm_state.destroyed) {
+        return Cancelled("NcclCommunicator aborted");
+      }
+      XLA_NCCL_RETURN_IF_ERROR(ncclCommGetAsyncError(comm_state.comm, &state));
+    }
+    if (state != ncclInProgress) return XLA_NCCL_STATUS(state);
+  }
 }
 
 }  // namespace xla::gpu

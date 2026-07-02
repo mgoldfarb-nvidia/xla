@@ -21,32 +21,12 @@ limitations under the License.
 
 #include "absl/synchronization/mutex.h"
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
-#include "xla/core/collectives/symmetric_memory.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/gpu/multicast_memory.h"
 #include "xla/stream_executor/memory_allocation.h"
 #include "xla/tsl/util/tied_ref.h"
 
 namespace xla::gpu {
-
-std::shared_ptr<SymmetricMemory> CollectiveMemoryCache::FindSymmetricMemory(
-    const GpuCliqueKey& clique, stream_executor::DeviceAddressBase addr) {
-  absl::MutexLock lock(mutex_);
-  auto it = sym_memories_.find(Key{clique, addr});
-  if (it == sym_memories_.end()) {
-    return nullptr;
-  }
-  return it->second.Lock();
-}
-
-std::shared_ptr<SymmetricMemory> CollectiveMemoryCache::AddSymmetricMemory(
-    const GpuCliqueKey& clique, stream_executor::DeviceAddressBase addr,
-    tsl::TiedRef<SymmetricMemory> sym_memory) {
-  absl::MutexLock lock(mutex_);
-  auto [it, _] =
-      sym_memories_.insert_or_assign(Key{clique, addr}, std::move(sym_memory));
-  return it->second.Lock();
-}
 
 std::shared_ptr<stream_executor::gpu::MulticastMemory>
 CollectiveMemoryCache::AddMulticastMemory(
@@ -68,7 +48,5 @@ CollectiveMemoryCache::FindMulticastMemory(
   }
   return it->second.Lock();
 }
-
-
 
 }  // namespace xla::gpu

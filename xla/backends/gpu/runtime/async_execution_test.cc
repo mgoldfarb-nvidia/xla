@@ -85,6 +85,24 @@ TEST(AsyncExecutionTest, InitializeStartDone) {
   ASSERT_OK(async_execution.Done(&state, stream.get()));
 }
 
+TEST(AsyncExecutionTest, ExecutionStateOutlivesAsyncExecution) {
+  ASSERT_OK_AND_ASSIGN(se::StreamExecutor * executor, CreateExecutor());
+
+  Thunk::ThunkInfo thunk_info;
+  thunk_info.thunk_id = ThunkId(1);
+  thunk_info.profile_annotation = "test-thunk";
+  Thunk::ExecutionScopedState state;
+
+  {
+    AsyncExecution async_execution(thunk_info);
+    ASSERT_OK(async_execution.Initialize(&state, executor));
+  }
+
+  // Returning the borrowed event after AsyncExecution is destroyed must remain
+  // safe. ExecutionScopedState keeps the event pool alive until this point.
+  state.clear();
+}
+
 TEST(AsyncExecutionTest, DoneWithoutStartFails) {
   ASSERT_OK_AND_ASSIGN(se::StreamExecutor * executor, CreateExecutor());
 

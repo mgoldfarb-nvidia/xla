@@ -34,6 +34,8 @@ limitations under the License.
 
 namespace xla::gpu {
 
+class GpuCliqueAgreement;
+
 // Parameters capturing all the details required for collective execution of
 // XLA executables (multiple partitions and replicas).
 struct CollectiveParams {
@@ -53,10 +55,17 @@ struct CollectiveParams {
 
   GpuCollectives* collectives;
   se::StreamExecutor* executor;
+  // Main execution stream. Provider-native initialization barriers use this
+  // stream and synchronously validate their rank tokens before returning.
+  se::Stream* stream;
 
   // XLA execution run id allows us to distinguish collective operations
   // from different concurrent executions and avoid deadlocks.
   RunId run_id;
+
+  // Globally coordinated execution identifier. Non-local device communication
+  // requires a non-zero value so agreement can detect launch-order mismatch.
+  int32_t launch_id;
 
   // Streams for asynchronous collective communications.
   absl::InlinedVector<se::Stream*, 4> async_streams;
@@ -67,6 +76,7 @@ struct CollectiveParams {
   const DeviceAssignment* device_assn;
   const GlobalDeviceIdMap* global_device_id_map;
   const CliqueIdCallback* clique_id_callback;
+  GpuCliqueAgreement* clique_agreement;
   const absl::flat_hash_map<GlobalDeviceId, IncarnationId>* incarnations;
 
   int64_t collective_max_nchannels;
@@ -78,12 +88,14 @@ struct CollectiveParams {
 
  private:
   CollectiveParams(
-      GpuCollectives* collectives, se::StreamExecutor* executor, RunId run_id,
+      GpuCollectives* collectives, se::StreamExecutor* executor,
+      se::Stream* stream, RunId run_id, int32_t launch_id,
       absl::Span<se::Stream* const> async_streams,
       LocalDeviceId local_device_id, GlobalDeviceId global_device_id,
       const DeviceAssignment* device_assn,
       const GlobalDeviceIdMap* global_device_id_map,
       const CliqueIdCallback* clique_id_callback,
+      GpuCliqueAgreement* clique_agreement,
       const absl::flat_hash_map<GlobalDeviceId, IncarnationId>* incarnations,
       int64_t collective_max_nchannels, int64_t p2p_max_nchannels,
       int local_device_count, bool collective_use_minimal_resource);

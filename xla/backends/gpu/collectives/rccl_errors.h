@@ -57,6 +57,8 @@ limitations under the License.
 
 namespace xla::gpu {
 
+struct RcclCommState;
+
 // Polls the provided communicator until it is "done" or cancelled.
 //
 // RCCL communicators can be blocking or non-blocking. Operations performed on
@@ -71,6 +73,9 @@ namespace xla::gpu {
 // documentation and exercise caution when reasoning about whether an operation
 // is really "done".
 absl::Status PollUntilDone(ncclComm_t comm, const CancellationToken& cancel);
+
+absl::Status PollUntilDone(RcclCommState& comm_state,
+                           const CancellationToken& cancel);
 
 }  // namespace xla::gpu
 

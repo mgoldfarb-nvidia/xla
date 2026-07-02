@@ -110,6 +110,7 @@ limitations under the License.
 #include "xla/backends/gpu/transforms/collectives/collective_ops_utils.h"
 #include "xla/backends/gpu/transforms/dynamic_slice_copy.h"
 #include "xla/backends/gpu/transforms/dynamic_slice_fusion.h"
+#include "xla/backends/gpu/transforms/ffi_device_communication_verifier.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
 #include "xla/codegen/kernel_definition.h"
 #include "xla/codegen/kernel_spec.h"
@@ -1040,6 +1041,10 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCustomCallThunk(
   // with a rich type safe API.
   bool is_ffi_custom_call =
       instr->api_version() == CustomCallApiVersion::API_VERSION_TYPED_FFI;
+  if (is_ffi_custom_call) {
+    RETURN_IF_ERROR(VerifyFfiDeviceCommunicationCustomCall(
+        *instr, ir_emitter_context_->platform_name()));
+  }
 
   using Slices = std::vector<NullableShapedSlice>;
 

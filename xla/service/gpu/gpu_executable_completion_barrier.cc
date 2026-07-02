@@ -15,19 +15,112 @@ limitations under the License.
 
 #include "xla/service/gpu/gpu_executable_completion_barrier.h"
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <memory>
 #include <utility>
+#include <vector>
 
 #include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/functional/function_ref.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/runtime/device_id.h"
 #include "xla/service/gpu/gpu_executable_run_options.h"
+#include "xla/service/rendezvous.h"
 #include "xla/stream_executor/stream.h"
 
 namespace xla::gpu {
+namespace {
+
+struct GpuExecutableRendezvousKey {
+  int64_t run_id;
+  GpuExecutableRendezvousPhase phase;
+  std::vector<int64_t> participant_devices;
+
+  template <typename H>
+  friend H AbslHashValue(H h, const GpuExecutableRendezvousKey& key) {
+    return H::combine(std::move(h), key.run_id, key.phase,
+                      key.participant_devices);
+  }
+
+  friend bool operator==(const GpuExecutableRendezvousKey& lhs,
+                         const GpuExecutableRendezvousKey& rhs) {
+    return lhs.run_id == rhs.run_id && lhs.phase == rhs.phase &&
+           lhs.participant_devices == rhs.participant_devices;
+  }
+};
+
+}  // namespace
+
+GpuExecutableErrorCleanupDisposition GetGpuExecutableErrorCleanupDisposition(
+    GpuExecutableCompletionBarrierState barrier_state,
+    bool deferred_controller_available, bool tail_cleanup_enabled) {
+  switch (barrier_state) {
+    case GpuExecutableCompletionBarrierState::kSucceeded:
+      return GpuExecutableErrorCleanupDisposition::kSynchronous;
+    case GpuExecutableCompletionBarrierState::kFailed:
+    case GpuExecutableCompletionBarrierState::kRemote:
+      return deferred_controller_available
+                 ? GpuExecutableErrorCleanupDisposition::kQuarantine
+                 : GpuExecutableErrorCleanupDisposition::kFatal;
+    case GpuExecutableCompletionBarrierState::kNotRequired:
+      return deferred_controller_available && tail_cleanup_enabled
+                 ? GpuExecutableErrorCleanupDisposition::kDeferred
+                 : GpuExecutableErrorCleanupDisposition::kSynchronous;
+  }
+  return GpuExecutableErrorCleanupDisposition::kFatal;
+}
+
+absl::Status AggregateGpuExecutableCompletionStatuses(
+    absl::Span<absl::Status* const> statuses) {
+  absl::Status result = absl::OkStatus();
+  for (const absl::Status* status : statuses) {
+    if (status == nullptr) {
+      result.Update(absl::InternalError(
+          "Completion rendezvous received a null rank status"));
+    } else {
+      result.Update(*status);
+    }
+  }
+  return result;
+}
+
+absl::Status RendezvousGpuExecutableStatuses(
+    absl::string_view name, int64_t run_id, GpuExecutableRendezvousPhase phase,
+    absl::Span<const GlobalDeviceId> participant_devices,
+    absl::Status local_status, size_t num_local_participants,
+    absl::Duration warn_stuck_timeout, absl::Duration terminate_timeout) {
+  std::vector<int64_t> canonical_participants;
+  canonical_participants.reserve(participant_devices.size());
+  for (GlobalDeviceId device : participant_devices) {
+    canonical_participants.push_back(device.value());
+  }
+  absl::c_sort(canonical_participants);
+  canonical_participants.erase(
+      std::unique(canonical_participants.begin(), canonical_participants.end()),
+      canonical_participants.end());
+
+  GpuExecutableRendezvousKey key{run_id, phase,
+                                 std::move(canonical_participants)};
+  absl::StatusOr<std::shared_ptr<absl::Status>> rendezvous_status =
+      Rendezvous<absl::Status>(
+          name, key, local_status, num_local_participants,
+          [](absl::Span<absl::Status*> statuses) {
+            return AggregateGpuExecutableCompletionStatuses(statuses);
+          },
+          warn_stuck_timeout, terminate_timeout);
+  if (!rendezvous_status.ok()) {
+    local_status.Update(rendezvous_status.status());
+    return local_status;
+  }
+  return **rendezvous_status;
+}
 
 absl::Status MaybeRunGpuExecutableCompletionBarrier(
     const absl::flat_hash_set<GlobalDeviceId>& requested_devices,

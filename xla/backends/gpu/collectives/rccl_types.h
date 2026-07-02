@@ -13,57 +13,44 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef XLA_BACKENDS_GPU_COLLECTIVES_NCCL_TYPES_H_
-#define XLA_BACKENDS_GPU_COLLECTIVES_NCCL_TYPES_H_
+#ifndef XLA_BACKENDS_GPU_COLLECTIVES_RCCL_TYPES_H_
+#define XLA_BACKENDS_GPU_COLLECTIVES_RCCL_TYPES_H_
 
-#include <cstddef>
 #include <memory>
 #include <utility>
 
 #include "absl/base/thread_annotations.h"
-#include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
-#include "third_party/nccl/nccl.h"
+#include "rocm/rocm_config.h"  // IWYU pragma: keep
 #include "xla/backends/gpu/collectives/cancellation_token.h"
 #include "xla/backends/gpu/collectives/gpu_communicator.h"
-#include "xla/core/collectives/reduction_kind.h"
-#include "xla/stream_executor/cuda/cuda_compute_capability.h"
-#include "xla/xla_data.pb.h"
+
+#if (TF_ROCM_VERSION >= 50200)
+#include "rocm/include/rccl/rccl.h"
+#else
+#include "rocm/include/rccl.h"
+#endif  // TF_ROCM_VERSION >= 50200
 
 namespace xla::gpu {
 
-struct NcclCommState {
-  explicit NcclCommState(ncclComm_t comm,
+// State shared by an RCCL communicator and provider resources derived from it.
+// The abort bit remains valid after the parent object is destroyed and
+// prevents child destructors from calling RCCL with an aborted communicator.
+struct RcclCommState {
+  explicit RcclCommState(ncclComm_t comm,
                          std::shared_ptr<CancellationToken> cancel = nullptr)
       : comm(comm),
         cancel(cancel != nullptr ? std::move(cancel)
                                  : std::make_shared<CancellationToken>()) {}
 
-  ncclComm_t comm ABSL_GUARDED_BY(mutex);
+  ncclComm_t comm;
   bool aborted ABSL_GUARDED_BY(mutex) = false;
   bool destroyed ABSL_GUARDED_BY(mutex) = false;
   std::shared_ptr<CancellationToken> cancel;
   GpuProviderHostStorage host_storage;
-
-  // NCCL API restricts concurrent usage with the same communicator.
-  // See:
-  // https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/threadsafety.html
-  // Therefore all NCCL API calls are guarded by this mutex.
   absl::Mutex mutex;
 };
 
-//===----------------------------------------------------------------------===//
-// Conversions between XLA and NCCL data types
-//===----------------------------------------------------------------------===//
-
-size_t ToNcclCount(PrimitiveType dtype, size_t count);
-
-absl::StatusOr<ncclDataType_t> ToNcclDataType(
-    PrimitiveType dtype, bool is_reduction_op,
-    stream_executor::CudaComputeCapability cc);
-
-ncclRedOp_t ToNcclReduction(ReductionKind kind);
-
 }  // namespace xla::gpu
 
-#endif  // XLA_BACKENDS_GPU_COLLECTIVES_NCCL_TYPES_H_
+#endif  // XLA_BACKENDS_GPU_COLLECTIVES_RCCL_TYPES_H_

@@ -1635,7 +1635,7 @@ WrapInputsInShapeTree(PjRtStreamExecutorClient* client,
 
 absl::StatusOr<PjRtStreamExecutorExecutionOutput>
 PjRtStreamExecutorClient::RunAsync(
-    LocalExecutable& exec, PjRtDevice* device,
+    std::shared_ptr<LocalExecutable> exec, PjRtDevice* device,
     absl::Span<const PjRtRawBufferRef> flat_arguments,
     absl::Span<const PjRtRawBufferRef> results,
     ExecutableRunOptions run_options, bool parameter_is_tupled_arguments,
@@ -1648,8 +1648,8 @@ PjRtStreamExecutorClient::RunAsync(
           std::move(flat_arguments), run_options.device_ordinal()));
 
   const auto& alias_config =
-      exec.executable()->module().input_output_alias_config();
-  const auto& result_shape = exec.executable()->module().result_shape();
+      exec->executable()->module().input_output_alias_config();
+  const auto& result_shape = exec->executable()->module().result_shape();
   auto get_alias = [&](int i) {
     return result_shape.IsTuple() ? alias_config.GetAliasedParameter({i})
                                   : alias_config.GetAliasedParameter({});
@@ -1690,7 +1690,7 @@ PjRtStreamExecutorClient::RunAsync(
 
   ASSIGN_OR_RETURN(
       ExecutionOutput output,
-      exec.RunAsync(std::move(xla_arguments), std::move(run_options)));
+      exec->RunAsync(std::move(xla_arguments), std::move(run_options)));
   ScopedShapedBuffer ssb = output.ConsumeResult();
   std::vector<se::ScopedDeviceAddress<uint8_t>> se_to_be_released =
       output.ConsumeToBeReleased();
@@ -1929,7 +1929,7 @@ PjRtStreamExecutorRawLoadedExecutable::Execute(
     absl::StatusOr<PjRtStreamExecutorExecutionOutput> result_buffer_or_status;
     if (predetermined_error.ok()) {
       result_buffer_or_status =
-          client->RunAsync(*executable, device, inputs, results, run_options,
+          client->RunAsync(executable, device, inputs, results, run_options,
                            parameter_is_tupled_arguments,
                            *on_device_executable_parameter_shapes);
     } else {

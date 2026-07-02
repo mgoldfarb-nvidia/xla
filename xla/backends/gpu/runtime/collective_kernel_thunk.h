@@ -161,9 +161,9 @@ class CollectiveKernelThunk : public Thunk {
     // Pointer to the collective kernel metadata on device.
     se::DeviceAddressBase metadata;
 
-    // These vectors are merely pointers into the buffer(s) above ordered
-    // by RankId. They are initialized once at the end of Initialize() and never
-    // changed.
+    // These vectors are merely pointers into the persistent scratch buffers
+    // above, ordered by RankId. The device metadata that also contains
+    // execution-scoped multimem addresses is refreshed by every Initialize().
     std::array<se::DeviceAddressBase, kNumBuffers> remote_buffer_ptrs;
     std::array<se::DeviceAddressBase, kNumBuffers> signal_buffer_ptrs;
     // Kernel entry for the stream executor.

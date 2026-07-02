@@ -145,6 +145,11 @@ class CollectiveCliqueRequests {
       absl::Span<const std::vector<GlobalDeviceId>> device_groups,
       const CliqueRequirements& requirements = {});
 
+  // Adds module-completion ordering to an existing clique request. Symmetric
+  // memory registrations are execution-scoped and must not be released until
+  // every rank has finished using them.
+  absl::Status RequestModuleExecutionBarrier(const GpuCliqueKey& clique_key);
+
   // Returns all requested cliques in undefined order.
   std::vector<GpuCliqueKey> RequestedCliques() const;
 
@@ -156,6 +161,11 @@ class CollectiveCliqueRequests {
 
   // Returns devices which requested a barrier after module execution.
   absl::flat_hash_set<GlobalDeviceId> GetDevicesRequiringBarrier() const;
+
+  // Returns true if a requested post-execution barrier includes devices owned
+  // by another process. A process-local host rendezvous cannot establish
+  // remote quiescence for these requests after an execution failure.
+  bool BarrierRequiresRemoteParticipants() const;
 
  private:
   absl::flat_hash_map<GpuCliqueKey, CliqueRequest> cliques_;

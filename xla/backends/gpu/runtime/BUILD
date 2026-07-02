@@ -35,6 +35,40 @@ cc_library(
 )
 
 cc_library(
+    name = "deferred_gpu_execution_completion",
+    srcs = ["deferred_gpu_execution_completion.cc"],
+    hdrs = ["deferred_gpu_execution_completion.h"],
+    deps = [
+        "//xla/stream_executor:stream",
+        "//xla/tsl/platform:env",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/functional:function_ref",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+xla_cc_test(
+    name = "deferred_gpu_execution_completion_test",
+    srcs = ["deferred_gpu_execution_completion_test.cc"],
+    deps = [
+        ":deferred_gpu_execution_completion",
+        "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "while_loop",
     srcs = ["while_loop.cc"],
     hdrs = ["while_loop.h"],
@@ -2927,12 +2961,15 @@ cc_library(
         "@com_google_absl//absl/container:btree",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
         "@tsl//tsl/platform:casts",
+        "@tsl//tsl/platform:fingerprint",
         "@tsl//tsl/profiler/lib:traceme",
     ],
 )
@@ -2974,7 +3011,6 @@ cc_library(
     compatible_with = get_compatible_with_portable(),
     deps = [
         "//xla/backends/gpu/collectives:gpu_clique_key",
-        "//xla/core/collectives:symmetric_memory",
         "//xla/stream_executor:device_address",
         "//xla/stream_executor:memory_allocation",
         "//xla/stream_executor/gpu:multicast_memory",
@@ -2995,6 +3031,7 @@ cc_library(
         ":collective_params",
         "//xla:util",
         "//xla/backends/gpu/collectives:gpu_clique",
+        "//xla/backends/gpu/collectives:gpu_clique_agreement",
         "//xla/backends/gpu/collectives:gpu_clique_key",
         "//xla/backends/gpu/collectives:gpu_cliques",
         "//xla/backends/gpu/collectives:gpu_communicator",
@@ -3012,11 +3049,15 @@ cc_library(
         "@com_google_absl//absl/base",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
         "@tsl//tsl/platform:casts",
+        "@tsl//tsl/platform:fingerprint",
         "@tsl//tsl/profiler/lib:traceme",
     ],
 )
@@ -3699,9 +3740,12 @@ cc_library(
         "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/synchronization",

@@ -154,6 +154,49 @@ TEST(CollectiveCliqueRequestsTest, BarrierAfterModuleExecutionRequested) {
 
   EXPECT_THAT(requests.GetDevicesRequiringBarrier(),
               UnorderedElementsAre(d0, d1));
+  EXPECT_FALSE(requests.BarrierRequiresRemoteParticipants());
+}
+
+TEST(CollectiveCliqueRequestsTest,
+     AddsModuleExecutionBarrierToExistingRequest) {
+  GlobalDeviceId d0(0);
+  GlobalDeviceId d1(1);
+  GpuCliqueKey clique({d0, d1}, /*num_local_participants=*/2);
+  std::vector<std::vector<GlobalDeviceId>> device_groups = {{d0, d1}};
+
+  CollectiveCliqueRequests requests;
+  ASSERT_OK(requests.RequestClique(clique, device_groups));
+  ASSERT_OK(requests.RequestModuleExecutionBarrier(clique));
+
+  EXPECT_THAT(requests.GetDevicesRequiringBarrier(),
+              UnorderedElementsAre(d0, d1));
+}
+
+TEST(CollectiveCliqueRequestsTest,
+     RejectsModuleExecutionBarrierForUnknownRequest) {
+  GpuCliqueKey clique({GlobalDeviceId(0)}, /*num_local_participants=*/1);
+  CollectiveCliqueRequests requests;
+
+  EXPECT_THAT(requests.RequestModuleExecutionBarrier(clique),
+              absl_testing::StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST(CollectiveCliqueRequestsTest,
+     BarrierDetectsParticipantsOwnedByAnotherProcess) {
+  GlobalDeviceId d0 = GlobalDeviceId(0);
+  GlobalDeviceId d1 = GlobalDeviceId(1);
+  GpuCliqueKey nonlocal_clique({d0, d1}, /*num_local_participants=*/1);
+  std::vector<std::vector<GlobalDeviceId>> device_groups = {{d0, d1}};
+  CollectiveCliqueRequests::CliqueRequirements requirements{
+      std::nullopt, CollectiveCliqueRequests::BarrierRequirements{true}};
+
+  CollectiveCliqueRequests requests;
+  TF_ASSERT_OK(
+      requests.RequestClique(nonlocal_clique, device_groups, requirements));
+
+  EXPECT_TRUE(requests.BarrierRequiresRemoteParticipants());
+  EXPECT_THAT(requests.GetDevicesRequiringBarrier(),
+              UnorderedElementsAre(d0, d1));
 }
 
 TEST(CollectiveCliqueRequestsTest,

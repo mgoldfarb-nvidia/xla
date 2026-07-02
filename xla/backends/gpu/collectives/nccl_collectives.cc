@@ -253,12 +253,10 @@ static auto DevicesToString(absl::Span<const GlobalDeviceId> devices) {
                          HumanReadableDevices(devices));
 }
 
-static ncclComm_t Cast(const Communicator* comm) {
+static std::shared_ptr<NcclCommState> Cast(const Communicator* comm) {
   auto* nccl_communicator = absl::down_cast<const NcclCommunicator*>(comm);
   CHECK(nccl_communicator != nullptr) << "Unsupported XLA communicator";
-  std::shared_ptr<NcclCommState> comm_state = nccl_communicator->comm_state();
-  absl::MutexLock lock(comm_state->mutex);
-  return comm_state->comm;
+  return nccl_communicator->comm_state();
 }
 
 absl::StatusOr<CliqueId> NcclCollectives::CreateUniqueCliqueId() const {
@@ -270,6 +268,8 @@ absl::StatusOr<CliqueId> NcclCollectives::CreateUniqueCliqueId() const {
 absl::Status NcclCollectives::GroupLaunch(
     absl::Span<const GpuCommunicator* const> comms,
     absl::FunctionRef<absl::Status()> group) {
+  std::vector<std::shared_ptr<NcclCommState>> comm_states;
+  comm_states.reserve(comms.size());
   for (const GpuCommunicator* comm : comms) {
     auto* nccl_comm = absl::down_cast<const NcclCommunicator*>(comm);
     if (!nccl_comm->IsBlocking()) {
@@ -277,9 +277,12 @@ absl::Status NcclCollectives::GroupLaunch(
           "NCCL multi-communicator group launch requires blocking "
           "communicators");
     }
+    comm_states.push_back(nccl_comm->comm_state());
   }
 
-  ASSIGN_OR_RETURN(bool launched, NcclGroupLaunch(group));
+  ASSIGN_OR_RETURN(bool launched, internal::RunGpuCommGroupWithLock(
+                                      std::move(comm_states),
+                                      [&] { return NcclGroupLaunch(group); }));
   if (launched) {
     for (const GpuCommunicator* comm : comms) {
       auto* nccl_comm = absl::down_cast<const NcclCommunicator*>(comm);
@@ -504,18 +507,29 @@ NcclCollectives::SplitCommunicatorsWithCancel(
     });
 
     absl::Time split_start = absl::Now();
-    ncclComm_t parent_comm = Cast(comms[i]);
-    VLOG(1) << absl::StreamFormat(
-        "[%d] [rank=%v] Split NCCL communicator %p with color %d and key %v",
-        device_ordinal, rank, static_cast<const void*>(parent_comm), color,
-        key);
-
     ASSIGN_OR_RETURN(ncclConfig_t comm_config,
                      AsNcclConfig(gpu_config, stream_executors[i]));
 
+    std::shared_ptr<NcclCommState> parent = Cast(comms[i]);
+    if (parent->cancel->IsCancelled()) {
+      return FailedPrecondition("NcclCommunicator aborted");
+    }
+    ncclComm_t parent_comm;
     ncclComm_t split_comm;
-    XLA_NCCL_RETURN_IF_ERROR(ncclCommSplit(parent_comm, color, key.value(),
-                                           &split_comm, &comm_config));
+    {
+      absl::MutexLock lock(parent->mutex);
+      if (parent->cancel->IsCancelled() || parent->aborted ||
+          parent->destroyed) {
+        return FailedPrecondition("NcclCommunicator aborted");
+      }
+      parent_comm = parent->comm;
+      VLOG(1) << absl::StreamFormat(
+          "[%d] [rank=%v] Split NCCL communicator %p with color %d and key %v",
+          device_ordinal, rank, static_cast<const void*>(parent_comm), color,
+          key);
+      XLA_NCCL_RETURN_IF_ERROR(ncclCommSplit(parent_comm, color, key.value(),
+                                             &split_comm, &comm_config));
+    }
 
     absl::Time split_done = absl::Now();
     VLOG(1) << absl::StreamFormat(
@@ -549,7 +563,6 @@ NcclCollectives::SplitCommunicatorsWithCancel(
 
   return JoinFutures(absl::MakeSpan(futures)).Await();
 }
-
 
 absl::StatusOr<GpuCollectives::CliqueIdCallback>
 NcclCollectives::InitializeTopology(const Topology& topology) {

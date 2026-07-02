@@ -16,7 +16,9 @@ limitations under the License.
 #include "xla/backends/gpu/collectives/gpu_communicator.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -32,6 +34,7 @@ namespace {
 
 using ::absl_testing::IsOk;
 using ::absl_testing::StatusIs;
+using ::testing::AllOf;
 using ::testing::HasSubstr;
 using Requirements = GpuDeviceCommunicator::Requirements;
 
@@ -166,6 +169,205 @@ TEST(GpuDeviceCommunicatorKernelArgAbiTest, RejectsVersionMismatch) {
                                              /*expected_version=*/457),
               StatusIs(absl::StatusCode::kFailedPrecondition,
                        HasSubstr("version mismatch")));
+}
+
+TEST(GpuCliqueBarrierTokenTest, AcceptsMatchingNonzeroTokens) {
+  GpuCliqueBarrierToken token{0x1234, 0x5678};
+  std::vector<GpuCliqueBarrierToken> gathered(4, token);
+
+  EXPECT_THAT(ValidateGpuCliqueBarrierTokens(token, gathered), IsOk());
+}
+
+TEST(GpuCliqueBarrierTokenTest, RejectsZeroToken) {
+  std::vector<GpuCliqueBarrierToken> gathered(2, GpuCliqueBarrierToken{});
+
+  EXPECT_THAT(
+      ValidateGpuCliqueBarrierTokens({}, gathered),
+      StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("nonzero")));
+}
+
+TEST(GpuCliqueBarrierTokenTest, RejectsEmptyGather) {
+  EXPECT_THAT(
+      ValidateGpuCliqueBarrierTokens({1, 2}, {}),
+      StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("at least one")));
+}
+
+TEST(GpuCliqueBarrierTokenTest, ReportsFirstMismatchingRank) {
+  GpuCliqueBarrierToken token{0x1234, 0x5678};
+  std::vector<GpuCliqueBarrierToken> gathered = {
+      token, token, GpuCliqueBarrierToken{0x1234, 0x9abc}, token};
+
+  EXPECT_THAT(ValidateGpuCliqueBarrierTokens(token, gathered),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       AllOf(HasSubstr("rank 2"), HasSubstr("mismatch"))));
+}
+
+TEST(GpuCliqueBarrierTokenTest, MismatchFailsFromEveryRanksPerspective) {
+  std::vector<GpuCliqueBarrierToken> gathered = {{0x1, 0x2}, {0x3, 0x4}};
+
+  for (GpuCliqueBarrierToken local_token : gathered) {
+    EXPECT_THAT(
+        ValidateGpuCliqueBarrierTokens(local_token, gathered),
+        StatusIs(absl::StatusCode::kFailedPrecondition, HasSubstr("mismatch")));
+  }
+}
+
+TEST(GpuProviderHostStorageTest, RetainsUntilProviderTeardownCompletes) {
+  GpuProviderHostStorage storage;
+  auto value = std::make_shared<int>(42);
+  std::weak_ptr<int> weak = value;
+
+  storage.RetainUntilProviderTeardown(value);
+  value.reset();
+  EXPECT_FALSE(weak.expired());
+  EXPECT_EQ(storage.retained_count_for_test(), 1);
+
+  storage.ProviderTeardownComplete();
+  EXPECT_TRUE(weak.expired());
+  EXPECT_EQ(storage.retained_count_for_test(), 0);
+}
+
+TEST(GpuProviderHostStorageTest, DoesNotRetainAfterProviderTeardown) {
+  GpuProviderHostStorage storage;
+  storage.ProviderTeardownComplete();
+  auto value = std::make_shared<int>(42);
+  std::weak_ptr<int> weak = value;
+
+  storage.RetainUntilProviderTeardown(value);
+  value.reset();
+
+  EXPECT_TRUE(weak.expired());
+  EXPECT_EQ(storage.retained_count_for_test(), 0);
+}
+
+TEST(GpuProviderHostStorageTest, RetainsOnlyFailedProviderOutputs) {
+  GpuProviderHostStorage storage;
+  auto completed = std::make_shared<int>(1);
+  auto failed = std::make_shared<int>(2);
+  std::weak_ptr<int> completed_weak = completed;
+  std::weak_ptr<int> failed_weak = failed;
+
+  storage.RetainOnFailure(absl::OkStatus(), completed);
+  storage.RetainOnFailure(absl::InternalError("failed"), failed);
+  completed.reset();
+  failed.reset();
+
+  EXPECT_TRUE(completed_weak.expired());
+  EXPECT_FALSE(failed_weak.expired());
+  EXPECT_EQ(storage.retained_count_for_test(), 1);
+
+  storage.ProviderTeardownComplete();
+  EXPECT_TRUE(failed_weak.expired());
+}
+
+TEST(GpuProviderHostStorageTest, QuarantinesAfterProviderTeardownFailure) {
+  GpuProviderHostStorage storage;
+  auto retained_before_failure = std::make_shared<int>(1);
+  std::weak_ptr<int> before_weak = retained_before_failure;
+  storage.RetainUntilProviderTeardown(retained_before_failure);
+
+  storage.ProviderTeardownFailed();
+  retained_before_failure.reset();
+  EXPECT_FALSE(before_weak.expired());
+  EXPECT_EQ(storage.retained_count_for_test(), 0);
+
+  // A later completion signal cannot retroactively establish safety for
+  // pointers already exposed during a failed teardown.
+  storage.ProviderTeardownComplete();
+  auto retained_after_failure = std::make_shared<int>(2);
+  std::weak_ptr<int> after_weak = retained_after_failure;
+  storage.RetainUntilProviderTeardown(retained_after_failure);
+  retained_after_failure.reset();
+  EXPECT_FALSE(after_weak.expired());
+}
+
+TEST(ScopedGpuCommGroupLockOwnershipTest, TracksNestedSameThreadOwnership) {
+  int first_state;
+  int second_state;
+  EXPECT_FALSE(internal::IsGpuCommGroupLockOwnedByCurrentThread(&first_state));
+
+  {
+    internal::ScopedGpuCommGroupLockOwnership first(&first_state);
+    EXPECT_TRUE(internal::IsGpuCommGroupLockOwnedByCurrentThread(&first_state));
+    EXPECT_FALSE(
+        internal::IsGpuCommGroupLockOwnedByCurrentThread(&second_state));
+
+    {
+      internal::ScopedGpuCommGroupLockOwnership nested(&first_state);
+      internal::ScopedGpuCommGroupLockOwnership second(&second_state);
+      EXPECT_TRUE(
+          internal::IsGpuCommGroupLockOwnedByCurrentThread(&first_state));
+      EXPECT_TRUE(
+          internal::IsGpuCommGroupLockOwnedByCurrentThread(&second_state));
+    }
+
+    EXPECT_TRUE(internal::IsGpuCommGroupLockOwnedByCurrentThread(&first_state));
+    EXPECT_FALSE(
+        internal::IsGpuCommGroupLockOwnedByCurrentThread(&second_state));
+  }
+
+  EXPECT_FALSE(internal::IsGpuCommGroupLockOwnedByCurrentThread(&first_state));
+}
+
+TEST(RunGpuCommGroupWithLockTest, MarksDeduplicatedStatesAndSupportsNesting) {
+  struct FakeCancel {
+    bool IsCancelled() const { return cancelled; }
+    bool cancelled = false;
+  };
+  struct FakeCommState {
+    std::shared_ptr<FakeCancel> cancel = std::make_shared<FakeCancel>();
+    absl::Mutex mutex;
+    bool aborted = false;
+    bool destroyed = false;
+  };
+
+  auto first = std::make_shared<FakeCommState>();
+  auto second = std::make_shared<FakeCommState>();
+  auto launched = internal::RunGpuCommGroupWithLock(
+      std::vector<std::shared_ptr<FakeCommState>>{second, first, second}, [&] {
+        EXPECT_TRUE(
+            internal::IsGpuCommGroupLockOwnedByCurrentThread(first.get()));
+        EXPECT_TRUE(
+            internal::IsGpuCommGroupLockOwnedByCurrentThread(second.get()));
+
+        auto nested = internal::RunGpuCommGroupWithLock(
+            std::vector<std::shared_ptr<FakeCommState>>{first, second},
+            [] { return absl::StatusOr<bool>(false); });
+        EXPECT_TRUE(nested.ok()) << nested.status();
+        return absl::StatusOr<bool>(true);
+      });
+
+  ASSERT_TRUE(launched.ok()) << launched.status();
+  EXPECT_TRUE(*launched);
+  EXPECT_FALSE(internal::IsGpuCommGroupLockOwnedByCurrentThread(first.get()));
+  EXPECT_FALSE(internal::IsGpuCommGroupLockOwnedByCurrentThread(second.get()));
+}
+
+TEST(RunGpuCommGroupWithLockTest, RejectsAddingStateToNestedGroup) {
+  struct FakeCancel {
+    bool IsCancelled() const { return false; }
+  };
+  struct FakeCommState {
+    std::shared_ptr<FakeCancel> cancel = std::make_shared<FakeCancel>();
+    absl::Mutex mutex;
+    bool aborted = false;
+    bool destroyed = false;
+  };
+
+  auto first = std::make_shared<FakeCommState>();
+  auto second = std::make_shared<FakeCommState>();
+  auto outer = internal::RunGpuCommGroupWithLock(
+      std::vector<std::shared_ptr<FakeCommState>>{first}, [&] {
+        auto nested = internal::RunGpuCommGroupWithLock(
+            std::vector<std::shared_ptr<FakeCommState>>{first, second},
+            [] { return absl::StatusOr<bool>(true); });
+        EXPECT_THAT(nested.status(),
+                    StatusIs(absl::StatusCode::kFailedPrecondition,
+                             HasSubstr("cannot add")));
+        return absl::StatusOr<bool>(false);
+      });
+
+  ASSERT_TRUE(outer.ok()) << outer.status();
 }
 
 }  // namespace

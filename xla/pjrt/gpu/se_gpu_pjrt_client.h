@@ -69,6 +69,10 @@ limitations under the License.
 #include "tsl/platform/numa.h"
 
 namespace xla {
+namespace gpu {
+class DeferredGpuExecutionRegistry;
+}  // namespace gpu
+
 using DeviceTopologyPair =
     std::pair<std::vector<std::unique_ptr<PjRtStreamExecutorDevice>>,
               GpuTopologyProto>;
@@ -125,6 +129,7 @@ class StreamExecutorGpuClient : public xla::PjRtStreamExecutorClient {
       std::optional<int> num_processes,
       std::shared_ptr<gpu::AllocatorMemoryRegistration> memory_registration =
           nullptr);
+  ~StreamExecutorGpuClient() override;
 
   std::optional<std::shared_ptr<KeyValueStoreInterface>> key_value_store()
       const override {
@@ -187,7 +192,7 @@ class StreamExecutorGpuClient : public xla::PjRtStreamExecutorClient {
       MaybeOwningMlirModule module, CompileOptions options) override;
 
   absl::StatusOr<PjRtStreamExecutorExecutionOutput> RunAsync(
-      LocalExecutable& exec, PjRtDevice* device,
+      std::shared_ptr<LocalExecutable> exec, PjRtDevice* device,
       absl::Span<const PjRtRawBufferRef> flat_arguments,
       absl::Span<const PjRtRawBufferRef> results,
       ExecutableRunOptions run_options_inp, bool parameter_is_tupled_arguments,
@@ -213,6 +218,8 @@ class StreamExecutorGpuClient : public xla::PjRtStreamExecutorClient {
   std::optional<xla::StreamExecutorGpuTopologyDescription> topology_;
   std::shared_ptr<gpu::AllocatorMemoryRegistration> memory_registration_;
   std::shared_ptr<KeyValueStoreInterface> kv_store_;
+  std::unique_ptr<gpu::DeferredGpuExecutionRegistry>
+      deferred_execution_registry_;
 
   // Helpers for cross host transfers.
   absl::Duration cross_host_transfer_timeout_ = absl::Minutes(3);

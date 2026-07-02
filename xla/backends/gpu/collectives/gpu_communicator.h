@@ -16,19 +16,24 @@ limitations under the License.
 #ifndef XLA_BACKENDS_GPU_COLLECTIVES_GPU_COMMUNICATOR_H_
 #define XLA_BACKENDS_GPU_COLLECTIVES_GPU_COMMUNICATOR_H_
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 #include "absl/container/inlined_vector.h"
 #include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "xla/core/collectives/communicator.h"
 #include "xla/core/collectives/rank_id.h"
@@ -42,6 +47,7 @@ limitations under the License.
 #include "xla/xla_data.pb.h"
 
 namespace stream_executor {
+class Stream;
 class StreamExecutor;
 }  // namespace stream_executor
 
@@ -64,6 +70,131 @@ class GpuSignalDesc : public Communicator::SignalDesc {
 struct PlatformCommunicatorHandle {
   void* handle = nullptr;  // will be nullptr if not supported
 };
+
+// Opaque identity of one clique-wide barrier round. Callers must use the same
+// token on every rank and must not reuse a token while another round with that
+// token can still be in flight on the same communicator.
+struct GpuCliqueBarrierToken {
+  uint64_t high = 0;
+  uint64_t low = 0;
+
+  bool operator==(const GpuCliqueBarrierToken& other) const {
+    return high == other.high && low == other.low;
+  }
+  bool operator!=(const GpuCliqueBarrierToken& other) const {
+    return !(*this == other);
+  }
+};
+
+// Validates the result of a provider all-gather for a clique barrier. Exposed
+// for provider-independent tests and shared by NCCL and RCCL implementations.
+absl::Status ValidateGpuCliqueBarrierTokens(
+    GpuCliqueBarrierToken expected,
+    absl::Span<const GpuCliqueBarrierToken> gathered);
+
+// Retains host objects whose addresses may still be referenced by an
+// asynchronous provider operation after a failed completion poll. Abort or
+// communicator destruction must call ProviderTeardownComplete only after the
+// provider guarantees that it will not access those addresses again.
+class GpuProviderHostStorage {
+ public:
+  void RetainUntilProviderTeardown(std::shared_ptr<void> storage);
+  void RetainOnFailure(const absl::Status& status,
+                       std::shared_ptr<void> storage);
+  void ProviderTeardownComplete();
+  void ProviderTeardownFailed();
+
+  size_t retained_count_for_test() const;
+
+ private:
+  mutable absl::Mutex mutex_;
+  bool provider_teardown_complete_ ABSL_GUARDED_BY(mutex_) = false;
+  bool provider_teardown_failed_ ABSL_GUARDED_BY(mutex_) = false;
+  std::vector<std::shared_ptr<void>> retained_ ABSL_GUARDED_BY(mutex_);
+};
+
+namespace internal {
+
+// Records that the current thread owns a communicator mutex for the duration
+// of a provider group. Nested launch helpers use this marker to avoid trying to
+// reacquire the non-recursive mutex. The caller is responsible for holding the
+// corresponding mutex for the marker's full lifetime.
+class ScopedGpuCommGroupLockOwnership {
+ public:
+  explicit ScopedGpuCommGroupLockOwnership(const void* comm_state);
+  ~ScopedGpuCommGroupLockOwnership();
+
+  ScopedGpuCommGroupLockOwnership(const ScopedGpuCommGroupLockOwnership&) =
+      delete;
+  ScopedGpuCommGroupLockOwnership& operator=(
+      const ScopedGpuCommGroupLockOwnership&) = delete;
+
+ private:
+  const void* comm_state_;
+};
+
+bool IsGpuCommGroupLockOwnedByCurrentThread(const void* comm_state);
+
+// Locks all communicator states in deterministic address order, marks them as
+// owned by the current provider group, and invokes `launch`. The markers let
+// nested per-operation launch helpers reuse the already-held mutexes. Locks
+// are released before this function returns, so callers can safely poll after
+// it completes.
+template <typename CommState, typename Launch>
+absl::StatusOr<bool> RunGpuCommGroupWithLock(
+    std::vector<std::shared_ptr<CommState>> comm_states,
+    Launch&& launch) ABSL_NO_THREAD_SAFETY_ANALYSIS {
+  std::sort(comm_states.begin(), comm_states.end(),
+            [](const auto& lhs, const auto& rhs) {
+              return std::less<const CommState*>{}(lhs.get(), rhs.get());
+            });
+  comm_states.erase(std::unique(comm_states.begin(), comm_states.end(),
+                                [](const auto& lhs, const auto& rhs) {
+                                  return lhs.get() == rhs.get();
+                                }),
+                    comm_states.end());
+
+  bool any_owned = false;
+  bool all_owned = true;
+  for (const auto& state : comm_states) {
+    if (state->cancel->IsCancelled()) {
+      return absl::FailedPreconditionError("GPU communicator aborted");
+    }
+    bool owned = IsGpuCommGroupLockOwnedByCurrentThread(state.get());
+    any_owned |= owned;
+    all_owned &= owned;
+  }
+
+  if (any_owned) {
+    if (!all_owned) {
+      return absl::FailedPreconditionError(
+          "A nested provider group cannot add an unlocked communicator");
+    }
+    return std::forward<Launch>(launch)();
+  }
+
+  std::vector<std::unique_ptr<absl::MutexLock>> locks;
+  locks.reserve(comm_states.size());
+  for (const auto& state : comm_states) {
+    if (state->cancel->IsCancelled()) {
+      return absl::FailedPreconditionError("GPU communicator aborted");
+    }
+    locks.push_back(std::make_unique<absl::MutexLock>(state->mutex));
+    if (state->cancel->IsCancelled() || state->aborted || state->destroyed) {
+      return absl::FailedPreconditionError("GPU communicator aborted");
+    }
+  }
+
+  std::vector<std::unique_ptr<ScopedGpuCommGroupLockOwnership>> ownership;
+  ownership.reserve(comm_states.size());
+  for (const auto& state : comm_states) {
+    ownership.push_back(
+        std::make_unique<ScopedGpuCommGroupLockOwnership>(state.get()));
+  }
+  return std::forward<Launch>(launch)();
+}
+
+}  // namespace internal
 
 // A device communicator that corresponds to the host side GPU communicator
 // object (it has same rank in the collective clique and shares underlying
@@ -223,6 +354,68 @@ class GpuDeviceCommunicator {
 // `GpuCommunicator::LaunchAllReduce` method which returns an `absl::Status`.
 class GpuCommunicator : public Communicator {
  public:
+  // Provider-resolved plan for constructing a device communicator. Plans are
+  // internal XLA objects: the agreement payload is exchanged between ranks,
+  // while provider-specific state stays type-erased and process local.
+  class DeviceCommPlan {
+   public:
+    virtual ~DeviceCommPlan() = default;
+
+    const GpuDeviceCommunicator::Requirements& requirements() const {
+      return requirements_;
+    }
+    absl::string_view provider() const { return provider_; }
+    absl::string_view agreement_payload() const { return agreement_payload_; }
+    uint64_t creation_priority() const { return creation_priority_; }
+    const GpuCommunicator* owner() const { return owner_; }
+
+   protected:
+    DeviceCommPlan(const GpuCommunicator* owner,
+                   GpuDeviceCommunicator::Requirements requirements,
+                   std::string provider, std::string agreement_payload,
+                   uint64_t creation_priority)
+        : owner_(owner),
+          requirements_(requirements),
+          provider_(std::move(provider)),
+          agreement_payload_(std::move(agreement_payload)),
+          creation_priority_(creation_priority) {}
+
+   private:
+    const GpuCommunicator* owner_;
+    GpuDeviceCommunicator::Requirements requirements_;
+    std::string provider_;
+    std::string agreement_payload_;
+    uint64_t creation_priority_;
+  };
+
+  // Provider-resolved plan for collectively registering symmetric memory.
+  // The local address remains process-local; agreement_payload contains only
+  // cross-rank comparable properties such as size, flags, and provider ABI.
+  class SymmetricMemoryPlan {
+   public:
+    virtual ~SymmetricMemoryPlan() = default;
+
+    se::DeviceAddressBase address() const { return address_; }
+    absl::string_view provider() const { return provider_; }
+    absl::string_view agreement_payload() const { return agreement_payload_; }
+    const GpuCommunicator* owner() const { return owner_; }
+
+   protected:
+    SymmetricMemoryPlan(const GpuCommunicator* owner,
+                        se::DeviceAddressBase address, std::string provider,
+                        std::string agreement_payload)
+        : owner_(owner),
+          address_(address),
+          provider_(std::move(provider)),
+          agreement_payload_(std::move(agreement_payload)) {}
+
+   private:
+    const GpuCommunicator* owner_;
+    se::DeviceAddressBase address_;
+    std::string provider_;
+    std::string agreement_payload_;
+  };
+
   ~GpuCommunicator() override = default;
 
   // Returns a platform-specific handle to the underlying communicator object.
@@ -239,10 +432,38 @@ class GpuCommunicator : public Communicator {
     return nullptr;
   }
 
-  // Creates a new device communicator linked to *this GPU communicator object.
+  // Synchronously joins a provider-native barrier across all communicator
+  // ranks and verifies that every rank supplied exactly `token`. The token
+  // must be nonzero, globally coordinated, and unique among barrier rounds
+  // that can concurrently reach this communicator. Implementations do not
+  // return until device-to-host validation has completed.
+  virtual absl::Status RunCliqueBarrier(stream_executor::Stream* stream,
+                                        GpuCliqueBarrierToken token) {
+    return Unimplemented("Clique barrier is not implemented");
+  }
+
+  // Resolves provider-neutral requirements into an immutable provider plan.
+  // This must not enter a provider collective operation: the runtime resolves
+  // plans on every rank and agrees on their canonical payloads first.
+  virtual absl::StatusOr<std::unique_ptr<DeviceCommPlan>> ResolveDeviceCommPlan(
+      const GpuDeviceCommunicator::Requirements& requirements) {
+    return Unimplemented("Device communicator planning is not implemented");
+  }
+
+  // Creates a new device communicator linked to *this GPU communicator from
+  // an exact plan previously returned by ResolveDeviceCommPlan.
+  virtual absl::StatusOr<std::unique_ptr<GpuDeviceCommunicator>>
+  CreateDeviceComm(const DeviceCommPlan& plan) {
+    return Unimplemented("Device communicator is not implemented");
+  }
+
+  // Convenience wrapper for direct callers. Runtime collective acquisition
+  // uses the explicit resolve/agree/create sequence above.
   virtual absl::StatusOr<std::unique_ptr<GpuDeviceCommunicator>>
   CreateDeviceComm(const GpuDeviceCommunicator::Requirements& requirements) {
-    return Unimplemented("Device communicator is not implementing");
+    auto plan = ResolveDeviceCommPlan(requirements);
+    if (!plan.ok()) return plan.status();
+    return CreateDeviceComm(**plan);
   }
 
   // Registers an existing device address range with this communicator for
@@ -255,12 +476,26 @@ class GpuCommunicator : public Communicator {
     return Unimplemented("Registered memory is not implemented");
   }
 
-  // Creates a symmetric memory from the existing device address range. This is
-  // a collective operation, and all ranks in a clique must call this operation
-  // in order to make a progress.
+  // Resolves all local, fallible registration checks without entering a
+  // provider collective operation.
+  virtual absl::StatusOr<std::unique_ptr<SymmetricMemoryPlan>>
+  ResolveSymmetricMemoryPlan(se::DeviceAddressBase addr) {
+    return Unimplemented("Symmetric memory planning is not implemented");
+  }
+
+  // Creates symmetric memory from an exact pre-resolved plan. This is a
+  // collective operation, and all ranks in a clique must call it together.
+  virtual absl::StatusOr<std::unique_ptr<SymmetricMemory>>
+  CreateSymmetricMemory(const SymmetricMemoryPlan& plan) {
+    return Unimplemented("Symmetric memory is not implemented");
+  }
+
+  // Convenience wrapper for direct callers.
   virtual absl::StatusOr<std::unique_ptr<SymmetricMemory>>
   CreateSymmetricMemory(se::DeviceAddressBase addr) {
-    return Unimplemented("Symmetric memory is not implemented");
+    auto plan = ResolveSymmetricMemoryPlan(addr);
+    if (!plan.ok()) return plan.status();
+    return CreateSymmetricMemory(**plan);
   }
 
   //===--------------------------------------------------------------------===//

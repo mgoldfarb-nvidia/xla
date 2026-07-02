@@ -58,10 +58,41 @@ class GpuClique : public Clique {
   std::optional<GpuDeviceCommunicator*> device_comm(
       RankId rank, const GpuDeviceCommunicator::Requirements& reqs) const;
 
+  // Returns the provider-resolved agreement payload stored with a cached
+  // device communicator.
+  std::optional<std::string> device_comm_plan(
+      RankId rank, const GpuDeviceCommunicator::Requirements& reqs) const;
+
   // Adds a device communicator to the clique.
   absl::Status AddDeviceComm(
       RankId rank, GpuDeviceCommunicator::Requirements reqs,
+      std::string agreement_payload,
       std::unique_ptr<GpuDeviceCommunicator> communicator);
+
+  // Returns a canonical identity for distributed agreement rounds. Split
+  // cliques derive their identity from the root clique session.
+  absl::StatusOr<std::string> agreement_session_id() const;
+
+  // Returns the first agreement failure recorded for this clique session.
+  // Agreement transport failures are terminal because a peer may already
+  // have observed a successful outcome.
+  absl::Status agreement_status() const;
+
+  // Records a terminal agreement failure, cancels future operations, and
+  // aborts the clique communicators exactly once. Aborting is required for an
+  // uncertain distributed outcome: a peer may already have entered a provider
+  // collective that this process will no longer join. Returns the first
+  // recorded failure.
+  absl::Status PoisonAgreement(absl::Status status);
+
+  // Records a terminal failure and cancels queued/future communicator work,
+  // but does not block in provider abort. Batch failure handling uses this for
+  // every affected clique before starting any potentially blocking abort.
+  absl::Status RecordAgreementFailure(absl::Status status);
+
+  // Aborts this clique once after RecordAgreementFailure. Concurrent callers
+  // are safe; at most one performs provider abort.
+  absl::Status AbortAfterAgreementFailure();
 
   // Ties an object to a clique. Clique takes ownership of the object and will
   // destroy it when the clique is destroyed. When TiedRef is destroyed, the
@@ -113,10 +144,17 @@ class GpuClique : public Clique {
 
   // We keep device communicators in a sorted container to guarantee that they
   // are destroyed in deterministic order.
+  struct DeviceCommunicatorEntry {
+    std::string agreement_payload;
+    std::unique_ptr<GpuDeviceCommunicator> communicator;
+  };
+
   mutable absl::Mutex mu_;
   absl::btree_map<std::pair<RankId, GpuDeviceCommunicator::Requirements>,
-                  std::unique_ptr<GpuDeviceCommunicator>>
+                  DeviceCommunicatorEntry>
       device_communicators_ ABSL_GUARDED_BY(mu_);
+  absl::Status agreement_status_ ABSL_GUARDED_BY(mu_);
+  bool agreement_abort_started_ ABSL_GUARDED_BY(mu_) = false;
 
   // Storage for tied objects.
   tsl::TiedAny tied_any_ ABSL_GUARDED_BY(mu_);

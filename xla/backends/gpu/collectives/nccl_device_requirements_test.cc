@@ -15,6 +15,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <limits>
+#include <string>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -575,6 +576,53 @@ TEST(NcclDeviceAbiTest, AcceptsExactVersion) {
                                   /*runtime_version=*/22907));
 }
 
+TEST(NcclDeviceRequirementsTest, AgreementPayloadExcludesRankIdentity) {
+  Requirements requirements =
+      MakeRequirements(PeerAccess::kLocalDomain, /*required_features=*/0,
+                       /*preferred_features=*/0, /*local_barrier_count=*/2);
+  NcclCapabilities rank0 = Capabilities(/*lsa_team_count=*/1,
+                                        /*supports_full_gin=*/false,
+                                        /*supports_rail_gin=*/false,
+                                        /*supports_multimem=*/false,
+                                        /*team_size=*/8, /*rank=*/0);
+  NcclCapabilities rank7 = rank0;
+  rank7.rank = 7;
+  ASSERT_OK_AND_ASSIGN(NcclDeviceCommPlan plan,
+                       BuildNcclDeviceCommPlan(requirements, rank0));
+
+  EXPECT_EQ(NcclDeviceCommPlanAgreementPayload(
+                plan, rank0, /*runtime_version=*/NCCL_VERSION_CODE),
+            NcclDeviceCommPlanAgreementPayload(
+                plan, rank7, /*runtime_version=*/NCCL_VERSION_CODE));
+}
+
+TEST(NcclDeviceRequirementsTest, AgreementPayloadIncludesResolvedAbiAndPlan) {
+  NcclCapabilities capabilities = Capabilities(/*lsa_team_count=*/1);
+  ASSERT_OK_AND_ASSIGN(
+      NcclDeviceCommPlan one_barrier,
+      BuildNcclDeviceCommPlan(
+          MakeRequirements(PeerAccess::kLocalDomain, /*required_features=*/0,
+                           /*preferred_features=*/0,
+                           /*local_barrier_count=*/1),
+          capabilities));
+  ASSERT_OK_AND_ASSIGN(
+      NcclDeviceCommPlan two_barriers,
+      BuildNcclDeviceCommPlan(
+          MakeRequirements(PeerAccess::kLocalDomain, /*required_features=*/0,
+                           /*preferred_features=*/0,
+                           /*local_barrier_count=*/2),
+          capabilities));
+
+  std::string payload = NcclDeviceCommPlanAgreementPayload(
+      one_barrier, capabilities, /*runtime_version=*/NCCL_VERSION_CODE);
+  EXPECT_NE(payload, NcclDeviceCommPlanAgreementPayload(
+                         two_barriers, capabilities,
+                         /*runtime_version=*/NCCL_VERSION_CODE));
+  EXPECT_NE(payload, NcclDeviceCommPlanAgreementPayload(
+                         one_barrier, capabilities,
+                         /*runtime_version=*/NCCL_VERSION_CODE + 1));
+}
+
 TEST(NcclDeviceAbiTest, RejectsVersionMismatch) {
   EXPECT_THAT(
       ValidateNcclDeviceAbi(/*compile_time_version=*/22907,
@@ -593,6 +641,17 @@ TEST(NcclWindowDeviceAbiTest, RequiresExactRuntimeVersion) {
       StatusIs(absl::StatusCode::kFailedPrecondition,
                HasSubstr("XLA compile-time version=22907, loaded runtime "
                          "version=23000")));
+}
+
+TEST(NcclWindowDeviceAbiTest, AgreementPayloadIncludesSizeAndRuntimeAbi) {
+  std::string payload = NcclSymmetricMemoryPlanAgreementPayload(
+      /*size=*/1024, /*runtime_version=*/NCCL_VERSION_CODE);
+  EXPECT_NE(payload, NcclSymmetricMemoryPlanAgreementPayload(
+                         /*size=*/2048,
+                         /*runtime_version=*/NCCL_VERSION_CODE));
+  EXPECT_NE(payload, NcclSymmetricMemoryPlanAgreementPayload(
+                         /*size=*/1024,
+                         /*runtime_version=*/NCCL_VERSION_CODE + 1));
 }
 
 }  // namespace

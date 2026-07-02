@@ -113,6 +113,7 @@ limitations under the License.
 #include "xla/backends/gpu/transforms/estimate_cub_sort_scratch_size.h"
 #include "xla/backends/gpu/transforms/explicit_collectives_group_async_wrapper.h"
 #include "xla/backends/gpu/transforms/explicit_stream_annotation_async_wrapper.h"
+#include "xla/backends/gpu/transforms/ffi_device_communication_verifier.h"
 #include "xla/backends/gpu/transforms/fusion_wrapper.h"
 #include "xla/backends/gpu/transforms/gemm_broadcast_folding_rewriter.h"
 #include "xla/backends/gpu/transforms/gemm_fusion.h"
@@ -1711,6 +1712,10 @@ absl::Status GpuCompiler::OptimizeHloModule(
     const GpuAliasInfo* alias_info, CompilationStats* compilation_stats) {
   tsl::profiler::TraceMe traceme("OptimizeHloModule");
   TF_RET_CHECK(gpu_topology.has_gpu_target_config());
+  FfiDeviceCommunicationVerifier ffi_device_communication_verifier(
+      gpu_topology.gpu_target_config().platform_name);
+  RETURN_IF_ERROR(ffi_device_communication_verifier.Run(hlo_module).status());
+
   const se::DeviceDescription& device_description =
       gpu_topology.gpu_target_config().device_description;
 

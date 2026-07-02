@@ -107,6 +107,8 @@ namespace {
 
 namespace m = ::xla::match;
 
+using absl_testing::StatusIs;
+using ::testing::AllOf;
 using ::testing::AssertionResult;
 using ::testing::AtLeast;
 using ::testing::EndsWith;
@@ -2598,6 +2600,73 @@ XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), "__xla_test_mock_custom_call_f32",
                              /*initialize=*/nullptr,
                              /*execute=*/kMockCustomCallExecuteF32,
                          });
+
+static absl::Status DeviceCommunicationSideEffectTestHandler(
+    ffi::BufferR0<F32>, ffi::Result<ffi::BufferR0<F32>>) {
+  return absl::OkStatus();
+}
+
+XLA_FFI_DEFINE_HANDLER(
+    kDeviceCommunicationSideEffectTestHandler,
+    DeviceCommunicationSideEffectTestHandler,
+    ffi::Ffi::Bind().Arg<ffi::BufferR0<F32>>().Ret<ffi::BufferR0<F32>>(),
+    {ffi::Traits::kUsesDeviceCommunication});
+
+constexpr absl::string_view kDeviceCommunicationSideEffectTestTarget =
+    "__xla_test$$device_communication_side_effect";
+
+XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(),
+                         kDeviceCommunicationSideEffectTestTarget, "gpu",
+                         kDeviceCommunicationSideEffectTestHandler);
+
+constexpr absl::string_view kDeviceCommunicationWithoutSideEffectHlo = R"(
+  HloModule test
+
+  ENTRY main {
+    p = f32[] parameter(0)
+    ROOT call = f32[] custom-call(p),
+      custom_call_target="__xla_test$$device_communication_side_effect",
+      api_version=API_VERSION_TYPED_FFI
+  }
+)";
+
+TEST_F(GpuCompilerTest,
+       RejectsDeviceCommunicationCustomCallBeforeHloTransformations) {
+  ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<HloModule> module,
+      ParseAndReturnVerifiedModule(kDeviceCommunicationWithoutSideEffectHlo));
+
+  Compiler::CompileOptions compile_options;
+  compile_options.gpu_topology =
+      GetSingleDeviceGpuTopology(/*platform_version=*/"", gpu_target_config());
+
+  EXPECT_THAT(
+      compiler()->RunHloPasses(std::move(module), /*executor=*/nullptr,
+                               compile_options),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               AllOf(HasSubstr(kDeviceCommunicationSideEffectTestTarget),
+                     HasSubstr("custom_call_has_side_effect=true"))));
+}
+
+TEST_F(GpuCompilerTest,
+       ThunkEmissionRejectsDeviceCommunicationCustomCallWhenMocking) {
+  HloModuleConfig config = GetModuleConfigForTest();
+  config.mutable_debug_options().set_xla_gpu_mock_custom_calls(true);
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(
+                           kDeviceCommunicationWithoutSideEffectHlo, config));
+
+  Compiler::CompileOptions compile_options;
+  compile_options.gpu_topology =
+      GetSingleDeviceGpuTopology(/*platform_version=*/"", gpu_target_config());
+
+  EXPECT_THAT(
+      compiler()->RunBackend(std::move(module), /*executor=*/nullptr,
+                             compile_options),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               AllOf(HasSubstr(kDeviceCommunicationSideEffectTestTarget),
+                     HasSubstr("custom_call_has_side_effect=true"))));
+}
 
 class FrontendAttributesMemorySpaceTest
     : public GpuCompilerTest,
