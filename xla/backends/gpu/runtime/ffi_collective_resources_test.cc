@@ -527,6 +527,65 @@ TEST(FfiCollectiveResourcesTest,
               ::testing::ElementsAre(expected_explicit));
 }
 
+TEST(FfiCollectiveResourcesTest, SkipsEmptyTaggedBuffersDuringPreparation) {
+  ASSERT_OK_AND_ASSIGN(se::Platform * platform,
+                       se::PlatformManager::PlatformWithName("Host"));
+  ASSERT_OK_AND_ASSIGN(se::StreamExecutor * executor,
+                       platform->ExecutorForDevice(0));
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Stream> stream,
+                       executor->CreateStream());
+
+  DeviceAssignment device_assignment(/*replica_count=*/1,
+                                     /*computation_count=*/1);
+  device_assignment(0, 0) = 0;
+  LoopbackCollectives collectives;
+  GpuExecutableRunOptions gpu_options;
+  gpu_options.set_collectives(&collectives);
+  ServiceExecutableRunOptions run_options;
+  run_options.mutable_run_options()->set_stream(stream.get());
+  run_options.mutable_run_options()->set_device_assignment(&device_assignment);
+  run_options.mutable_run_options()->set_gpu_executable_run_options(
+      &gpu_options);
+  run_options.mutable_run_options()->set_local_device_count(1);
+  ASSERT_OK_AND_ASSIGN(
+      CollectiveParams collective_params,
+      CollectiveParams::Create(run_options, /*async_streams=*/{},
+                               LocalDeviceId(executor->device_ordinal())));
+
+  BufferAllocation empty(/*index=*/0, /*size=*/0, /*color=*/1);
+  std::vector<NullableShapedSlice> operands{
+      ShapedSlice{BufferAllocation::Slice(&empty, /*offset=*/0, /*size=*/0),
+                  MakeU8Shape(0, /*memory_space=*/1)}};
+  FfiCollectiveResources resources = MakeResources(ThunkId(1), operands);
+
+  std::array<se::DeviceAddressBase, 1> addresses{
+      se::DeviceAddressBase(nullptr, 0)};
+  BufferAllocations buffers(addresses, executor->device_ordinal(), nullptr);
+  CollectiveCliqueRequests clique_requests;
+  CollectiveMemoryRequests memory_requests(buffers);
+  ASSERT_OK(resources.BeginInvocation(XLA_FFI_ExecutionStage_PREPARE, &buffers,
+                                      &collective_params, &clique_requests,
+                                      &memory_requests, nullptr, nullptr));
+  EXPECT_OK(resources.FinalizeDeviceCommunication());
+  EXPECT_EQ(memory_requests.symmetric_size(), 0);
+  EXPECT_EQ(clique_requests.size(), 1);
+
+  ASSERT_OK(resources.BeginInvocation(XLA_FFI_ExecutionStage_EXECUTE, &buffers,
+                                      nullptr, nullptr, nullptr, nullptr,
+                                      nullptr));
+  std::byte dummy;
+  int64_t dim = 0;
+  XLA_FFI_Buffer buffer{XLA_FFI_Buffer_STRUCT_SIZE,
+                        /*extension_start=*/nullptr,
+                        XLA_FFI_DataType_U8,
+                        &dummy,
+                        /*rank=*/1,
+                        &dim};
+  EXPECT_THAT(FfiCollectiveResourcesTestPeer::FindBufferView(resources, buffer),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("must not be empty")));
+}
+
 TEST(FfiCollectiveResourcesTest,
      ResolvesTaggedViewsAndRejectsUntaggedOrOutOfBoundsViews) {
   std::array<std::byte, 64> tagged_storage;

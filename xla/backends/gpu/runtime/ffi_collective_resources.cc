@@ -341,12 +341,16 @@ absl::Status FfiCollectiveResources::FinalizeDeviceCommunication() {
   allocations.reserve(static_buffers_.size());
   for (const StaticBuffer& buffer : static_buffers_) {
     if (buffer.memory_space != kCollectiveMemorySpace) continue;
-    if (buffer.allocation < 0 || buffer.offset < 0 || buffer.size <= 0 ||
-        buffer.allocation_size <= 0 || buffer.offset > buffer.allocation_size ||
+    if (buffer.allocation < 0 || buffer.offset < 0 || buffer.size < 0 ||
+        buffer.allocation_size < 0 || buffer.offset > buffer.allocation_size ||
         buffer.size > buffer.allocation_size - buffer.offset) {
       return InvalidArgument(
           "Invalid collective-memory FFI buffer allocation or slice");
     }
+    // Empty FFI buffers do not need a provider window. GetDeviceMemory rejects
+    // empty views because providers do not define a useful packed argument for
+    // them, but their presence must not make Prepare fail.
+    if (buffer.size == 0) continue;
     if (std::find(allocations.begin(), allocations.end(), buffer.allocation) ==
         allocations.end()) {
       allocations.push_back(buffer.allocation);
