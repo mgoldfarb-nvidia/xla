@@ -42,7 +42,9 @@ limitations under the License.
 #include "xla/core/collectives/symmetric_memory.h"
 #include "xla/future.h"
 #include "xla/stream_executor/device_address.h"
+#include "xla/stream_executor/device_address_handle.h"
 #include "xla/stream_executor/kernel_args.h"
+#include "xla/stream_executor/memory_allocation.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/concurrency/executor.h"
 #include "xla/tsl/platform/env.h"
@@ -81,6 +83,12 @@ absl::StatusOr<NcclDeviceCommPlan> BuildNcclDeviceCommPlan(
     const GpuDeviceCommunicator::Requirements& requirements,
     const NcclCapabilities& capabilities);
 
+// Returns the canonical provider payload used for cross-rank agreement. It
+// serializes fields explicitly and intentionally excludes rank-local identity.
+std::string NcclDeviceCommPlanAgreementPayload(
+    const NcclDeviceCommPlan& plan, const NcclCapabilities& capabilities,
+    uint64_t runtime_version);
+
 // Validates the concrete ncclDevComm returned by NCCL and constructs immutable
 // provider-neutral information for FFI handlers. In particular, this catches a
 // returned communicator that does not satisfy the requested sticky GIN mode.
@@ -94,6 +102,9 @@ absl::StatusOr<GpuDeviceCommunicator::Info> BuildNcclDeviceCommInfo(
 // for focused unit testing.
 absl::Status ValidateNcclDeviceAbi(uint64_t compile_time_version,
                                    uint64_t runtime_version);
+
+std::string NcclSymmetricMemoryPlanAgreementPayload(size_t size,
+                                                    uint64_t runtime_version);
 
 struct NcclCapabilities {
   bool supports_device_comm = false;
@@ -121,6 +132,9 @@ class NcclCommunicator : public GpuCommunicator {
   friend class NcclDeviceCommunicator;
 
  public:
+  using GpuCommunicator::CreateDeviceComm;
+  using GpuCommunicator::CreateSymmetricMemory;
+
   // Creates a NCCL communicator.
   //
   // make_comm should construct and return a new ncclComm_t. For example, it
@@ -155,14 +169,25 @@ class NcclCommunicator : public GpuCommunicator {
 
   bool SupportsDeviceComm() const final;
 
-  absl::StatusOr<std::unique_ptr<GpuDeviceCommunicator>> CreateDeviceComm(
+  bool SupportsCliqueBarrier() const final { return true; }
+
+  absl::Status RunCliqueBarrier(se::Stream* stream,
+                                GpuCliqueBarrierToken token) final;
+
+  absl::StatusOr<std::unique_ptr<DeviceCommPlan>> ResolveDeviceCommPlan(
       const GpuDeviceCommunicator::Requirements& requirements) final;
+
+  absl::StatusOr<std::unique_ptr<GpuDeviceCommunicator>> CreateDeviceComm(
+      const DeviceCommPlan& plan) final;
 
   absl::StatusOr<std::unique_ptr<RegisteredMemory>> CreateRegisteredMemory(
       se::DeviceAddressBase addr) final;
 
+  absl::StatusOr<std::unique_ptr<SymmetricMemoryPlan>>
+  ResolveSymmetricMemoryPlan(se::DeviceAddressBase addr) final;
+
   absl::StatusOr<std::unique_ptr<SymmetricMemory>> CreateSymmetricMemory(
-      se::DeviceAddressBase addr) final;
+      const SymmetricMemoryPlan& plan) final;
 
   Future<> GroupExecute(absl::AnyInvocable<absl::Status() &&> group) final;
 
@@ -334,6 +359,15 @@ class NcclCommunicator : public GpuCommunicator {
   // Should all pending collectives cancel?
   std::shared_ptr<CancellationToken> cancel_;
 
+  // A clique barrier reuses one bounded pair of host/device buffers. This
+  // mutex serializes complete enqueue, device execution, and host validation
+  // so concurrent callers cannot overwrite the scratch.
+  absl::Mutex clique_barrier_mutex_;
+  se::DeviceAddressHandle clique_barrier_device_scratch_
+      ABSL_GUARDED_BY(clique_barrier_mutex_);
+  std::unique_ptr<se::MemoryAllocation> clique_barrier_host_scratch_
+      ABSL_GUARDED_BY(clique_barrier_mutex_);
+
   // Has comm_ been aborted?
   bool aborted_ = false;
 
@@ -355,7 +389,8 @@ class NcclDeviceCommunicator : public GpuDeviceCommunicator {
   // Creates a new instance of a NCCL device communicator from the given host
   // communicator object.
   static absl::StatusOr<std::unique_ptr<NcclDeviceCommunicator>> CreateFrom(
-      const NcclCommunicator& comm, const Requirements& requirements);
+      const NcclCommunicator& comm,
+      const GpuCommunicator::DeviceCommPlan& plan);
 
   PlatformCommunicatorHandle platform_comm() const final;
 

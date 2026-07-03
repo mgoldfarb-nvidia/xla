@@ -163,12 +163,14 @@ TEST_F(GpuCollectivesFfiDsoTest,
       call0 = u32[2]{0} custom-call(slice0),
         custom_call_target="__xla_test_gpu_collectives_public_dso",
         api_version=API_VERSION_TYPED_FFI,
+        custom_call_has_side_effect=true,
         output_to_operand_aliasing={{}: (0, {})},
         frontend_attributes={operands_memory_spaces="{0:1}", results_memory_spaces="{0:1}"}
       slice1 = u32[2]{0} slice(collective_buffer), slice={[4:6]}
       call1 = u32[2]{0} custom-call(slice1),
         custom_call_target="__xla_test_gpu_collectives_public_dso",
         api_version=API_VERSION_TYPED_FFI,
+        custom_call_has_side_effect=true,
         output_to_operand_aliasing={{}: (0, {})},
         frontend_attributes={operands_memory_spaces="{0:1}", results_memory_spaces="{0:1}"}
       out0 = u32[2]{0} copy(call0)
@@ -219,6 +221,7 @@ TEST_F(GpuCollectivesFfiDsoTest,
       call = (u32[4]{0}, u32[5]{0}) custom-call(collective_buffer0, collective_buffer1),
         custom_call_target="__xla_test_gpu_collectives_public_dso_two_buffers",
         api_version=API_VERSION_TYPED_FFI,
+        custom_call_has_side_effect=true,
         output_to_operand_aliasing={{0}: (0, {}), {1}: (1, {})},
         frontend_attributes={operands_memory_spaces="{0:1,1:1}", results_memory_spaces="{0:1,1:1}"}
       result0 = u32[4]{0} get-tuple-element(call), index=0

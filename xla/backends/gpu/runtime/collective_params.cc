@@ -108,16 +108,18 @@ absl::StatusOr<CollectiveParams> CollectiveParams::Create(
                    GetGlobalDeviceId(device_id_map, local_device_id));
 
   return CollectiveParams(
-      collectives, run_options.stream()->parent(),
-      run_options.run_options().run_id(), async_streams, local_device_id,
-      global_device_id, run_options.run_options().device_assignment(),
-      device_id_map, clique_id_callback, incarnations, collective_max_nchannels,
+      collectives, run_options.stream()->parent(), run_options.stream(),
+      run_options.run_options().run_id(), run_options.run_options().launch_id(),
+      async_streams, local_device_id, global_device_id,
+      run_options.run_options().device_assignment(), device_id_map,
+      clique_id_callback, incarnations, collective_max_nchannels,
       p2p_max_nchannels, run_options.run_options().local_device_count(),
       collective_use_minimal_resource);
 }
 
 CollectiveParams::CollectiveParams(
-    GpuCollectives* collectives, se::StreamExecutor* executor, RunId run_id,
+    GpuCollectives* collectives, se::StreamExecutor* executor,
+    se::Stream* stream, RunId run_id, int32_t launch_id,
     absl::Span<se::Stream* const> async_streams, LocalDeviceId local_device_id,
     GlobalDeviceId global_device_id, const DeviceAssignment* device_assn,
     const GlobalDeviceIdMap* global_device_id_map,
@@ -127,7 +129,9 @@ CollectiveParams::CollectiveParams(
     int local_device_count, bool collective_use_minimal_resource)
     : collectives(collectives),
       executor(executor),
+      stream(stream),
       run_id(run_id),
+      launch_id(launch_id),
       async_streams(async_streams.begin(), async_streams.end()),
       local_device_id(local_device_id),
       global_device_id(global_device_id),

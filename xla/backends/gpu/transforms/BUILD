@@ -136,6 +136,43 @@ cc_library(
 )
 
 cc_library(
+    name = "ffi_device_communication_verifier",
+    srcs = ["ffi_device_communication_verifier.cc"],
+    hdrs = ["ffi_device_communication_verifier.h"],
+    deps = [
+        "//xla:xla_data_proto_cc",
+        "//xla/ffi:ffi_registry",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+xla_cc_test(
+    name = "ffi_device_communication_verifier_test",
+    srcs = ["ffi_device_communication_verifier_test.cc"],
+    deps = [
+        ":ffi_device_communication_verifier",
+        "//xla/ffi",
+        "//xla/ffi:ffi_api",  # buildcleaner: keep
+        "//xla/ffi/api:c_api",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "alias_passthrough_params",
     srcs = ["alias_passthrough_params.cc"],
     hdrs = ["alias_passthrough_params.h"],

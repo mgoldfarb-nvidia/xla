@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -32,6 +33,7 @@ namespace {
 
 using ::absl_testing::IsOk;
 using ::absl_testing::StatusIs;
+using ::testing::AllOf;
 using ::testing::HasSubstr;
 using Requirements = GpuDeviceCommunicator::Requirements;
 
@@ -166,6 +168,47 @@ TEST(GpuDeviceCommunicatorKernelArgAbiTest, RejectsVersionMismatch) {
                                              /*expected_version=*/457),
               StatusIs(absl::StatusCode::kFailedPrecondition,
                        HasSubstr("version mismatch")));
+}
+
+TEST(GpuCliqueBarrierTokenTest, AcceptsMatchingNonzeroTokens) {
+  GpuCliqueBarrierToken token{0x1234, 0x5678};
+  std::vector<GpuCliqueBarrierToken> gathered(4, token);
+
+  EXPECT_THAT(ValidateGpuCliqueBarrierTokens(token, gathered), IsOk());
+}
+
+TEST(GpuCliqueBarrierTokenTest, RejectsZeroToken) {
+  std::vector<GpuCliqueBarrierToken> gathered(2, GpuCliqueBarrierToken{});
+
+  EXPECT_THAT(
+      ValidateGpuCliqueBarrierTokens({}, gathered),
+      StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("nonzero")));
+}
+
+TEST(GpuCliqueBarrierTokenTest, RejectsEmptyGather) {
+  EXPECT_THAT(
+      ValidateGpuCliqueBarrierTokens({1, 2}, {}),
+      StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("at least one")));
+}
+
+TEST(GpuCliqueBarrierTokenTest, ReportsFirstMismatchingRank) {
+  GpuCliqueBarrierToken token{0x1234, 0x5678};
+  std::vector<GpuCliqueBarrierToken> gathered = {
+      token, token, GpuCliqueBarrierToken{0x1234, 0x9abc}, token};
+
+  EXPECT_THAT(ValidateGpuCliqueBarrierTokens(token, gathered),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       AllOf(HasSubstr("rank 2"), HasSubstr("mismatch"))));
+}
+
+TEST(GpuCliqueBarrierTokenTest, MismatchFailsFromEveryRanksPerspective) {
+  std::vector<GpuCliqueBarrierToken> gathered = {{0x1, 0x2}, {0x3, 0x4}};
+
+  for (GpuCliqueBarrierToken local_token : gathered) {
+    EXPECT_THAT(
+        ValidateGpuCliqueBarrierTokens(local_token, gathered),
+        StatusIs(absl::StatusCode::kFailedPrecondition, HasSubstr("mismatch")));
+  }
 }
 
 }  // namespace

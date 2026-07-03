@@ -18,6 +18,7 @@ limitations under the License.
 #include <array>
 #include <vector>
 
+#include "absl/status/status.h"
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
 #include "xla/runtime/device_id.h"
 #include "xla/service/gpu/buffer_allocations.h"
@@ -56,6 +57,45 @@ TEST(CollectiveMemoryRequestsTest, OrderedSymmetricRequests) {
   EXPECT_EQ(ordered_requests[0].clique, k2);
   EXPECT_EQ(ordered_requests[1].clique, k0);
   EXPECT_EQ(ordered_requests[2].clique, k1);
+}
+
+TEST(CollectiveMemoryRequestsTest, TracksExecutionScopePerAllocation) {
+  GpuCliqueKey clique({kD0, kD1}, 2);
+  std::array<char, 10> data;
+  se::DeviceAddressBase buffer(data.data(), data.size());
+  BufferAllocations buffers({buffer}, /*device_ordinal=*/0, nullptr);
+  CollectiveMemoryRequests requests(buffers);
+
+  TF_ASSERT_OK(requests.RequestSymmetricAllocation(clique, 0));
+  TF_ASSERT_OK(requests.RequestSymmetricAllocation(clique, 1,
+                                                   /*execution_scoped=*/true));
+
+  auto ordered = requests.OrderedSymmetricAllocations();
+  ASSERT_EQ(ordered.size(), 1);
+  EXPECT_EQ(ordered[0].execution_scoped_allocations.size(), 1);
+  EXPECT_TRUE(ordered[0].execution_scoped_allocations.contains(1));
+  EXPECT_FALSE(ordered[0].execution_scoped_allocations.contains(0));
+}
+
+TEST(CollectiveMemoryRequestsTest, RejectsMixedLifetimeForSameAllocation) {
+  GpuCliqueKey clique({kD0, kD1}, 2);
+  std::array<char, 10> data;
+  se::DeviceAddressBase buffer(data.data(), data.size());
+  BufferAllocations buffers({buffer}, /*device_ordinal=*/0, nullptr);
+
+  CollectiveMemoryRequests persistent_first(buffers);
+  TF_ASSERT_OK(persistent_first.RequestSymmetricAllocation(clique, 0));
+  EXPECT_EQ(persistent_first
+                .RequestSymmetricAllocation(clique, 0,
+                                            /*execution_scoped=*/true)
+                .code(),
+            absl::StatusCode::kFailedPrecondition);
+
+  CollectiveMemoryRequests execution_scoped_first(buffers);
+  TF_ASSERT_OK(execution_scoped_first.RequestSymmetricAllocation(
+      clique, 0, /*execution_scoped=*/true));
+  EXPECT_EQ(execution_scoped_first.RequestSymmetricAllocation(clique, 0).code(),
+            absl::StatusCode::kFailedPrecondition);
 }
 
 TEST(CollectiveMemoryRequestsTest, OrderedMulticastRequests) {

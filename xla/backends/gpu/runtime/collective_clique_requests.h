@@ -157,6 +157,11 @@ class CollectiveCliqueRequests {
   // Returns devices which requested a barrier after module execution.
   absl::flat_hash_set<GlobalDeviceId> GetDevicesRequiringBarrier() const;
 
+  // Returns true if a device-communication post-execution barrier includes
+  // devices owned by another process. Existing provider-specific barriers that
+  // do not request a device communicator retain their legacy behavior.
+  bool BarrierRequiresRemoteParticipants() const;
+
  private:
   absl::flat_hash_map<GpuCliqueKey, CliqueRequest> cliques_;
 };

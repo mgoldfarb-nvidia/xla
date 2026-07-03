@@ -32,19 +32,21 @@ limitations under the License.
 
 namespace xla::gpu {
 
-// Caches collective memories (symmetric, multicast) across executable
-// invocations. On the first invocation, collective memory windows are
+// Caches persistent collective memories (symmetric, multicast) across
+// executable invocations. On the first invocation, collective memory windows
 // registered with the communication library (a collective operation). On
 // subsequent invocations, the cached windows are reused to avoid redundant
-// registration calls and to keep signal counters consistent.
+// registration calls and to keep signal counters consistent. Execution-scoped
+// symmetric windows deliberately bypass this cache because their registrations
+// refer to one invocation's backing buffers.
 //
 // Correctness note: window registration is a collective operation — all ranks
 // must call it together. Caching is safe because all ranks share the same
 // buffer assignment, so they all get cache hits or misses for a given address.
 //
 // Lifetime: owned by GpuExecutable, persists across executions. Cached entries
-// hold TiedRefs to the global GpuClique, so the underlying windows remain
-// valid as long as the clique exists.
+// hold TiedRefs to the global GpuClique, so the underlying windows remain valid
+// as long as the clique exists.
 class CollectiveMemoryCache {
  public:
   // Returns a locked shared_ptr to the cached memory, or nullptr if not cached
@@ -63,8 +65,6 @@ class CollectiveMemoryCache {
   std::shared_ptr<stream_executor::gpu::MulticastMemory> AddMulticastMemory(
       const GpuCliqueKey& clique, stream_executor::DeviceAddressBase addr,
       tsl::TiedRef<stream_executor::gpu::MulticastMemory> multicast_memory);
-
-
 
  private:
   using Key = std::pair<GpuCliqueKey, stream_executor::DeviceAddressBase>;

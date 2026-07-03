@@ -127,6 +127,24 @@ NcclSymmetricMemory::Create(std::shared_ptr<NcclCommState> comm_state,
     return status;
   }
 
+  return Create(std::move(comm_state), addr, executor, stream_executor,
+                runtime_version);
+}
+
+absl::StatusOr<std::unique_ptr<NcclSymmetricMemory>>
+NcclSymmetricMemory::Create(std::shared_ptr<NcclCommState> comm_state,
+                            stream_executor::DeviceAddressBase addr,
+                            const std::shared_ptr<tsl::Executor> executor,
+                            stream_executor::StreamExecutor* stream_executor,
+                            uint64_t validated_device_abi_version) {
+  if (stream_executor == nullptr) {
+    return absl::InvalidArgumentError(
+        "StreamExecutor is required to create NCCL symmetric memory");
+  }
+  RETURN_IF_ERROR(ValidateNcclWindowDeviceAbi(NCCL_VERSION_CODE,
+                                              validated_device_abi_version));
+  auto activation = stream_executor->Activate();
+
   ncclWindow_t win = nullptr;
   absl::Status registration_status;
   CancellationToken never_cancelled;
@@ -154,8 +172,9 @@ NcclSymmetricMemory::Create(std::shared_ptr<NcclCommState> comm_state,
     return registration_status;
   }
 
-  return absl::WrapUnique(new NcclSymmetricMemory(
-      comm_state, win, addr, executor, stream_executor, runtime_version));
+  return absl::WrapUnique(
+      new NcclSymmetricMemory(comm_state, win, addr, executor, stream_executor,
+                              validated_device_abi_version));
 }
 
 NcclSymmetricMemory::~NcclSymmetricMemory() {

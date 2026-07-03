@@ -15,8 +15,10 @@ limitations under the License.
 
 #include "xla/service/gpu/gpu_executable_completion_barrier.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -28,6 +30,157 @@ limitations under the License.
 
 namespace xla::gpu {
 namespace {
+
+TEST(GpuExecutableCompletionBarrierTest, AggregatesLocalRankCompletionFailure) {
+  absl::Status first = absl::OkStatus();
+  absl::Status second = absl::InternalError("stream synchronization failed");
+  absl::Status third = absl::OkStatus();
+  std::vector<absl::Status*> statuses = {&first, &second, &third};
+
+  absl::Status result = AggregateGpuExecutableCompletionStatuses(statuses);
+  EXPECT_EQ(result, second);
+}
+
+TEST(GpuExecutableCompletionBarrierTest, RejectsNullLocalRankCompletionStatus) {
+  std::vector<absl::Status*> statuses = {nullptr};
+  EXPECT_EQ(AggregateGpuExecutableCompletionStatuses(statuses).code(),
+            absl::StatusCode::kInternal);
+}
+
+TEST(GpuExecutableCompletionBarrierTest,
+     ResourceInitializationBroadcastsSiblingFailure) {
+  const std::array<GlobalDeviceId, 2> participants = {GlobalDeviceId(10),
+                                                      GlobalDeviceId(11)};
+  std::array<absl::Status, 2> results;
+
+  std::thread first([&] {
+    results[0] = RendezvousGpuExecutableStatuses(
+        "resource initialization failure", /*run_id=*/1001,
+        GpuExecutableRendezvousPhase::kCollectiveResourceInitialization,
+        participants, absl::OkStatus(), /*num_local_participants=*/2,
+        absl::Seconds(1), absl::Seconds(5));
+  });
+  std::thread second([&] {
+    // Reverse the input order to verify that participant identity is
+    // canonicalized before it is used as a rendezvous key.
+    const std::array<GlobalDeviceId, 2> reversed = {GlobalDeviceId(11),
+                                                    GlobalDeviceId(10)};
+    results[1] = RendezvousGpuExecutableStatuses(
+        "resource initialization failure", /*run_id=*/1001,
+        GpuExecutableRendezvousPhase::kCollectiveResourceInitialization,
+        reversed, absl::InternalError("rank 1 failed to acquire clique"),
+        /*num_local_participants=*/2, absl::Seconds(1), absl::Seconds(5));
+  });
+  first.join();
+  second.join();
+
+  EXPECT_EQ(results[0], absl::InternalError("rank 1 failed to acquire clique"));
+  EXPECT_EQ(results[1], results[0]);
+}
+
+TEST(GpuExecutableCompletionBarrierTest,
+     InitializationBroadcastsSiblingFailure) {
+  std::array<absl::Status, 2> results;
+
+  std::thread first([&] {
+    results[0] = RendezvousGpuExecutableStatuses(
+        "thunk initialization failure", /*run_id=*/1002,
+        GpuExecutableRendezvousPhase::kInitialization,
+        /*participant_devices=*/{}, absl::OkStatus(),
+        /*num_local_participants=*/2, absl::Seconds(1), absl::Seconds(5));
+  });
+  std::thread second([&] {
+    results[1] = RendezvousGpuExecutableStatuses(
+        "thunk initialization failure", /*run_id=*/1002,
+        GpuExecutableRendezvousPhase::kInitialization,
+        /*participant_devices=*/{},
+        absl::FailedPreconditionError("rank 1 Initialize failed"),
+        /*num_local_participants=*/2, absl::Seconds(1), absl::Seconds(5));
+  });
+  first.join();
+  second.join();
+
+  EXPECT_EQ(results[0],
+            absl::FailedPreconditionError("rank 1 Initialize failed"));
+  EXPECT_EQ(results[1], results[0]);
+}
+
+TEST(GpuExecutableCompletionBarrierTest, PrepareBroadcastsSiblingFailure) {
+  std::array<absl::Status, 2> results;
+
+  std::thread first([&] {
+    results[0] = RendezvousGpuExecutableStatuses(
+        "thunk preparation failure", /*run_id=*/1003,
+        GpuExecutableRendezvousPhase::kPrepare,
+        /*participant_devices=*/{}, absl::OkStatus(),
+        /*num_local_participants=*/2, absl::Seconds(1), absl::Seconds(5));
+  });
+  std::thread second([&] {
+    results[1] = RendezvousGpuExecutableStatuses(
+        "thunk preparation failure", /*run_id=*/1003,
+        GpuExecutableRendezvousPhase::kPrepare,
+        /*participant_devices=*/{},
+        absl::FailedPreconditionError("rank 1 Prepare failed"),
+        /*num_local_participants=*/2, absl::Seconds(1), absl::Seconds(5));
+  });
+  first.join();
+  second.join();
+
+  EXPECT_EQ(results[0], absl::FailedPreconditionError("rank 1 Prepare failed"));
+  EXPECT_EQ(results[1], results[0]);
+}
+
+TEST(GpuExecutableCompletionBarrierTest,
+     SameRunDisjointAndOverlappingTeamsDoNotCrossPair) {
+  auto run_scoped_rounds = [](int64_t run_id,
+                              std::array<GlobalDeviceId, 2> first_team,
+                              std::array<GlobalDeviceId, 2> second_team) {
+    std::array<absl::Status, 4> results;
+    const absl::Status first_team_failure =
+        absl::UnavailableError("first team failed");
+
+    std::array<std::thread, 4> threads = {
+        std::thread([&] {
+          results[0] = RendezvousGpuExecutableStatuses(
+              "first scoped team", run_id,
+              GpuExecutableRendezvousPhase::kCompletion, first_team,
+              absl::OkStatus(), /*num_local_participants=*/2, absl::Seconds(1),
+              absl::Seconds(5));
+        }),
+        std::thread([&] {
+          results[2] = RendezvousGpuExecutableStatuses(
+              "second scoped team", run_id,
+              GpuExecutableRendezvousPhase::kCompletion, second_team,
+              absl::OkStatus(), /*num_local_participants=*/2, absl::Seconds(1),
+              absl::Seconds(5));
+        }),
+        std::thread([&] {
+          results[1] = RendezvousGpuExecutableStatuses(
+              "first scoped team", run_id,
+              GpuExecutableRendezvousPhase::kCompletion, first_team,
+              first_team_failure, /*num_local_participants=*/2,
+              absl::Seconds(1), absl::Seconds(5));
+        }),
+        std::thread([&] {
+          results[3] = RendezvousGpuExecutableStatuses(
+              "second scoped team", run_id,
+              GpuExecutableRendezvousPhase::kCompletion, second_team,
+              absl::OkStatus(), /*num_local_participants=*/2, absl::Seconds(1),
+              absl::Seconds(5));
+        })};
+    for (std::thread& thread : threads) thread.join();
+
+    EXPECT_EQ(results[0], first_team_failure);
+    EXPECT_EQ(results[1], first_team_failure);
+    EXPECT_OK(results[2]);
+    EXPECT_OK(results[3]);
+  };
+
+  run_scoped_rounds(/*run_id=*/1003, {GlobalDeviceId(0), GlobalDeviceId(1)},
+                    {GlobalDeviceId(2), GlobalDeviceId(3)});
+  run_scoped_rounds(/*run_id=*/1004, {GlobalDeviceId(0), GlobalDeviceId(1)},
+                    {GlobalDeviceId(1), GlobalDeviceId(2)});
+}
 
 TEST(GpuExecutableCompletionBarrierTest,
      CountsAllRequestedDevicesWithoutLocalMap) {

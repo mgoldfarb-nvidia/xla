@@ -2848,6 +2848,7 @@ xla_cc_test(
     srcs = ["collective_clique_requests_test.cc"],
     deps = [
         ":collective_clique_requests",
+        ":collective_cliques",
         "//xla:xla_data_proto_cc",
         "//xla/backends/gpu/collectives:gpu_clique_key",
         "//xla/backends/gpu/collectives:gpu_communicator",
@@ -2894,6 +2895,7 @@ xla_cc_test(
         "//xla/tsl/lib/core:status_test_util",
         "//xla/tsl/platform:test",
         "//xla/tsl/platform:test_main",
+        "@com_google_absl//absl/status",
     ],
 )
 
@@ -2927,12 +2929,15 @@ cc_library(
         "@com_google_absl//absl/container:btree",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
         "@tsl//tsl/platform:casts",
+        "@tsl//tsl/platform:fingerprint",
         "@tsl//tsl/profiler/lib:traceme",
     ],
 )
@@ -3012,11 +3017,14 @@ cc_library(
         "@com_google_absl//absl/base",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/time",
         "@tsl//tsl/platform:casts",
+        "@tsl//tsl/platform:fingerprint",
         "@tsl//tsl/profiler/lib:traceme",
     ],
 )

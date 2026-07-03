@@ -53,10 +53,17 @@ struct CollectiveParams {
 
   GpuCollectives* collectives;
   se::StreamExecutor* executor;
+  // Main execution stream. Provider-native initialization barriers use this
+  // stream and synchronously validate their rank tokens before returning.
+  se::Stream* stream;
 
   // XLA execution run id allows us to distinguish collective operations
   // from different concurrent executions and avoid deadlocks.
   RunId run_id;
+
+  // Globally coordinated execution identifier. Non-local device communication
+  // requires a non-zero value so agreement can detect launch-order mismatch.
+  int32_t launch_id;
 
   // Streams for asynchronous collective communications.
   absl::InlinedVector<se::Stream*, 4> async_streams;
@@ -78,7 +85,8 @@ struct CollectiveParams {
 
  private:
   CollectiveParams(
-      GpuCollectives* collectives, se::StreamExecutor* executor, RunId run_id,
+      GpuCollectives* collectives, se::StreamExecutor* executor,
+      se::Stream* stream, RunId run_id, int32_t launch_id,
       absl::Span<se::Stream* const> async_streams,
       LocalDeviceId local_device_id, GlobalDeviceId global_device_id,
       const DeviceAssignment* device_assn,

@@ -29,6 +29,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/core/collectives/communicator.h"
 #include "xla/core/collectives/rank_id.h"
@@ -42,6 +43,7 @@ limitations under the License.
 #include "xla/xla_data.pb.h"
 
 namespace stream_executor {
+class Stream;
 class StreamExecutor;
 }  // namespace stream_executor
 
@@ -64,6 +66,27 @@ class GpuSignalDesc : public Communicator::SignalDesc {
 struct PlatformCommunicatorHandle {
   void* handle = nullptr;  // will be nullptr if not supported
 };
+
+// Opaque identity of one clique-wide barrier round. Callers must use the same
+// token on every rank and must not reuse a token while another round with that
+// token can still be in flight on the same communicator.
+struct GpuCliqueBarrierToken {
+  uint64_t high = 0;
+  uint64_t low = 0;
+
+  bool operator==(const GpuCliqueBarrierToken& other) const {
+    return high == other.high && low == other.low;
+  }
+  bool operator!=(const GpuCliqueBarrierToken& other) const {
+    return !(*this == other);
+  }
+};
+
+// Validates the result of a provider all-gather for a clique barrier. Exposed
+// for provider-independent tests.
+absl::Status ValidateGpuCliqueBarrierTokens(
+    GpuCliqueBarrierToken expected,
+    absl::Span<const GpuCliqueBarrierToken> gathered);
 
 // A device communicator that corresponds to the host side GPU communicator
 // object (it has same rank in the collective clique and shares underlying
@@ -223,6 +246,68 @@ class GpuDeviceCommunicator {
 // `GpuCommunicator::LaunchAllReduce` method which returns an `absl::Status`.
 class GpuCommunicator : public Communicator {
  public:
+  // Provider-resolved plan for constructing a device communicator. Plans are
+  // internal XLA objects: the agreement payload is exchanged between ranks,
+  // while provider-specific state stays type-erased and process local.
+  class DeviceCommPlan {
+   public:
+    virtual ~DeviceCommPlan() = default;
+
+    const GpuDeviceCommunicator::Requirements& requirements() const {
+      return requirements_;
+    }
+    absl::string_view provider() const { return provider_; }
+    absl::string_view agreement_payload() const { return agreement_payload_; }
+    uint64_t creation_priority() const { return creation_priority_; }
+    const GpuCommunicator* owner() const { return owner_; }
+
+   protected:
+    DeviceCommPlan(const GpuCommunicator* owner,
+                   GpuDeviceCommunicator::Requirements requirements,
+                   std::string provider, std::string agreement_payload,
+                   uint64_t creation_priority)
+        : owner_(owner),
+          requirements_(requirements),
+          provider_(std::move(provider)),
+          agreement_payload_(std::move(agreement_payload)),
+          creation_priority_(creation_priority) {}
+
+   private:
+    const GpuCommunicator* owner_;
+    GpuDeviceCommunicator::Requirements requirements_;
+    std::string provider_;
+    std::string agreement_payload_;
+    uint64_t creation_priority_;
+  };
+
+  // Provider-resolved plan for collectively registering symmetric memory.
+  // The local address remains process-local; agreement_payload contains only
+  // cross-rank comparable properties such as size, flags, and provider ABI.
+  class SymmetricMemoryPlan {
+   public:
+    virtual ~SymmetricMemoryPlan() = default;
+
+    se::DeviceAddressBase address() const { return address_; }
+    absl::string_view provider() const { return provider_; }
+    absl::string_view agreement_payload() const { return agreement_payload_; }
+    const GpuCommunicator* owner() const { return owner_; }
+
+   protected:
+    SymmetricMemoryPlan(const GpuCommunicator* owner,
+                        se::DeviceAddressBase address, std::string provider,
+                        std::string agreement_payload)
+        : owner_(owner),
+          address_(address),
+          provider_(std::move(provider)),
+          agreement_payload_(std::move(agreement_payload)) {}
+
+   private:
+    const GpuCommunicator* owner_;
+    se::DeviceAddressBase address_;
+    std::string provider_;
+    std::string agreement_payload_;
+  };
+
   ~GpuCommunicator() override = default;
 
   // Returns a platform-specific handle to the underlying communicator object.
@@ -239,10 +324,42 @@ class GpuCommunicator : public Communicator {
     return nullptr;
   }
 
-  // Creates a new device communicator linked to *this GPU communicator object.
+  // Returns true iff this provider implements RunCliqueBarrier.
+  virtual bool SupportsCliqueBarrier() const { return false; }
+
+  // Synchronously joins a provider-native barrier across all communicator
+  // ranks and verifies that every rank supplied exactly `token`. The token
+  // must be nonzero, globally coordinated, and unique among barrier rounds
+  // that can concurrently reach this communicator. Implementations do not
+  // return until device-to-host validation has completed.
+  virtual absl::Status RunCliqueBarrier(stream_executor::Stream* stream,
+                                        GpuCliqueBarrierToken token) {
+    return Unimplemented("Clique barrier is not implemented");
+  }
+
+  // Resolves provider-neutral requirements into an immutable provider plan.
+  // This must not enter a provider collective operation: the runtime resolves
+  // plans on every rank and agrees on their canonical payloads first.
+  virtual absl::StatusOr<std::unique_ptr<DeviceCommPlan>> ResolveDeviceCommPlan(
+      const GpuDeviceCommunicator::Requirements& requirements) {
+    return Unimplemented("Device communicator planning is not implemented");
+  }
+
+  // Creates a new device communicator linked to *this GPU communicator from
+  // an exact plan previously returned by ResolveDeviceCommPlan.
+  virtual absl::StatusOr<std::unique_ptr<GpuDeviceCommunicator>>
+  CreateDeviceComm(const DeviceCommPlan& plan) {
+    return Unimplemented("Device communicator is not implemented");
+  }
+
+  // Legacy convenience wrapper. Runtime collective acquisition uses the
+  // explicit resolve/agree/create sequence above; providers that only
+  // implement this overload continue to work.
   virtual absl::StatusOr<std::unique_ptr<GpuDeviceCommunicator>>
   CreateDeviceComm(const GpuDeviceCommunicator::Requirements& requirements) {
-    return Unimplemented("Device communicator is not implementing");
+    auto plan = ResolveDeviceCommPlan(requirements);
+    if (!plan.ok()) return plan.status();
+    return CreateDeviceComm(**plan);
   }
 
   // Registers an existing device address range with this communicator for
@@ -255,12 +372,27 @@ class GpuCommunicator : public Communicator {
     return Unimplemented("Registered memory is not implemented");
   }
 
-  // Creates a symmetric memory from the existing device address range. This is
-  // a collective operation, and all ranks in a clique must call this operation
-  // in order to make a progress.
+  // Resolves all local, fallible registration checks without entering a
+  // provider collective operation.
+  virtual absl::StatusOr<std::unique_ptr<SymmetricMemoryPlan>>
+  ResolveSymmetricMemoryPlan(se::DeviceAddressBase addr) {
+    return Unimplemented("Symmetric memory planning is not implemented");
+  }
+
+  // Creates symmetric memory from an exact pre-resolved plan. This is a
+  // collective operation, and all ranks in a clique must call it together.
+  virtual absl::StatusOr<std::unique_ptr<SymmetricMemory>>
+  CreateSymmetricMemory(const SymmetricMemoryPlan& plan) {
+    return Unimplemented("Symmetric memory is not implemented");
+  }
+
+  // Legacy convenience wrapper. Providers that only implement this overload
+  // continue to work.
   virtual absl::StatusOr<std::unique_ptr<SymmetricMemory>>
   CreateSymmetricMemory(se::DeviceAddressBase addr) {
-    return Unimplemented("Symmetric memory is not implemented");
+    auto plan = ResolveSymmetricMemoryPlan(addr);
+    if (!plan.ok()) return plan.status();
+    return CreateSymmetricMemory(**plan);
   }
 
   //===--------------------------------------------------------------------===//

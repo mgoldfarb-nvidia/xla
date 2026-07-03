@@ -15,19 +15,24 @@ limitations under the License.
 
 #include "xla/backends/gpu/runtime/collective_cliques.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/base/casts.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/string_view.h"
 #include "absl/time/time.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/backends/gpu/collectives/gpu_clique.h"
@@ -47,9 +52,73 @@ limitations under the License.
 #include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 #include "tsl/platform/casts.h"
+#include "tsl/platform/fingerprint.h"
 #include "tsl/profiler/lib/traceme.h"
 
 namespace xla::gpu {
+namespace {
+
+void AppendManifestField(absl::string_view name, absl::string_view value,
+                         std::string* manifest) {
+  absl::StrAppend(manifest, name.size(), ":", name, value.size(), ":", value);
+}
+
+GpuCliqueBarrierToken DeviceCommBarrierToken(const CollectiveParams& params,
+                                             absl::string_view phase,
+                                             absl::string_view manifest) {
+  std::string input = "xla-device-comm-barrier-v1;";
+  AppendManifestField("execution_id_kind",
+                      params.launch_id == 0 ? "run" : "launch", &input);
+  AppendManifestField("execution_id",
+                      absl::StrCat(params.launch_id == 0 ? params.run_id.ToInt()
+                                                         : params.launch_id),
+                      &input);
+  AppendManifestField("phase", phase, &input);
+  AppendManifestField("manifest", manifest, &input);
+  tsl::Fprint128 fingerprint = tsl::Fingerprint128(input);
+  GpuCliqueBarrierToken token{fingerprint.high64, fingerprint.low64};
+  if (token == GpuCliqueBarrierToken{}) token.high = 1;
+  return token;
+}
+
+absl::Status DeviceCommFailure(const GpuCliqueKey& clique,
+                               absl::Status status) {
+  if (!status.ok() && clique.num_devices() > 1) {
+    LOG(FATAL) << "Multi-rank device communicator initialization failed "
+                  "before clique quiescence was established: "
+               << status;
+  }
+  return status;
+}
+
+struct DeviceCommState {
+  size_t request_index = 0;
+  GpuDeviceCommunicator::Requirements requirements;
+  bool cached = false;
+  std::unique_ptr<GpuCommunicator::DeviceCommPlan> plan;
+  std::unique_ptr<GpuDeviceCommunicator> device_comm;
+};
+
+}  // namespace
+
+std::string GpuCliqueKeyAgreementPayload(const GpuCliqueKey& clique_key) {
+  std::string payload = "xla-gpu-clique-key-v1;";
+  AppendManifestField("device_count", absl::StrCat(clique_key.devices().size()),
+                      &payload);
+  for (GlobalDeviceId device : clique_key.devices()) {
+    AppendManifestField("device", absl::StrCat(device.value()), &payload);
+  }
+  AppendManifestField("communication_id",
+                      absl::StrCat(clique_key.communication_id().value()),
+                      &payload);
+  AppendManifestField("incarnation_count",
+                      absl::StrCat(clique_key.incarnations().size()), &payload);
+  for (IncarnationId incarnation : clique_key.incarnations()) {
+    AppendManifestField("incarnation", absl::StrCat(incarnation.value()),
+                        &payload);
+  }
+  return payload;
+}
 
 CollectiveCliques::CollectiveCliques(AcquiredCliquesMap cliques_map)
     : cliques_map_(std::move(cliques_map)) {}
@@ -128,6 +197,49 @@ absl::StatusOr<bool> CollectiveCliques::peer_access_enabled(
   return (*clique->second)->peer_access_enabled();
 }
 
+absl::Status CollectiveCliques::RunRemoteBarriers(
+    const CollectiveParams& params, const CollectiveCliqueRequests& requests,
+    stream_executor::Stream* stream, absl::string_view phase,
+    const absl::Status& local_status) const {
+  if (params.launch_id == 0) {
+    return absl::FailedPreconditionError(
+        "A distributed device-communication barrier requires a non-zero, "
+        "globally coordinated execution launch id");
+  }
+  if (stream == nullptr) {
+    return absl::InvalidArgumentError(
+        "A distributed device-communication barrier requires a stream");
+  }
+
+  for (const CollectiveCliqueRequests::CliqueRequest& request :
+       requests.OrderedRequestedCliques()) {
+    if (!request.barrier_after_module_execution_requested ||
+        request.key.is_local() || request.dev_comms.empty()) {
+      continue;
+    }
+
+    ASSIGN_OR_RETURN(GpuCommunicator * communicator,
+                     GetComm(request.key, params.global_device_id));
+    if (!communicator->SupportsCliqueBarrier()) {
+      return absl::UnimplementedError(
+          "The provider does not support a non-local completion barrier");
+    }
+
+    std::string manifest = "xla-device-communication-runtime-barrier-v1;";
+    AppendManifestField("clique", GpuCliqueKeyAgreementPayload(request.key),
+                        &manifest);
+    AppendManifestField("request_id", absl::StrCat(request.id), &manifest);
+    AppendManifestField("phase", phase, &manifest);
+    AppendManifestField("status_code",
+                        absl::StrCat(static_cast<int>(local_status.code())),
+                        &manifest);
+    AppendManifestField("status", local_status.message(), &manifest);
+    RETURN_IF_ERROR(communicator->RunCliqueBarrier(
+        stream, DeviceCommBarrierToken(params, phase, manifest)));
+  }
+  return absl::OkStatus();
+}
+
 absl::StatusOr<CollectiveCliques> AcquireCollectiveCliques(
     const CollectiveParams& params, const CollectiveCliqueRequests& cliques) {
   std::vector<CollectiveCliqueRequests::CliqueRequest> ordered_cliques =
@@ -197,14 +309,22 @@ absl::StatusOr<CollectiveCliques> AcquireCollectiveCliques(
                                ? params.p2p_max_nchannels
                                : params.collective_max_nchannels;
 
-    ASSIGN_OR_RETURN(
-        std::shared_ptr<LockableGpuClique::Lock> clique,
+    absl::StatusOr<std::shared_ptr<LockableGpuClique::Lock>> clique_or =
         AcquireGpuClique(params.collectives, params.executor, params.run_id,
                          r.key, r.device_groups,
                          params.clique_id_callback ? *params.clique_id_callback
                                                    : default_clique_id_callback,
                          *rank, cliques_map, max_channels,
-                         params.collective_use_minimal_resource));
+                         params.collective_use_minimal_resource);
+    if (!clique_or.ok()) {
+      if (!r.key.is_local() && !r.dev_comms.empty()) {
+        LOG(FATAL) << "Non-local device-communication clique acquisition "
+                      "failed before peers could converge: "
+                   << clique_or.status();
+      }
+      return clique_or.status();
+    }
+    std::shared_ptr<LockableGpuClique::Lock> clique = std::move(*clique_or);
 
     cliques_map[r.key] = std::move(clique);
   }
@@ -215,31 +335,156 @@ absl::StatusOr<CollectiveCliques> AcquireCollectiveCliques(
       params.global_device_id, params.run_id, cliques_map.size(),
       absl::FormatDuration(absl::Microseconds(end_micros - start_micros)));
 
-  // After we acquired all GPU cliques, check if they already have required
-  // device communicators, and create them if needed. Creating device
-  // communicators is a collective operation that must be executed by all ranks,
-  // but luckily we already are inside the collective function, so we can safely
-  // create missing communicators here.
+  // Resolve and agree on the complete device-communicator plan before any rank
+  // enters provider creation. The already-acquired host communicator is the
+  // agreement transport, which keeps this first layer NCCL-local and avoids a
+  // separate distributed protocol.
   for (const CollectiveCliqueRequests::CliqueRequest& r : ordered_cliques) {
     std::optional<RankId> rank = r.key.rank(params.global_device_id);
     std::shared_ptr<LockableGpuClique::Lock> clique = cliques_map.at(r.key);
+    if (r.dev_comms.empty()) continue;
 
-    for (const GpuDeviceCommunicator::Requirements& reqs : r.dev_comms) {
-      // Device communicator already exists in the GPU clique.
-      if ((*clique)->device_comm(*rank, reqs)) {
-        continue;
+    if (!rank.has_value() || params.stream == nullptr) {
+      return DeviceCommFailure(
+          r.key, Internal("Device communicator initialization is missing rank "
+                          "or execution stream for clique %v",
+                          r.key));
+    }
+    if (!r.key.is_local() && params.launch_id == 0) {
+      return FailedPrecondition(
+          "Non-local device communication requires a non-zero, globally "
+          "coordinated execution launch id");
+    }
+
+    auto* comm = dynamic_cast<GpuCommunicator*>(*(*clique)->comm(*rank));
+    if (comm == nullptr) {
+      return Internal("Communicator for clique %v is not a GpuCommunicator",
+                      r.key);
+    }
+    if (!comm->SupportsCliqueBarrier()) {
+      return Unimplemented(
+          "Device communicator provider for clique %v does not support "
+          "initialization agreement",
+          r.key);
+    }
+
+    std::vector<DeviceCommState> states;
+    states.reserve(r.dev_comms.size());
+    absl::Status local_status;
+    std::string manifest = "xla-device-comm-plan-v1;";
+    AppendManifestField("clique", GpuCliqueKeyAgreementPayload(r.key),
+                        &manifest);
+    AppendManifestField("count", absl::StrCat(r.dev_comms.size()), &manifest);
+
+    size_t request_index = 0;
+    for (const GpuDeviceCommunicator::Requirements& requirements :
+         r.dev_comms) {
+      DeviceCommState& state = states.emplace_back();
+      state.request_index = request_index++;
+      state.requirements = requirements;
+      state.cached = (*clique)->device_comm(*rank, requirements).has_value();
+      if (!state.cached) {
+        absl::StatusOr<std::unique_ptr<GpuCommunicator::DeviceCommPlan>> plan =
+            comm->ResolveDeviceCommPlan(requirements);
+        if (!plan.ok()) {
+          local_status.Update(plan.status());
+        } else if (*plan == nullptr) {
+          local_status.Update(absl::InternalError(
+              "Provider returned a null device communicator plan"));
+        } else {
+          state.plan = std::move(*plan);
+        }
       }
 
-      XLA_VLOG_DEVICE(2, params.executor->device_ordinal())
-          << absl::StreamFormat("Create device communicator: rank=%v clique=%v",
-                                *rank, r.key);
+      AppendManifestField("requirements", absl::StrCat(requirements),
+                          &manifest);
+      AppendManifestField("cached", state.cached ? "1" : "0", &manifest);
+      AppendManifestField(
+          "provider",
+          state.plan == nullptr ? absl::string_view() : state.plan->provider(),
+          &manifest);
+      AppendManifestField("plan",
+                          state.plan == nullptr
+                              ? absl::string_view()
+                              : state.plan->agreement_payload(),
+                          &manifest);
+    }
+    AppendManifestField("status_code",
+                        absl::StrCat(static_cast<int>(local_status.code())),
+                        &manifest);
+    AppendManifestField("status", local_status.message(), &manifest);
 
-      auto* comm = dynamic_cast<GpuCommunicator*>(*(*clique)->comm(*rank));
-      DCHECK(comm) << "Communicator must be in the acquired clique";
-      ASSIGN_OR_RETURN(std::unique_ptr<GpuDeviceCommunicator> dev_comm,
-                       comm->CreateDeviceComm(reqs));
-      RETURN_IF_ERROR(
-          (*clique)->AddDeviceComm(*rank, reqs, std::move(dev_comm)));
+    absl::Status preflight = comm->RunCliqueBarrier(
+        params.stream,
+        DeviceCommBarrierToken(params, "resolved-plan", manifest));
+    if (!preflight.ok()) {
+      return DeviceCommFailure(r.key, std::move(preflight));
+    }
+    if (!local_status.ok()) {
+      return local_status;
+    }
+
+    std::vector<DeviceCommState*> creation_order;
+    creation_order.reserve(states.size());
+    for (DeviceCommState& state : states) {
+      if (!state.cached) creation_order.push_back(&state);
+    }
+    std::stable_sort(
+        creation_order.begin(), creation_order.end(),
+        [](const DeviceCommState* lhs, const DeviceCommState* rhs) {
+          return lhs->plan->creation_priority() <
+                 rhs->plan->creation_priority();
+        });
+
+    for (DeviceCommState* state : creation_order) {
+      {
+        XLA_VLOG_DEVICE(2, params.executor->device_ordinal())
+            << absl::StreamFormat(
+                   "Create device communicator: rank=%v clique=%v", *rank,
+                   r.key);
+        absl::StatusOr<std::unique_ptr<GpuDeviceCommunicator>> device_comm =
+            comm->CreateDeviceComm(*state->plan);
+        if (!device_comm.ok()) {
+          if (r.key.num_devices() > 1) {
+            LOG(FATAL) << "Device communicator creation failed inside a "
+                          "multi-rank provider collective; quiescence is "
+                          "unknown: "
+                       << device_comm.status();
+          }
+          return device_comm.status();
+        }
+        if (*device_comm == nullptr) {
+          absl::Status status = absl::InternalError(
+              "Provider returned a null device communicator");
+          if (r.key.num_devices() > 1) {
+            LOG(FATAL) << status;
+          }
+          return status;
+        }
+        state->device_comm = std::move(*device_comm);
+      }
+
+      std::string outcome = manifest;
+      AppendManifestField("created_index", absl::StrCat(state->request_index),
+                          &outcome);
+      AppendManifestField("created", state->device_comm != nullptr ? "1" : "0",
+                          &outcome);
+      absl::Status post_create = comm->RunCliqueBarrier(
+          params.stream,
+          DeviceCommBarrierToken(params, "post-create", outcome));
+      if (!post_create.ok()) {
+        return DeviceCommFailure(r.key, std::move(post_create));
+      }
+    }
+
+    // Publish only after every rank has completed the full creation sequence.
+    for (DeviceCommState& state : states) {
+      if (state.cached) continue;
+      absl::Status status = (*clique)->AddDeviceComm(
+          *rank, state.requirements, std::move(state.device_comm));
+      if (!status.ok()) {
+        return DeviceCommFailure(r.key, std::move(status));
+      }
     }
   }
 

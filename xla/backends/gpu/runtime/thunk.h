@@ -394,6 +394,11 @@ class Thunk {
     return absl::OkStatus();
   }
 
+  // Returns true when a Prepare failure can strand a peer that is about to
+  // enter device-communication resource acquisition. The minimal runtime uses
+  // this static property to fail fast before ranks can diverge.
+  virtual bool UsesDeviceCommunication() const { return false; }
+
   // Initializes thunk for execution.
   //
   // This may be called multiple times. Its main purpose is to give us a chance

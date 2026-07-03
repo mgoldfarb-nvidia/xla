@@ -36,14 +36,27 @@ CollectiveMemoryRequests::CollectiveMemoryRequests(
     : buffers_(buffers) {}
 
 absl::Status CollectiveMemoryRequests::RequestSymmetricAllocation(
-    const GpuCliqueKey& clique, BufferAllocation::Index allocation) {
+    const GpuCliqueKey& clique, BufferAllocation::Index allocation,
+    bool execution_scoped) {
   VLOG(5) << "Add collective allocation request: " << clique
           << "; allocation=" << allocation;
 
   // If symmetric allocation requests already exists add allocation index to it.
   if (auto it = sym_allocations_.find(clique); it != sym_allocations_.end()) {
     CollectiveAllocations& allocs = it->second;
+    bool already_requested = allocs.allocations.contains(allocation);
+    bool already_execution_scoped =
+        allocs.execution_scoped_allocations.contains(allocation);
+    if (already_requested && already_execution_scoped != execution_scoped) {
+      return FailedPrecondition(
+          "Allocation %d in clique %v cannot be requested as both persistent "
+          "and execution-scoped symmetric memory",
+          allocation, clique);
+    }
     allocs.allocations.insert(allocation);
+    if (execution_scoped) {
+      allocs.execution_scoped_allocations.insert(allocation);
+    }
     return absl::OkStatus();
   }
 
@@ -51,7 +64,10 @@ absl::Status CollectiveMemoryRequests::RequestSymmetricAllocation(
   // order on all replicas. We rely on this property to assign unique id to
   // symmetric allocation requests to guarantee deterministic execution order.
   CollectiveAllocations alloc{
-      /*id=*/sym_allocations_.size(), clique, {allocation}};
+      /*id=*/sym_allocations_.size(), clique, {allocation}, {}};
+  if (execution_scoped) {
+    alloc.execution_scoped_allocations.insert(allocation);
+  }
 
   sym_allocations_.try_emplace(clique, std::move(alloc));
   return absl::OkStatus();

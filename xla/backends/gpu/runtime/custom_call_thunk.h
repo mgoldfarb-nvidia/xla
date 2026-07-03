@@ -152,6 +152,9 @@ class CustomCallThunk : public TracedCommand {
   absl::Status Prepare(const PrepareParams& params) override;
   absl::Status Initialize(const InitializeParams& params) override;
   absl::Status ExecuteOnStream(const ExecuteParams& params) override;
+  bool UsesDeviceCommunication() const override {
+    return uses_device_communication_;
+  }
 
   bool requires_warmup() const override { return true; }
 

@@ -408,7 +408,7 @@ absl::Status FfiCollectiveResources::FinalizeDeviceCommunication() {
 
   for (BufferAllocation::Index allocation : allocations) {
     RETURN_IF_ERROR(collective_memory_requests_->RequestSymmetricAllocation(
-        clique_key, allocation));
+        clique_key, allocation, /*execution_scoped=*/true));
   }
 
   collective_ = CollectiveRecord{std::move(clique_key), requirements};

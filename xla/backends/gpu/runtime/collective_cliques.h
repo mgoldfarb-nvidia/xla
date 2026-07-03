@@ -17,9 +17,12 @@ limitations under the License.
 #define XLA_BACKENDS_GPU_RUNTIME_COLLECTIVE_CLIQUES_H_
 
 #include <memory>
+#include <string>
 #include <utility>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
 #include "xla/backends/gpu/collectives/gpu_cliques.h"
 #include "xla/backends/gpu/collectives/gpu_communicator.h"
@@ -31,6 +34,10 @@ limitations under the License.
 #include "xla/util.h"
 
 namespace xla::gpu {
+
+// Returns a canonical clique identity for cross-process agreement. Process-
+// local properties such as the number of locally hosted ranks are excluded.
+std::string GpuCliqueKeyAgreementPayload(const GpuCliqueKey& clique_key);
 
 // A collection of collective cliques acquired based on GPU clique requests
 // collected from all thunks at prepare stage.
@@ -57,6 +64,16 @@ class CollectiveCliques {
   // in the clique.
   absl::StatusOr<bool> peer_access_enabled(
       const GpuCliqueKey& clique_key) const;
+
+  // Establishes a provider-native agreement across every non-local clique
+  // that requested module-completion ordering. `phase` separates Initialize
+  // and completion rounds; `local_status` is included in the token so ranks
+  // cannot silently disagree about whether it is safe to proceed.
+  absl::Status RunRemoteBarriers(const CollectiveParams& params,
+                                 const CollectiveCliqueRequests& requests,
+                                 stream_executor::Stream* stream,
+                                 absl::string_view phase,
+                                 const absl::Status& local_status) const;
 
   // Ties an object to a clique. Clique takes ownership of the object and will
   // destroy it when the clique is destroyed. When TiedRef is destroyed, the

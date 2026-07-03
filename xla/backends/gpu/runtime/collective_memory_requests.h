@@ -81,11 +81,17 @@ class CollectiveMemoryRequests {
     size_t id;  // see synthetic id documentation above
     GpuCliqueKey clique;
     absl::btree_set<BufferAllocation::Index> allocations;
+    // Registrations for these allocations must be released with the
+    // invocation's backing buffers and require module-completion ordering.
+    absl::btree_set<BufferAllocation::Index> execution_scoped_allocations;
   };
 
   // Adds a request to make the given allocation symmetric on the given clique.
+  // The same allocation cannot mix persistent and execution-scoped requests;
+  // persistent consumers can embed the registered address in shared metadata.
   absl::Status RequestSymmetricAllocation(const GpuCliqueKey& clique,
-                                          BufferAllocation::Index allocation);
+                                          BufferAllocation::Index allocation,
+                                          bool execution_scoped = false);
 
   // Adds a request to make the given allocation slice symmetric on the given
   // clique.

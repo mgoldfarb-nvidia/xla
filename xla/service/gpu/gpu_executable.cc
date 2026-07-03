@@ -537,14 +537,24 @@ absl::Status MaybeSyncAndProfile(const ServiceExecutableRunOptions* run_options,
                                  se::EventBasedTimer* execution_timer,
                                  se::Stream* stream_to_sync);
 
-absl::Status RendezvousAfterInitialization(
+absl::Status RendezvousAfterLocalThunkPhase(
     const ServiceExecutableRunOptions& run_options,
-    const DebugOptions* absl_nullable debug_options);
+    const DebugOptions* absl_nullable debug_options,
+    GpuExecutableRendezvousPhase phase, absl::string_view phase_name,
+    absl::Status phase_status);
+
+absl::Status RendezvousAfterCollectiveResourceInitialization(
+    const ServiceExecutableRunOptions& run_options,
+    const DebugOptions* absl_nullable debug_options,
+    absl::Span<const GlobalDeviceId> participant_devices,
+    absl::Status initialization_status, size_t num_participants);
 
 absl::Status BarrierAfterExecutable(
     const ServiceExecutableRunOptions& run_options,
     const DebugOptions* absl_nullable debug_options,
-    absl::Span<se::Stream* const> streams_to_sync, size_t num_participants);
+    absl::Span<se::Stream* const> streams_to_sync,
+    absl::Span<const GlobalDeviceId> participant_devices,
+    absl::Status execution_status, size_t num_participants);
 
 absl::Status SynchronizeExecutionStreams(
     absl::Span<se::Stream* const> streams) {
@@ -747,6 +757,14 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
   CollectiveCliqueRequests collective_clique_requests;
   CollectiveMemoryRequests collective_memory_requests(buffer_allocations);
 
+  bool uses_device_communication = false;
+  RETURN_IF_ERROR(thunk_executor.thunks().WalkNested(
+      [&](const Thunk* thunk) -> absl::Status {
+        uses_device_communication |= thunk->UsesDeviceCommunication();
+        return absl::OkStatus();
+      }));
+
+  absl::Status prepare_status;
   {  // Prepare thunks for execution and collect requested GPU cliques.
     Thunk::PrepareParams prepare_params{
         &collective_params,          &collective_clique_requests,
@@ -754,14 +772,52 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
         &buffer_allocations,         &execution_scoped_state};
 
     tsl::profiler::TraceMe trace_prepare("Thunks::Prepare");
-    RETURN_IF_ERROR(thunk_executor.Prepare(prepare_params));
+    prepare_status = thunk_executor.Prepare(prepare_params);
   }
+
+  if (uses_device_communication) {
+    prepare_status = RendezvousAfterLocalThunkPhase(
+        *run_options, debug_options, GpuExecutableRendezvousPhase::kPrepare,
+        "preparation", std::move(prepare_status));
+    int64_t team_size =
+        collective_params.device_assn == nullptr
+            ? 1
+            : collective_params.device_assn->replica_count() *
+                  collective_params.device_assn->computation_count();
+    int64_t local_team_size = team_size;
+    if (collective_params.device_assn != nullptr &&
+        collective_params.global_device_id_map != nullptr) {
+      auto device_to_logical =
+          collective_params.device_assn->GetDeviceToLogicalIdMap();
+      local_team_size = 0;
+      for (const auto& local_to_global :
+           *collective_params.global_device_id_map) {
+        local_team_size += device_to_logical.contains(local_to_global.second);
+      }
+    }
+    bool may_have_remote_participants = local_team_size < team_size;
+    if (!prepare_status.ok() && may_have_remote_participants) {
+      LOG(FATAL) << "Prepare failed in an executable that may use non-local "
+                    "device communication; peer resource acquisition cannot "
+                    "be proven quiescent: "
+                 << prepare_status;
+    }
+  }
+  RETURN_IF_ERROR(prepare_status);
 
   XLA_VLOG_DEVICE(3, run_options->device_ordinal()) << absl::StreamFormat(
       "Prepared GPU executable module: %s for execution: "
       "#collective=[cliques=%d, symmetric=%d]",
       module_name, collective_clique_requests.size(),
       collective_memory_requests.symmetric_size());
+
+  if (collective_clique_requests.BarrierRequiresRemoteParticipants() &&
+      collective_params.launch_id == 0) {
+    return FailedPrecondition(
+        "Non-local device communication requires a non-zero, globally "
+        "coordinated execution launch id that is unique among concurrently "
+        "in-flight distributed launches");
+  }
 
   std::vector<std::unique_ptr<CliqueKey>>* clique_keys =
       run_options->run_options().clique_keys();
@@ -772,19 +828,71 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
     }
   }
 
-  // Acquire collective cliques requested by thunks.
+  absl::flat_hash_set<GlobalDeviceId> requested_barrier_devices =
+      collective_clique_requests.GetDevicesRequiringBarrier();
+  std::vector<GlobalDeviceId> barrier_participant_devices(
+      requested_barrier_devices.begin(), requested_barrier_devices.end());
+  absl::c_sort(barrier_participant_devices);
+  bool barrier_requires_remote_participants =
+      collective_clique_requests.BarrierRequiresRemoteParticipants();
+
+  // Acquire resources without allowing one local rank to return while its
+  // siblings proceed to Initialize or completion rendezvous. Provider-native
+  // preflight barriers inside these helpers cover the remote NCCL ranks.
   CollectiveCliques collective_cliques;
+  absl::Status collective_resource_status;
   if (!mock_collectives) {
-    ASSIGN_OR_RETURN(collective_cliques,
-                     AcquireCollectiveCliques(collective_params,
-                                              collective_clique_requests));
+    absl::StatusOr<CollectiveCliques> cliques_or =
+        AcquireCollectiveCliques(collective_params, collective_clique_requests);
+    if (cliques_or.ok()) {
+      collective_cliques = std::move(*cliques_or);
+    } else {
+      collective_resource_status = cliques_or.status();
+    }
   }
 
-  // Acquire collective memories requested by thunks.
-  ASSIGN_OR_RETURN(CollectiveMemory collective_memory,
-                   AcquireCollectiveMemory(
-                       collective_params, collective_cliques,
-                       collective_memory_requests, collective_memory_cache));
+  std::optional<CollectiveMemory> collective_memory;
+  if (collective_resource_status.ok()) {
+    absl::StatusOr<CollectiveMemory> memory_or = AcquireCollectiveMemory(
+        collective_params, collective_cliques, collective_memory_requests,
+        collective_memory_cache);
+    if (memory_or.ok()) {
+      collective_memory.emplace(std::move(*memory_or));
+    } else {
+      collective_resource_status = memory_or.status();
+    }
+  }
+
+  if (requested_barrier_devices.contains(collective_params.global_device_id)) {
+    absl::Status local_resource_status = collective_resource_status;
+    collective_resource_status = MaybeRunGpuExecutableCompletionBarrier(
+        requested_barrier_devices, collective_params.global_device_id,
+        collective_params.global_device_id_map, absl::OkStatus(),
+        [&](size_t num_local_barrier_participants) {
+          return RendezvousAfterCollectiveResourceInitialization(
+              *run_options, debug_options, barrier_participant_devices,
+              local_resource_status, num_local_barrier_participants);
+        });
+  }
+
+  if (!collective_resource_status.ok()) {
+    collective_resource_status.Update(
+        thunk_executor.FinalizeOnError(&execution_scoped_state));
+    return collective_resource_status;
+  }
+  TF_RET_CHECK(collective_memory.has_value());
+
+  std::vector<se::Stream*> completion_streams = {
+      main_stream, command_buffer_trace_stream,
+      run_options->run_options().device_to_host_stream(),
+      run_options->run_options().host_to_device_stream()};
+  completion_streams.insert(completion_streams.end(),
+                            collective_params.async_streams.begin(),
+                            collective_params.async_streams.end());
+  completion_streams.insert(completion_streams.end(),
+                            compute_streams.streams.begin(),
+                            compute_streams.streams.end());
+
   {  // Initialize thunks using prepared resources before execution.
     Thunk::InitializeParams initialize_params{
         executor,
@@ -794,14 +902,14 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
         command_buffer_trace_stream,
         &collective_params,
         &collective_cliques,
-        &collective_memory,
+        &*collective_memory,
         run_options->run_options().ffi_execution_context(),
         run_options->local_device_count(),
         &execution_scoped_state};
     initialize_params.persistent_alloc_indices = persistent_alloc_indices;
 
     tsl::profiler::TraceMe trace_initialize("Thunks::Initialize");
-    RETURN_IF_ERROR(thunk_executor.Initialize(initialize_params));
+    collective_resource_status = thunk_executor.Initialize(initialize_params);
   }
 
   // Join a round of rendezvous after thunk initialization. We do this only in
@@ -810,32 +918,63 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
   // deadlocks if we try to execute it concurrently with other potentially
   // memory-allocating operations.
   if (!collective_cliques.empty()) {
-    RETURN_IF_ERROR(RendezvousAfterInitialization(*run_options, debug_options));
+    collective_resource_status = RendezvousAfterLocalThunkPhase(
+        *run_options, debug_options,
+        GpuExecutableRendezvousPhase::kInitialization, "initialization",
+        std::move(collective_resource_status));
+  }
+
+  if (!collective_resource_status.ok()) {
+    bool has_multi_rank_device_communication = absl::c_any_of(
+        collective_clique_requests.OrderedRequestedCliques(),
+        [](const CollectiveCliqueRequests::CliqueRequest& request) {
+          return !request.dev_comms.empty() && request.key.num_devices() > 1;
+        });
+    if (has_multi_rank_device_communication) {
+      LOG(FATAL) << "Multi-rank device-communication initialization failed "
+                    "before device work could be proven quiescent: "
+                 << collective_resource_status;
+    }
+    collective_resource_status.Update(
+        SynchronizeExecutionStreams(completion_streams));
+    collective_resource_status.Update(
+        thunk_executor.FinalizeOnError(&execution_scoped_state));
+    return collective_resource_status;
+  }
+
+  if (barrier_requires_remote_participants) {
+    absl::Status remote_status = collective_cliques.RunRemoteBarriers(
+        collective_params, collective_clique_requests, main_stream,
+        "initialize", collective_resource_status);
+    if (!remote_status.ok()) {
+      LOG(FATAL) << "Distributed thunk initialization failed before remote "
+                    "device-communication quiescence was established: "
+                 << remote_status;
+    }
   }
 
   // Prepare parameters for thunks execution.
   Thunk::ExecuteParams execute_params = Thunk::ExecuteParams::Create(
       *run_options, buffer_allocations, main_stream,
       command_buffer_trace_stream, &collective_params, &collective_cliques,
-      &collective_memory, std::move(compute_streams.streams),
+      &*collective_memory, std::move(compute_streams.streams),
       &execution_scoped_state, persistent_alloc_indices);
-
-  std::vector<se::Stream*> completion_streams = {
-      main_stream, execute_params.command_buffer_trace_stream,
-      execute_params.device_to_host_stream,
-      execute_params.host_to_device_stream};
-  completion_streams.insert(completion_streams.end(),
-                            collective_params.async_streams.begin(),
-                            collective_params.async_streams.end());
-  completion_streams.insert(completion_streams.end(),
-                            execute_params.additional_compute_streams.begin(),
-                            execute_params.additional_compute_streams.end());
 
   XLA_VLOG_DEVICE(1, run_options->device_ordinal())
       << "Start GpuExecutable::ExecuteOnStream module: " << module_name;
   absl::Status execute_status = thunk_executor.ExecuteOnStream(execute_params);
   XLA_VLOG_DEVICE(1, run_options->device_ordinal())
       << "End GpuExecutable::ExecuteOnStream module: " << module_name;
+
+  // A rank that fails before its peer's device-communication kernel completes
+  // cannot safely block on local streams or release remotely addressable
+  // buffers. The recovery layer above this branch replaces this fail-fast
+  // policy with communicator abort and ownership quarantine.
+  if (!execute_status.ok() && barrier_requires_remote_participants) {
+    LOG(FATAL) << "Non-local device-communication execution failed before "
+                  "remote quiescence was established: "
+               << execute_status;
+  }
 
   // An execution error can skip async-done thunks, leaving device work and
   // AsyncExecution host state outstanding. Drain every stream before closing
@@ -854,8 +993,7 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
   // 2. To make sure that cuda module which uses a multimem handler used by
   //    another GPU will be unloaded only after all kernels are finished.
   //    Otherwise module unloading can cause a deadlock.
-  absl::flat_hash_set<GlobalDeviceId> requested_barrier_devices =
-      collective_clique_requests.GetDevicesRequiringBarrier();
+  absl::Status local_execution_status = execute_status;
   execute_status = MaybeRunGpuExecutableCompletionBarrier(
       requested_barrier_devices, collective_params.global_device_id,
       collective_params.global_device_id_map, std::move(execute_status),
@@ -863,10 +1001,22 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
         XLA_VLOG_DEVICE(1, collective_params.global_device_id.value())
             << "Barrier after executable required by participants: ("
             << absl::StrJoin(requested_barrier_devices, ", ") << ")";
-        return BarrierAfterExecutable(*run_options, debug_options,
-                                      completion_streams,
-                                      num_local_barrier_participants);
+        return BarrierAfterExecutable(
+            *run_options, debug_options, completion_streams,
+            barrier_participant_devices, local_execution_status,
+            num_local_barrier_participants);
       });
+
+  if (barrier_requires_remote_participants) {
+    absl::Status remote_status = collective_cliques.RunRemoteBarriers(
+        collective_params, collective_clique_requests, main_stream,
+        "completion", execute_status);
+    if (!remote_status.ok()) {
+      LOG(FATAL) << "Distributed executable completion failed before remote "
+                    "device-communication quiescence was established: "
+                 << remote_status;
+    }
+  }
 
   RETURN_IF_ERROR(execute_status);
 
@@ -874,26 +1024,11 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
                              block_host_until_done ? main_stream : nullptr);
 }
 
-namespace {
-// Wrap RunId into a unique struct to guarantee we do not accidentally try to
-// run multiple unrelated rendezvous for a same key.
-struct InitializationKey {
-  RunId run_id;
-
-  template <typename H>
-  friend H AbslHashValue(H h, const InitializationKey& key) {
-    return H::combine(std::move(h), key.run_id);
-  }
-};
-
-bool operator==(const InitializationKey& a, const InitializationKey& b) {
-  return a.run_id == b.run_id;
-}
-}  // namespace
-
-absl::Status RendezvousAfterInitialization(
+absl::Status RendezvousAfterLocalThunkPhase(
     const ServiceExecutableRunOptions& run_options,
-    const DebugOptions* absl_nullable debug_options) {
+    const DebugOptions* absl_nullable debug_options,
+    GpuExecutableRendezvousPhase phase, absl::string_view phase_name,
+    absl::Status phase_status) {
   // Thunk initialization can allocate new control data structures on device
   // that can lead to deadlocks if other replicas are executing concurrently
   // (i.e. this happens if we try to instantiate CUDA graph when other replica
@@ -906,7 +1041,7 @@ absl::Status RendezvousAfterInitialization(
   // If we don't have Gpu executable options or device assignment it means we
   // are running in a single Gpu config and don't need a rendezvous.
   if (!gpu_opts || !device_assn) {
-    return absl::OkStatus();
+    return phase_status;
   }
 
   // Assume that all participants execute locally first, if we have a local
@@ -925,29 +1060,58 @@ absl::Status RendezvousAfterInitialization(
     }
 
     if (num_local_participants == 0) {
-      return absl::InternalError(
-          "Cound't find the number of local participants");
+      phase_status.Update(
+          absl::InternalError("Couldn't find any local participants"));
+      return phase_status;
     }
   }
 
   XLA_VLOG_DEVICE(1, run_options.device_ordinal()) << absl::StreamFormat(
-      "Join thunks initialization rendezvous with %d local participants",
+      "Join thunks %s rendezvous with %d local participants", phase_name,
       num_local_participants);
 
   tsl::profiler::TraceMe trace([&] {
     return tsl::profiler::TraceMeEncode(
-        "RendezvousAfterInitialization",
+        absl::StrCat("RendezvousAfter", phase_name),
         {{"run_id", run_options.run_options().run_id().ToInt()},
          {"num_local_participants", num_local_participants}});
   });
 
-  auto rendezvous_key = InitializationKey{run_options.run_options().run_id()};
   auto rendezvous_name = absl::StrFormat(
-      "thunk initialization completion for device ordinal %d; run_id=%d",
+      "thunk %s completion for device ordinal %d; run_id=%d", phase_name,
       run_options.device_ordinal(), run_options.run_options().run_id().ToInt());
 
-  return Rendezvous(
-      rendezvous_name, rendezvous_key, num_local_participants,
+  return RendezvousGpuExecutableStatuses(
+      rendezvous_name, run_options.run_options().run_id().ToInt(), phase,
+      /*participant_devices=*/{}, std::move(phase_status),
+      num_local_participants,
+      absl::Seconds(
+          debug_options
+              ? debug_options->xla_gpu_executable_warn_stuck_timeout_seconds()
+              : 10),
+      absl::Seconds(
+          debug_options
+              ? debug_options->xla_gpu_executable_terminate_timeout_seconds()
+              : 30));
+}
+
+absl::Status RendezvousAfterCollectiveResourceInitialization(
+    const ServiceExecutableRunOptions& run_options,
+    const DebugOptions* absl_nullable debug_options,
+    absl::Span<const GlobalDeviceId> participant_devices,
+    absl::Status initialization_status, size_t num_participants) {
+  XLA_VLOG_DEVICE(1, run_options.device_ordinal()) << absl::StreamFormat(
+      "Join collective resource initialization rendezvous with %d local "
+      "participants",
+      num_participants);
+
+  auto rendezvous_name = absl::StrFormat(
+      "collective resource initialization for device ordinal %d; run_id=%d",
+      run_options.device_ordinal(), run_options.run_options().run_id().ToInt());
+  return RendezvousGpuExecutableStatuses(
+      rendezvous_name, run_options.run_options().run_id().ToInt(),
+      GpuExecutableRendezvousPhase::kCollectiveResourceInitialization,
+      participant_devices, std::move(initialization_status), num_participants,
       absl::Seconds(
           debug_options
               ? debug_options->xla_gpu_executable_warn_stuck_timeout_seconds()
@@ -991,8 +1155,15 @@ absl::Status MaybeSyncAndProfile(const ServiceExecutableRunOptions* run_options,
 absl::Status BarrierAfterExecutable(
     const ServiceExecutableRunOptions& run_options,
     const DebugOptions* absl_nullable debug_options,
-    absl::Span<se::Stream* const> streams, const size_t num_participants) {
-  absl::Status status = SynchronizeExecutionStreams(streams);
+    absl::Span<se::Stream* const> streams,
+    absl::Span<const GlobalDeviceId> participant_devices,
+    absl::Status execution_status, const size_t num_participants) {
+  absl::Status stream_status = SynchronizeExecutionStreams(streams);
+  if (!stream_status.ok() && participant_devices.size() > num_participants) {
+    LOG(FATAL) << "A non-local device-communication stream failed to quiesce: "
+               << stream_status;
+  }
+  execution_status.Update(std::move(stream_status));
 
   XLA_VLOG_DEVICE(1, run_options.device_ordinal()) << absl::StreamFormat(
       "Join thunks in barrier after module execution rendezvous with %d "
@@ -1007,14 +1178,15 @@ absl::Status BarrierAfterExecutable(
          {"num_local_participants", num_participants}});
   });
 
-  auto rendezvous_key = InitializationKey{run_options.run_options().run_id()};
   auto rendezvous_name = absl::StrFormat(
       "thunk barrier after module execution completion for device ordinal "
       "%d; run_id=%d",
       run_options.device_ordinal(), run_options.run_options().run_id().ToInt());
 
-  status.Update(Rendezvous(
-      rendezvous_name, rendezvous_key, num_participants,
+  return RendezvousGpuExecutableStatuses(
+      rendezvous_name, run_options.run_options().run_id().ToInt(),
+      GpuExecutableRendezvousPhase::kCompletion, participant_devices,
+      std::move(execution_status), num_participants,
       absl::Seconds(
           debug_options
               ? debug_options->xla_gpu_executable_warn_stuck_timeout_seconds()
@@ -1022,8 +1194,7 @@ absl::Status BarrierAfterExecutable(
       absl::Seconds(
           debug_options
               ? debug_options->xla_gpu_executable_terminate_timeout_seconds()
-              : 30)));
-  return status;
+              : 30));
 }
 
 absl::StatusOr<const GpuExecutable::BufferAllocToDeviceMemoryMap*>

@@ -436,6 +436,7 @@ xla_test(
 
 cc_library(
     name = "gpu_communicator",
+    srcs = ["gpu_communicator.cc"],
     hdrs = ["gpu_communicator.h"],
     deps = [
         "//xla:future",
@@ -453,6 +454,7 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
     ],
 )
@@ -941,7 +943,9 @@ cc_library(
         "//xla/core/collectives:registered_memory",
         "//xla/core/collectives:symmetric_memory",
         "//xla/stream_executor:device_address",
+        "//xla/stream_executor:device_address_handle",
         "//xla/stream_executor:kernel_args",
+        "//xla/stream_executor:memory_allocation",
         "//xla/stream_executor:stream",
         "//xla/stream_executor:stream_executor_h",
         "//xla/tsl/concurrency:executor",

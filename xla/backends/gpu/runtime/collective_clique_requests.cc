@@ -150,4 +150,12 @@ CollectiveCliqueRequests::GetDevicesRequiringBarrier() const {
   return result;
 }
 
+bool CollectiveCliqueRequests::BarrierRequiresRemoteParticipants() const {
+  return absl::c_any_of(cliques_, [](const auto& entry) {
+    const CliqueRequest& request = entry.second;
+    return request.barrier_after_module_execution_requested &&
+           !request.key.is_local() && !request.dev_comms.empty();
+  });
+}
+
 }  // namespace xla::gpu

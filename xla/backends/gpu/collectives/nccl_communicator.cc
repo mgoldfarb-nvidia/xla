@@ -457,6 +457,98 @@ absl::StatusOr<NcclDeviceCommPlan> BuildNcclDeviceCommPlan(
   return plan;
 }
 
+std::string NcclDeviceCommPlanAgreementPayload(
+    const NcclDeviceCommPlan& plan, const NcclCapabilities& capabilities,
+    uint64_t runtime_version) {
+  const ncclDevCommRequirements& reqs = plan.requirements;
+  std::string payload = absl::StrFormat(
+      "provider=nccl;schema=1;compile_abi=%d;runtime_abi=%d;team_size=%d;"
+      "lsa_team_count=%d;device_api=%d;multimem_cap=%d;full_gin_cap=%d;"
+      "rail_gin_cap=%d;lsa_barriers=%d;topology=%d;enabled_features=%d",
+      NCCL_VERSION_CODE, runtime_version, capabilities.team_size,
+      capabilities.lsa_team_count, capabilities.supports_device_comm,
+      capabilities.supports_multimem, capabilities.supports_full_gin,
+      capabilities.supports_rail_gin, reqs.lsaBarrierCount,
+      static_cast<int>(plan.topology), plan.enabled_features);
+#if NCCL_VERSION_CODE >= 22900
+  absl::StrAppendFormat(&payload, ";lsa_multimem=%d", reqs.lsaMultimem);
+#endif
+#if NCCL_VERSION_CODE >= 22907
+  absl::StrAppendFormat(
+      &payload,
+      ";barriers=%d;rail_gin_barriers=%d;gin_signals=%d;gin_counters=%d;"
+      "gin_connection=%d",
+      reqs.barrierCount, reqs.railGinBarrierCount, reqs.ginSignalCount,
+      reqs.ginCounterCount, static_cast<int>(reqs.ginConnectionType));
+#endif
+  return payload;
+}
+
+std::string NcclSymmetricMemoryPlanAgreementPayload(size_t size,
+                                                    uint64_t runtime_version) {
+  return absl::StrFormat(
+      "provider=nccl-window;schema=1;compile_abi=%d;runtime_abi=%d;size=%d;"
+      "flags=%d",
+      NCCL_VERSION_CODE, runtime_version, size, NCCL_WIN_COLL_SYMMETRIC);
+}
+
+namespace {
+
+uint64_t NcclDeviceCommCreationPriority(const NcclDeviceCommPlan& plan) {
+#if NCCL_VERSION_CODE >= 22907
+  switch (plan.requirements.ginConnectionType) {
+    case NCCL_GIN_CONNECTION_FULL:
+      return 0;
+    case NCCL_GIN_CONNECTION_RAIL:
+      return 1;
+    case NCCL_GIN_CONNECTION_NONE:
+      return 2;
+  }
+#endif
+  return 2;
+}
+
+class ResolvedNcclDeviceCommPlan final
+    : public GpuCommunicator::DeviceCommPlan {
+ public:
+  ResolvedNcclDeviceCommPlan(const NcclCommunicator* owner,
+                             GpuDeviceCommunicator::Requirements requirements,
+                             NcclDeviceCommPlan plan, uint64_t runtime_version,
+                             const NcclCapabilities& capabilities)
+      : DeviceCommPlan(owner, requirements, "nccl",
+                       NcclDeviceCommPlanAgreementPayload(plan, capabilities,
+                                                          runtime_version),
+                       NcclDeviceCommCreationPriority(plan)),
+        plan_(std::move(plan)),
+        runtime_version_(runtime_version) {}
+
+  const NcclDeviceCommPlan& plan() const { return plan_; }
+  uint64_t runtime_version() const { return runtime_version_; }
+
+ private:
+  NcclDeviceCommPlan plan_;
+  uint64_t runtime_version_;
+};
+
+class ResolvedNcclSymmetricMemoryPlan final
+    : public GpuCommunicator::SymmetricMemoryPlan {
+ public:
+  ResolvedNcclSymmetricMemoryPlan(const NcclCommunicator* owner,
+                                  se::DeviceAddressBase address,
+                                  uint64_t runtime_version)
+      : SymmetricMemoryPlan(owner, address, "nccl-window",
+                            NcclSymmetricMemoryPlanAgreementPayload(
+                                address.size(), runtime_version)),
+        runtime_version_(runtime_version) {}
+
+  uint64_t runtime_version() const { return runtime_version_; }
+
+ private:
+  uint64_t runtime_version_;
+};
+
+}  // namespace
+
 absl::StatusOr<GpuDeviceCommunicator::Info> BuildNcclDeviceCommInfo(
     const GpuDeviceCommunicator::Requirements& requirements,
     const NcclDeviceCommPlan& plan, const NcclCapabilities& capabilities,
@@ -601,13 +693,128 @@ bool NcclCommunicator::SupportsDeviceComm() const {
   return capabilities_.supports_device_comm;
 }
 
+absl::Status NcclCommunicator::RunCliqueBarrier(se::Stream* stream,
+                                                GpuCliqueBarrierToken token) {
+  if (token == GpuCliqueBarrierToken{}) {
+    return InvalidArgument("A clique barrier requires a nonzero token");
+  }
+  if (stream == nullptr) {
+    return InvalidArgument("A clique barrier requires a stream");
+  }
+  if (stream->parent() != stream_executor_) {
+    return InvalidArgument(
+        "Clique barrier stream belongs to a different StreamExecutor");
+  }
+  if (cancel_->IsCancelled()) {
+    return FailedPrecondition("NcclCommunicator aborted");
+  }
+
+  constexpr size_t kWordsPerToken = 2;
+  static_assert(sizeof(GpuCliqueBarrierToken) ==
+                kWordsPerToken * sizeof(uint64_t));
+
+  int rank = capabilities_.rank;
+  int team_size = capabilities_.team_size;
+  if (team_size <= 0 || rank < 0 || rank >= team_size) {
+    return FailedPrecondition(
+        "NCCL communicator has invalid barrier identity: rank %d of %d", rank,
+        team_size);
+  }
+
+  auto activation = stream_executor_->Activate();
+  absl::MutexLock scratch_lock(clique_barrier_mutex_);
+  size_t scratch_bytes =
+      static_cast<size_t>(team_size) * kWordsPerToken * sizeof(uint64_t);
+  if (clique_barrier_device_scratch_.address().is_null()) {
+    se::DeviceAddress<uint64_t> device_scratch =
+        stream_executor_->AllocateArray<uint64_t>(
+            static_cast<size_t>(team_size) * kWordsPerToken);
+    if (device_scratch.is_null()) {
+      return ResourceExhausted(
+          "Failed to allocate %d bytes of NCCL clique barrier scratch",
+          scratch_bytes);
+    }
+    se::DeviceAddressHandle device_handle(stream_executor_, device_scratch);
+    ASSIGN_OR_RETURN(std::unique_ptr<se::MemoryAllocation> host_scratch,
+                     stream_executor_->HostMemoryAllocate(scratch_bytes));
+    if (host_scratch->address().is_null() ||
+        host_scratch->address().size() < scratch_bytes) {
+      return Internal("Invalid NCCL clique barrier host scratch allocation");
+    }
+    clique_barrier_device_scratch_ = std::move(device_handle);
+    clique_barrier_host_scratch_ = std::move(host_scratch);
+  }
+
+  auto* host_tokens = static_cast<GpuCliqueBarrierToken*>(
+      clique_barrier_host_scratch_->address().opaque());
+  host_tokens[rank] = token;
+
+  se::DeviceAddress<uint64_t> device_scratch(
+      clique_barrier_device_scratch_.address());
+  se::DeviceAddress<uint64_t> rank_slot = device_scratch.GetSlice(
+      static_cast<size_t>(rank) * kWordsPerToken, kWordsPerToken);
+  RETURN_IF_ERROR(
+      stream->Memcpy(&rank_slot, &host_tokens[rank], sizeof(token)));
+
+  // Only provider interaction runs on NCCL's owner thread. BlockHostUntilDone
+  // stays on the caller so an Abort can run on the owner thread if a peer
+  // never enters this barrier round.
+  RETURN_IF_ERROR(
+      ExecuteAwait([this, stream, device_scratch, rank_slot]() -> absl::Status {
+        if (cancel_->IsCancelled()) {
+          return FailedPrecondition("NcclCommunicator aborted");
+        }
+        auto activation = stream_executor_->Activate();
+        absl::MutexLock lock(comm_->mutex);
+        ncclResult_t status = ncclAllGather(
+            rank_slot.opaque(), device_scratch.opaque(), kWordsPerToken,
+            ncclUint64, comm_->comm, AsCudaStream(stream));
+        RETURN_IF_ERROR(XLA_NCCL_STATUS(status));
+        if (status == ncclInProgress) {
+          RETURN_IF_ERROR(::xla::gpu::PollUntilDone(comm_->comm, *cancel_));
+        }
+        return absl::OkStatus();
+      }));
+
+  RETURN_IF_ERROR(stream->Memcpy(host_tokens, device_scratch, scratch_bytes));
+  RETURN_IF_ERROR(stream->BlockHostUntilDone());
+  if (cancel_->IsCancelled()) {
+    return FailedPrecondition("NcclCommunicator aborted");
+  }
+  return ValidateGpuCliqueBarrierTokens(
+      token, absl::Span<const GpuCliqueBarrierToken>(host_tokens, team_size));
+}
+
 absl::StatusOr<std::unique_ptr<GpuDeviceCommunicator>>
-NcclCommunicator::CreateDeviceComm(
-    const GpuDeviceCommunicator::Requirements& requirements) {
+NcclCommunicator::CreateDeviceComm(const DeviceCommPlan& plan) {
   return ExecuteAwait<std::unique_ptr<GpuDeviceCommunicator>>(
-      [this, requirements]()
-          -> absl::StatusOr<std::unique_ptr<GpuDeviceCommunicator>> {
-        VLOG(5) << "Creating device communicator with requirements: "
+      [this,
+       &plan]() -> absl::StatusOr<std::unique_ptr<GpuDeviceCommunicator>> {
+        VLOG(5) << "Creating device communicator from resolved plan: "
+                << plan.agreement_payload();
+        if (cancel_->IsCancelled()) {
+          return FailedPrecondition("NcclCommunicator aborted");
+        }
+        if (plan.owner() != this) {
+          return InvalidArgument(
+              "NCCL device communicator plan belongs to another communicator");
+        }
+        auto* nccl_plan =
+            dynamic_cast<const ResolvedNcclDeviceCommPlan*>(&plan);
+        if (nccl_plan == nullptr) {
+          return InvalidArgument("Expected a resolved NCCL device comm plan");
+        }
+        return NcclDeviceCommunicator::CreateFrom(*this, *nccl_plan);
+      });
+}
+
+absl::StatusOr<std::unique_ptr<GpuCommunicator::DeviceCommPlan>>
+NcclCommunicator::ResolveDeviceCommPlan(
+    const GpuDeviceCommunicator::Requirements& requirements) {
+  return ExecuteAwait<std::unique_ptr<DeviceCommPlan>>(
+      [this,
+       requirements]() -> absl::StatusOr<std::unique_ptr<DeviceCommPlan>> {
+        VLOG(5) << "Resolving device communicator requirements: "
                 << requirements;
         if (cancel_->IsCancelled()) {
           return FailedPrecondition("NcclCommunicator aborted");
@@ -617,7 +824,19 @@ NcclCommunicator::CreateDeviceComm(
               "NCCL communicator does not support the device API");
         }
 
-        return NcclDeviceCommunicator::CreateFrom(*this, requirements);
+        DCHECK(stream_executor_) << "StreamExecutor is unavailable";
+        auto activation = stream_executor_->Activate();
+        ASSIGN_OR_RETURN(NcclDeviceCommPlan plan,
+                         BuildNcclDeviceCommPlan(requirements, capabilities_));
+
+        int runtime_version = 0;
+        RETURN_IF_ERROR(XLA_NCCL_STATUS(ncclGetVersion(&runtime_version)));
+        RETURN_IF_ERROR(
+            ValidateNcclDeviceAbi(NCCL_VERSION_CODE, runtime_version));
+
+        return std::make_unique<ResolvedNcclDeviceCommPlan>(
+            this, requirements, std::move(plan), runtime_version,
+            capabilities_);
       });
 }
 
@@ -636,9 +855,19 @@ NcclCommunicator::CreateRegisteredMemory(se::DeviceAddressBase addr) {
 }
 
 absl::StatusOr<std::unique_ptr<SymmetricMemory>>
-NcclCommunicator::CreateSymmetricMemory(se::DeviceAddressBase addr) {
+NcclCommunicator::CreateSymmetricMemory(const SymmetricMemoryPlan& plan) {
   return ExecuteAwait<std::unique_ptr<SymmetricMemory>>(
-      [this, addr]() -> absl::StatusOr<std::unique_ptr<SymmetricMemory>> {
+      [this, &plan]() -> absl::StatusOr<std::unique_ptr<SymmetricMemory>> {
+        if (plan.owner() != this) {
+          return InvalidArgument(
+              "NCCL symmetric memory plan belongs to another communicator");
+        }
+        auto* nccl_plan =
+            dynamic_cast<const ResolvedNcclSymmetricMemoryPlan*>(&plan);
+        if (nccl_plan == nullptr) {
+          return InvalidArgument("Expected a resolved NCCL window plan");
+        }
+        se::DeviceAddressBase addr = plan.address();
         VLOG(5) << "Creating symmetric memory for device address: "
                 << addr.opaque();
         if (cancel_->IsCancelled()) {
@@ -646,7 +875,30 @@ NcclCommunicator::CreateSymmetricMemory(se::DeviceAddressBase addr) {
         }
 
         return NcclSymmetricMemory::Create(comm_, addr, executor_,
-                                           stream_executor_);
+                                           stream_executor_,
+                                           nccl_plan->runtime_version());
+      });
+}
+
+absl::StatusOr<std::unique_ptr<GpuCommunicator::SymmetricMemoryPlan>>
+NcclCommunicator::ResolveSymmetricMemoryPlan(se::DeviceAddressBase addr) {
+  return ExecuteAwait<std::unique_ptr<SymmetricMemoryPlan>>(
+      [this, addr]() -> absl::StatusOr<std::unique_ptr<SymmetricMemoryPlan>> {
+        if (cancel_->IsCancelled()) {
+          return FailedPrecondition("NcclCommunicator aborted");
+        }
+        if (addr.size() == 0 || addr.opaque() == nullptr) {
+          return InvalidArgument(
+              "NCCL symmetric memory requires a non-empty device address");
+        }
+        DCHECK(stream_executor_) << "StreamExecutor is unavailable";
+        auto activation = stream_executor_->Activate();
+        int runtime_version = 0;
+        RETURN_IF_ERROR(XLA_NCCL_STATUS(ncclGetVersion(&runtime_version)));
+        RETURN_IF_ERROR(
+            ValidateNcclWindowDeviceAbi(NCCL_VERSION_CODE, runtime_version));
+        return std::make_unique<ResolvedNcclSymmetricMemoryPlan>(
+            this, addr, runtime_version);
       });
 }
 
@@ -1486,28 +1738,28 @@ NcclDeviceCommunicator::~NcclDeviceCommunicator() {
 }
 
 absl::StatusOr<std::unique_ptr<NcclDeviceCommunicator>>
-NcclDeviceCommunicator::CreateFrom(const NcclCommunicator& comm,
-                                   const Requirements& requirements) {
+NcclDeviceCommunicator::CreateFrom(
+    const NcclCommunicator& comm, const GpuCommunicator::DeviceCommPlan& plan) {
+  auto* nccl_plan = dynamic_cast<const ResolvedNcclDeviceCommPlan*>(&plan);
+  if (nccl_plan == nullptr || plan.owner() != &comm) {
+    return InvalidArgument(
+        "Resolved NCCL device comm plan does not belong to communicator");
+  }
+  const Requirements& requirements = plan.requirements();
   VLOG(3) << absl::StreamFormat(
-      "Create NCCL device comm from %v with requirements %v", comm,
-      requirements);
+      "Create NCCL device comm from %v with resolved plan %s", comm,
+      plan.agreement_payload());
 
   DCHECK(comm.stream_executor()) << "StreamExecutor is unavailable";
   auto activation = comm.stream_executor()->Activate();
-
-  ASSIGN_OR_RETURN(NcclDeviceCommPlan plan,
-                   BuildNcclDeviceCommPlan(requirements, comm.capabilities_));
-
-  int runtime_version = 0;
-  RETURN_IF_ERROR(XLA_NCCL_STATUS(ncclGetVersion(&runtime_version)));
-  RETURN_IF_ERROR(ValidateNcclDeviceAbi(NCCL_VERSION_CODE, runtime_version));
+  const NcclDeviceCommPlan& provider_plan = nccl_plan->plan();
 
   std::shared_ptr<NcclCommState> comm_state = comm.comm_state();
   ncclDevComm dev_comm{};
   {
     absl::MutexLock lock(comm_state->mutex);
-    ncclResult_t status =
-        ncclDevCommCreate(comm_state->comm, &plan.requirements, &dev_comm);
+    ncclResult_t status = ncclDevCommCreate(
+        comm_state->comm, &provider_plan.requirements, &dev_comm);
     RETURN_IF_ERROR(XLA_NCCL_STATUS(status));
     if (status == ncclInProgress) {
       // The output object is not valid until the operation has completed.
@@ -1519,8 +1771,8 @@ NcclDeviceCommunicator::CreateFrom(const NcclCommunicator& comm,
     }
   }
 
-  absl::StatusOr<Info> info =
-      BuildNcclDeviceCommInfo(requirements, plan, comm.capabilities_, dev_comm);
+  absl::StatusOr<Info> info = BuildNcclDeviceCommInfo(
+      requirements, provider_plan, comm.capabilities_, dev_comm);
   if (!info.ok()) {
     absl::MutexLock lock(comm_state->mutex);
     ncclResult_t nccl_status = ncclDevCommDestroy(comm_state->comm, &dev_comm);
@@ -1537,8 +1789,8 @@ NcclDeviceCommunicator::CreateFrom(const NcclCommunicator& comm,
   }
 
   return absl::WrapUnique(new NcclDeviceCommunicator(
-      comm_state, comm.stream_executor(), comm.executor(), runtime_version,
-      dev_comm, std::move(*info)));
+      comm_state, comm.stream_executor(), comm.executor(),
+      nccl_plan->runtime_version(), dev_comm, std::move(*info)));
 }
 
 PlatformCommunicatorHandle NcclDeviceCommunicator::platform_comm() const {
