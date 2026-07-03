@@ -58,6 +58,25 @@ struct GpuExecutableRendezvousKey {
 
 }  // namespace
 
+GpuExecutableErrorCleanupDisposition GetGpuExecutableErrorCleanupDisposition(
+    GpuExecutableCompletionBarrierState barrier_state,
+    bool deferred_controller_available, bool tail_cleanup_enabled) {
+  switch (barrier_state) {
+    case GpuExecutableCompletionBarrierState::kSucceeded:
+      return GpuExecutableErrorCleanupDisposition::kSynchronous;
+    case GpuExecutableCompletionBarrierState::kFailed:
+    case GpuExecutableCompletionBarrierState::kRemote:
+      return deferred_controller_available
+                 ? GpuExecutableErrorCleanupDisposition::kQuarantine
+                 : GpuExecutableErrorCleanupDisposition::kFatal;
+    case GpuExecutableCompletionBarrierState::kNotRequired:
+      return deferred_controller_available && tail_cleanup_enabled
+                 ? GpuExecutableErrorCleanupDisposition::kDeferred
+                 : GpuExecutableErrorCleanupDisposition::kSynchronous;
+  }
+  return GpuExecutableErrorCleanupDisposition::kFatal;
+}
+
 absl::Status AggregateGpuExecutableCompletionStatuses(
     absl::Span<absl::Status* const> statuses) {
   absl::Status result = absl::OkStatus();

@@ -23,7 +23,6 @@ limitations under the License.
 #include "absl/status/status_matchers.h"
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
 #include "xla/backends/gpu/collectives/gpu_communicator.h"
-#include "xla/backends/gpu/runtime/collective_cliques.h"
 #include "xla/runtime/device_id.h"
 #include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/tsl/platform/test.h"
@@ -35,23 +34,6 @@ namespace {
 
 using ::testing::ElementsAre;
 using ::testing::UnorderedElementsAre;
-
-TEST(CollectiveCliqueRequestsTest,
-     AgreementPayloadIgnoresLocalParticipantCount) {
-  GlobalDeviceId d0(0);
-  GlobalDeviceId d1(1);
-  GpuCliqueKey one_local({d0, d1}, /*num_local_participants=*/1,
-                         CommunicationId(7));
-  GpuCliqueKey two_local({d0, d1}, /*num_local_participants=*/2,
-                         CommunicationId(7));
-  GpuCliqueKey another_channel({d0, d1}, /*num_local_participants=*/1,
-                               CommunicationId(8));
-
-  EXPECT_EQ(GpuCliqueKeyAgreementPayload(one_local),
-            GpuCliqueKeyAgreementPayload(two_local));
-  EXPECT_NE(GpuCliqueKeyAgreementPayload(one_local),
-            GpuCliqueKeyAgreementPayload(another_channel));
-}
 
 TEST(CollectiveCliqueRequestsTest, OrderedRequests) {
   GlobalDeviceId d0 = GlobalDeviceId(0);

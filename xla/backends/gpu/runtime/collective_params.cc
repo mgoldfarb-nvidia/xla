@@ -100,6 +100,10 @@ absl::StatusOr<CollectiveParams> CollectiveParams::Create(
                                  ? &gpu_options->clique_id_callback()
                                  : nullptr;
 
+  auto* clique_agreement = gpu_options && gpu_options->clique_agreement()
+                               ? gpu_options->clique_agreement().get()
+                               : nullptr;
+
   auto* incarnations = gpu_options && gpu_options->incarnations().has_value()
                            ? &*gpu_options->incarnations()
                            : nullptr;
@@ -112,8 +116,9 @@ absl::StatusOr<CollectiveParams> CollectiveParams::Create(
       run_options.run_options().run_id(), run_options.run_options().launch_id(),
       async_streams, local_device_id, global_device_id,
       run_options.run_options().device_assignment(), device_id_map,
-      clique_id_callback, incarnations, collective_max_nchannels,
-      p2p_max_nchannels, run_options.run_options().local_device_count(),
+      clique_id_callback, clique_agreement, incarnations,
+      collective_max_nchannels, p2p_max_nchannels,
+      run_options.run_options().local_device_count(),
       collective_use_minimal_resource);
 }
 
@@ -124,6 +129,7 @@ CollectiveParams::CollectiveParams(
     GlobalDeviceId global_device_id, const DeviceAssignment* device_assn,
     const GlobalDeviceIdMap* global_device_id_map,
     const CliqueIdCallback* clique_id_callback,
+    GpuCliqueAgreement* clique_agreement,
     const absl::flat_hash_map<GlobalDeviceId, IncarnationId>* incarnations,
     int64_t collective_max_nchannels, int64_t p2p_max_nchannels,
     int local_device_count, bool collective_use_minimal_resource)
@@ -138,6 +144,7 @@ CollectiveParams::CollectiveParams(
       device_assn(device_assn),
       global_device_id_map(global_device_id_map),
       clique_id_callback(clique_id_callback),
+      clique_agreement(clique_agreement),
       incarnations(incarnations),
       collective_max_nchannels(collective_max_nchannels),
       p2p_max_nchannels(p2p_max_nchannels),

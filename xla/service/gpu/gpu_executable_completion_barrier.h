@@ -34,9 +34,23 @@ class Stream;
 
 namespace xla::gpu {
 
-// Distinct process-local rendezvous phases for one executable run. The phase
-// and exact global participant set are part of the key so independent teams
-// cannot accidentally satisfy each other's rendezvous.
+enum class GpuExecutableCompletionBarrierState {
+  kNotRequired,
+  kSucceeded,
+  kFailed,
+  kRemote,
+};
+
+enum class GpuExecutableErrorCleanupDisposition {
+  kSynchronous,
+  kDeferred,
+  kQuarantine,
+  kFatal,
+};
+
+// Distinct rendezvous phases for a single executable run. The phase and exact
+// global participant set are both part of the rendezvous identity so disjoint
+// MPMD communication teams cannot accidentally satisfy each other's barrier.
 enum class GpuExecutableRendezvousPhase {
   kPrepare,
   kCollectiveResourceInitialization,
@@ -44,14 +58,25 @@ enum class GpuExecutableRendezvousPhase {
   kCompletion,
 };
 
-// Aggregates local rank statuses into the value returned to every local
-// participant. All ranks must observe a sibling failure before any of them can
-// release communication-enabled memory.
+// Selects the only safe error-cleanup strategy for the observed completion
+// state. A remote clique or failed local barrier cannot be proven quiescent
+// from one rank's stream tail and therefore requires quarantine (or fail-fast
+// when the execution API cannot retain owners).
+GpuExecutableErrorCleanupDisposition GetGpuExecutableErrorCleanupDisposition(
+    GpuExecutableCompletionBarrierState barrier_state,
+    bool deferred_controller_available, bool tail_cleanup_enabled);
+
+// Aggregates process-local stream completion statuses into the single result
+// broadcast by the completion rendezvous. Returning the same status to every
+// local rank is required before any rank releases memory that another local
+// device can access remotely.
 absl::Status AggregateGpuExecutableCompletionStatuses(
     absl::Span<absl::Status* const> statuses);
 
-// Joins a value-carrying process-local rendezvous. Participant devices are
-// canonicalized and included in the rendezvous key.
+// Joins a process-local, value-carrying rendezvous and broadcasts the aggregate
+// status to every participant. `participant_devices` is canonicalized before
+// it is included in the key; pass an empty span only for a whole-assignment
+// rendezvous whose RunId already uniquely identifies its participants.
 absl::Status RendezvousGpuExecutableStatuses(
     absl::string_view name, int64_t run_id, GpuExecutableRendezvousPhase phase,
     absl::Span<const GlobalDeviceId> participant_devices,

@@ -51,10 +51,12 @@ limitations under the License.
 #include "xla/backends/cpu/target_machine_options.h"
 #include "xla/backends/gpu/collectives/allocator_memory_registration.h"
 #include "xla/backends/gpu/collectives/gpu_clique.h"
+#include "xla/backends/gpu/collectives/gpu_clique_agreement.h"
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
 #include "xla/backends/gpu/collectives/gpu_cliques.h"
 #include "xla/backends/gpu/collectives/gpu_collectives.h"
 #include "xla/backends/gpu/collectives/gpu_communicator.h"
+#include "xla/backends/gpu/runtime/deferred_gpu_execution_completion.h"
 #include "xla/backends/gpu/target_config/target_config.h"
 #include "xla/client/local_client.h"
 #include "xla/core/collectives/clique_id.h"
@@ -257,7 +259,9 @@ StreamExecutorGpuClient::StreamExecutorGpuClient(
       num_nodes_(num_nodes),
       abort_collectives_on_failure_(abort_collectives_on_failure),
       memory_registration_(std::move(memory_registration)),
-      kv_store_(std::move(kv_store)) {
+      kv_store_(std::move(kv_store)),
+      deferred_execution_registry_(
+          std::make_unique<gpu::DeferredGpuExecutionRegistry>()) {
   VLOG(1) << absl::StreamFormat(
       "Constructed StreamExecutor GPU client: #devices=%d #num_nodes=%d",
       devices_.size(), num_nodes.value_or(1));
@@ -295,6 +299,23 @@ StreamExecutorGpuClient::StreamExecutorGpuClient(
                [](const PjRtMemorySpace* a, const PjRtMemorySpace* b) {
                  return a->id() < b->id();
                });
+}
+
+StreamExecutorGpuClient::~StreamExecutorGpuClient() {
+  // Deferred cleanups return borrowed streams, release raw-buffer references,
+  // and call the allocator owned by the base client. Drain their owner leases
+  // before base-class teardown destroys any of those dependencies.
+  if (deferred_execution_registry_ != nullptr) {
+    while (!deferred_execution_registry_->WaitForAll(absl::Minutes(1))) {
+      LOG(ERROR)
+          << "Waiting to destroy StreamExecutorGpuClient: "
+          << deferred_execution_registry_->outstanding()
+          << " deferred GPU execution(s) still retain client-owned "
+             "streams, buffers, or allocators. A quarantined "
+             "device-communication failure intentionally prevents unsafe "
+             "client teardown.";
+    }
+  }
 }
 
 absl::string_view StreamExecutorGpuClient::platform_version() const {
@@ -1740,6 +1761,9 @@ absl::StatusOr<DeviceTopologyPair> BuildDistributedDevices(
       absl::StrJoin(gpu_device_ids, ",", absl::PairFormatter("->")));
   gpu_executable_run_options->set_gpu_global_device_ids(
       std::move(gpu_device_ids));
+  gpu_executable_run_options->set_clique_agreement(
+      std::make_shared<gpu::GpuCliqueAgreement>(ProcessId(process_id),
+                                                device_to_process, kv_store));
 
   ASSIGN_OR_RETURN(xla::Collectives * collectives,
                    xla::CollectivesRegistry::Default("gpu"));
@@ -2012,7 +2036,7 @@ std::vector<std::unique_ptr<PjRtStreamExecutorDevice>> BuildLocalDevices(
 
 absl::StatusOr<PjRtStreamExecutorExecutionOutput>
 StreamExecutorGpuClient::RunAsync(
-    LocalExecutable& exec, PjRtDevice* device,
+    std::shared_ptr<LocalExecutable> exec, PjRtDevice* device,
     absl::Span<const PjRtRawBufferRef> flat_arguments,
     absl::Span<const PjRtRawBufferRef> results,
     ExecutableRunOptions run_options_inp, bool parameter_is_tupled_arguments,
@@ -2026,9 +2050,9 @@ StreamExecutorGpuClient::RunAsync(
   }
 
   ASSIGN_OR_RETURN(auto options_and_stream,
-                   exec.RunHelper(argument_shapes, run_options_inp));
+                   exec->RunHelper(argument_shapes, run_options_inp));
   auto* gpu_exec =
-      tensorflow::down_cast<xla::gpu::GpuExecutable*>(exec.executable());
+      tensorflow::down_cast<xla::gpu::GpuExecutable*>(exec->executable());
   const ServiceExecutableRunOptions* run_options = &options_and_stream.first;
   se::DeviceAddressAllocator* const memory_allocator = run_options->allocator();
 
@@ -2191,14 +2215,77 @@ StreamExecutorGpuClient::RunAsync(
     RETURN_IF_ERROR(set_result({}, 0));
   }
 
+  gpu::DeferredGpuExecution deferred_execution;
+  // VMM aliases require synchronous unmapping after collective-memory
+  // deregistration. Disable ordinary tail cleanup in that mode, but still pass
+  // the controller so a non-local device-communication failure can quarantine
+  // every dependent resource instead of releasing remotely accessible memory.
+  deferred_execution.set_completion_cleanup_enabled(
+      !allocation_scope.command_buffer_active());
+  gpu::DeferredGpuExecution* deferred_execution_ptr = &deferred_execution;
   absl::Status execute_status = allocation_scope.ExecuteWithBufferAllocations(
       buffer_allocations, device_ordinal,
       [&](const gpu::BufferAllocations& execution_buffers,
           std::optional<absl::Span<const BufferAllocation::Index>>
               persistent_alloc_indices) {
         return gpu_exec->ExecuteThunks(execution_buffers, run_options,
-                                       persistent_alloc_indices);
-      });
+                                       persistent_alloc_indices,
+                                       deferred_execution_ptr);
+      },
+      deferred_execution_ptr);
+
+  if (deferred_execution.active()) {
+    std::vector<se::DeviceAddressBase> teardown_addresses =
+        buffer_allocations.ExtractTearDownAddresses(buffers_in_result,
+                                                    gpu_exec->GetAllocations());
+    std::vector<PjRtRawBufferRef> retained_arguments(flat_arguments.begin(),
+                                                     flat_arguments.end());
+    std::vector<PjRtRawBufferRef> retained_results(results.begin(),
+                                                   results.end());
+    std::optional<gpu::DeferredGpuExecutionRegistry::Lease> client_lease(
+        deferred_execution_registry_->Acquire());
+    absl::Status cleanup_status = deferred_execution.AddCleanup(
+        [memory_allocator, device_ordinal,
+         teardown_addresses = std::move(teardown_addresses),
+         retained_arguments = std::move(retained_arguments),
+         retained_results = std::move(retained_results),
+         retained_executable = std::move(exec),
+         retained_main_stream = std::move(options_and_stream.second),
+         client_lease = std::move(client_lease)]() mutable {
+          absl::Status status = gpu::DeallocateBufferAddresses(
+              memory_allocator, device_ordinal, teardown_addresses);
+          if (!status.ok()) {
+            LOG(ERROR) << "Failed to deallocate raw-buffer execution "
+                          "buffers after deferred GPU completion: "
+                       << status;
+          }
+          teardown_addresses.clear();
+          retained_arguments.clear();
+          retained_results.clear();
+          retained_executable.reset();
+          // The tail callback and its worker synchronize this stream through
+          // the first cleanup above. Return it to the pool only afterwards.
+          retained_main_stream.reset();
+          // Release this last: it permits StreamExecutorGpuClient teardown.
+          client_lease.reset();
+        });
+    if (!cleanup_status.ok()) {
+      LOG(FATAL) << "Failed to attach owner cleanup to a deferred GPU "
+                    "execution: "
+                 << cleanup_status;
+    }
+    absl::Status arm_status = deferred_execution.Arm();
+    if (!arm_status.ok()) {
+      LOG(FATAL) << "Failed to arm a deferred GPU execution cleanup: "
+                 << arm_status;
+    }
+    if (execute_status.ok()) {
+      return Internal(
+          "Deferred GPU execution was active without an execution error");
+    }
+    return execute_status;
+  }
+
   absl::Status teardown_status = buffer_allocations.TearDown(
       buffers_in_result, gpu_exec->GetAllocations());
 

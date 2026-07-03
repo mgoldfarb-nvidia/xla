@@ -394,9 +394,9 @@ class Thunk {
     return absl::OkStatus();
   }
 
-  // Returns true when a Prepare failure can strand a peer that is about to
-  // enter device-communication resource acquisition. The minimal runtime uses
-  // this static property to fail fast before ranks can diverge.
+  // Returns true when this thunk can access memory through a device-side
+  // communication mechanism. The executable uses this before Prepare so a
+  // local Prepare failure cannot leave remote peers entering acquisition.
   virtual bool UsesDeviceCommunication() const { return false; }
 
   // Initializes thunk for execution.

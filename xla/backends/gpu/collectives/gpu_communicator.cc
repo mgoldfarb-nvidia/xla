@@ -15,13 +15,32 @@ limitations under the License.
 
 #include "xla/backends/gpu/collectives/gpu_communicator.h"
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <iterator>
+#include <vector>
 
 #include "absl/status/status.h"
 #include "absl/strings/str_format.h"
 #include "absl/types/span.h"
 
 namespace xla::gpu {
+namespace {
+
+thread_local std::vector<const void*> group_locked_comm_states;
+
+void QuarantineProviderHostStorage(std::shared_ptr<void> storage) {
+  // A failed communicator teardown gives us no provider lifetime boundary.
+  // Intentionally retain the storage until process exit (and leak the
+  // container itself so static destruction cannot race provider threads).
+  static auto* mutex = new absl::Mutex;
+  static auto* quarantine = new std::vector<std::shared_ptr<void>>;
+  absl::MutexLock lock(*mutex);
+  quarantine->push_back(std::move(storage));
+}
+
+}  // namespace
 
 absl::Status ValidateGpuCliqueBarrierTokens(
     GpuCliqueBarrierToken expected,
@@ -46,5 +65,73 @@ absl::Status ValidateGpuCliqueBarrierTokens(
   }
   return absl::OkStatus();
 }
+
+void GpuProviderHostStorage::RetainUntilProviderTeardown(
+    std::shared_ptr<void> storage) {
+  if (storage == nullptr) return;
+  absl::MutexLock lock(mutex_);
+  if (provider_teardown_complete_) return;
+  if (provider_teardown_failed_) {
+    QuarantineProviderHostStorage(std::move(storage));
+    return;
+  }
+  retained_.push_back(std::move(storage));
+}
+
+void GpuProviderHostStorage::RetainOnFailure(const absl::Status& status,
+                                             std::shared_ptr<void> storage) {
+  if (!status.ok()) {
+    RetainUntilProviderTeardown(std::move(storage));
+  }
+}
+
+void GpuProviderHostStorage::ProviderTeardownComplete() {
+  absl::MutexLock lock(mutex_);
+  if (provider_teardown_failed_) return;
+  provider_teardown_complete_ = true;
+  retained_.clear();
+}
+
+void GpuProviderHostStorage::ProviderTeardownFailed() {
+  std::vector<std::shared_ptr<void>> retained;
+  {
+    absl::MutexLock lock(mutex_);
+    if (provider_teardown_complete_ || provider_teardown_failed_) return;
+    provider_teardown_failed_ = true;
+    retained.swap(retained_);
+  }
+  for (auto& storage : retained) {
+    QuarantineProviderHostStorage(std::move(storage));
+  }
+}
+
+size_t GpuProviderHostStorage::retained_count_for_test() const {
+  absl::MutexLock lock(mutex_);
+  return retained_.size();
+}
+
+namespace internal {
+
+ScopedGpuCommGroupLockOwnership::ScopedGpuCommGroupLockOwnership(
+    const void* comm_state)
+    : comm_state_(comm_state) {
+  group_locked_comm_states.push_back(comm_state_);
+}
+
+ScopedGpuCommGroupLockOwnership::~ScopedGpuCommGroupLockOwnership() {
+  auto it = std::find(group_locked_comm_states.rbegin(),
+                      group_locked_comm_states.rend(), comm_state_);
+  if (it != group_locked_comm_states.rend()) {
+    group_locked_comm_states.erase(std::next(it).base());
+  }
+}
+
+bool IsGpuCommGroupLockOwnedByCurrentThread(const void* comm_state) {
+  return std::find(group_locked_comm_states.begin(),
+                   group_locked_comm_states.end(),
+                   comm_state) != group_locked_comm_states.end();
+}
+
+}  // namespace internal
 
 }  // namespace xla::gpu

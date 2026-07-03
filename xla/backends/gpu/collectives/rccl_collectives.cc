@@ -49,6 +49,7 @@ limitations under the License.
 #include "xla/backends/gpu/collectives/rccl_communicator.h"
 #include "xla/backends/gpu/collectives/rccl_errors.h"
 #include "xla/backends/gpu/collectives/rccl_group.h"
+#include "xla/backends/gpu/collectives/rccl_types.h"
 #include "xla/core/collectives/clique_id.h"
 #include "xla/core/collectives/clique_key.h"
 #include "xla/core/collectives/collectives.h"
@@ -135,10 +136,10 @@ class RcclIdStore {
 // RcclCollectives
 //===----------------------------------------------------------------------===//
 
-static ncclComm_t Cast(const Communicator* comm) {
+static std::shared_ptr<RcclCommState> Cast(const Communicator* comm) {
   auto* rccl_communicator = absl::down_cast<const RcclCommunicator*>(comm);
   CHECK(rccl_communicator != nullptr) << "Unsupported XLA communicator";
-  return rccl_communicator->comm();
+  return rccl_communicator->comm_state();
 }
 
 absl::StatusOr<CliqueId> RcclCollectives::CreateUniqueCliqueId() const {
@@ -151,6 +152,8 @@ absl::StatusOr<CliqueId> RcclCollectives::CreateUniqueCliqueId() const {
 absl::Status RcclCollectives::GroupLaunch(
     absl::Span<const GpuCommunicator* const> comms,
     absl::FunctionRef<absl::Status()> group) {
+  std::vector<std::shared_ptr<RcclCommState>> comm_states;
+  comm_states.reserve(comms.size());
   for (const GpuCommunicator* comm : comms) {
     auto* rccl_comm = absl::down_cast<const RcclCommunicator*>(comm);
     if (!rccl_comm->IsBlocking()) {
@@ -158,9 +161,12 @@ absl::Status RcclCollectives::GroupLaunch(
           "RCCL multi-communicator group launch requires blocking "
           "communicators");
     }
+    comm_states.push_back(rccl_comm->comm_state());
   }
 
-  ASSIGN_OR_RETURN(bool launched, RcclGroupLaunch(group));
+  ASSIGN_OR_RETURN(bool launched, internal::RunGpuCommGroupWithLock(
+                                      std::move(comm_states),
+                                      [&] { return RcclGroupLaunch(group); }));
   if (launched) {
     for (const GpuCommunicator* comm : comms) {
       auto* rccl_comm = absl::down_cast<const RcclCommunicator*>(comm);
@@ -261,8 +267,12 @@ RcclCollectives::CreateCommunicatorsWithCancel(
                                  ranks.size());
     for (size_t i = 0; i < ranks.size(); ++i) {
       pool.Schedule([&, i]() {
+        auto* device =
+            absl::down_cast<GpuCollectives::Device*>(ranks[i].device);
+        CHECK(device != nullptr);
         absl::StatusOr<std::unique_ptr<RcclCommunicator>> comm =
-            RcclCommunicator::Create(std::bind(make_comm, i), cancel,
+            RcclCommunicator::Create(device->stream_executor(),
+                                     std::bind(make_comm, i), cancel,
                                      gpu_config.async_execution);
         if (!comm.ok()) {
           absl::call_once(once, [&] { status = comm.status(); });
@@ -309,8 +319,19 @@ RcclCollectives::SplitCommunicatorsWithCancel(
     VLOG(1) << "Split NCCL communicator " << comms[i] << " with color " << color
             << " and key " << keys[i];
     ncclComm_t split_comm;
-    XLA_RCCL_RETURN_IF_ERROR(ncclCommSplit(
-        Cast(comms[i]), color, keys[i].value(), &split_comm, &comm_config));
+    std::shared_ptr<RcclCommState> parent = Cast(comms[i]);
+    if (parent->cancel->IsCancelled()) {
+      return FailedPrecondition("RcclCommunicator aborted");
+    }
+    {
+      absl::MutexLock lock(parent->mutex);
+      if (parent->cancel->IsCancelled() || parent->aborted ||
+          parent->destroyed) {
+        return FailedPrecondition("RcclCommunicator aborted");
+      }
+      XLA_RCCL_RETURN_IF_ERROR(ncclCommSplit(
+          parent->comm, color, keys[i].value(), &split_comm, &comm_config));
+    }
     return split_comm;
   };
 
@@ -322,8 +343,12 @@ RcclCollectives::SplitCommunicatorsWithCancel(
                                  comms.size());
     for (size_t i = 0; i < comms.size(); ++i) {
       pool.Schedule([&, i]() {
+        auto* device =
+            absl::down_cast<GpuCollectives::Device*>(ranks[i].device);
+        CHECK(device != nullptr);
         absl::StatusOr<std::unique_ptr<RcclCommunicator>> comm =
-            RcclCommunicator::Create(std::bind(make_comm, i), cancel,
+            RcclCommunicator::Create(device->stream_executor(),
+                                     std::bind(make_comm, i), cancel,
                                      gpu_config.async_execution);
         if (!comm.ok()) {
           absl::call_once(once, [&] { status = comm.status(); });
@@ -336,7 +361,6 @@ RcclCollectives::SplitCommunicatorsWithCancel(
   RETURN_IF_ERROR(status);
   return split_comms;
 }
-
 
 absl::StatusOr<void*> RcclCollectives::Allocate(uint64_t bytes) {
   void* ptr = nullptr;
@@ -368,7 +392,6 @@ absl::Status RcclCollectives::Deallocate(void* location) {
 
 absl::StatusOr<CliqueIdCallback> RcclCollectives::InitializeTopology(
     const Topology& topology) {
-
   if (topology.num_processes > 1) {
     auto rccl_id_store = std::make_shared<RcclIdStore>(
         topology.process_id, topology.device_to_process,

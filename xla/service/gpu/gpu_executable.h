@@ -72,6 +72,8 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 
+class DeferredGpuExecution;
+
 // GPU-targeting implementation of the XLA Executable interface.
 //
 // Launches the given GPU kernel via the StreamExecutor.
@@ -218,7 +220,8 @@ class GpuExecutable : public Executable {
       const BufferAllocations& buffer_allocations,
       const ServiceExecutableRunOptions* run_options,
       std::optional<absl::Span<const BufferAllocation::Index>>
-          persistent_alloc_indices = std::nullopt);
+          persistent_alloc_indices = std::nullopt,
+      DeferredGpuExecution* deferred_execution = nullptr);
 
   using BufferAllocToDeviceMemoryMap =
       GpuModuleGlobals::BufferAllocToDeviceMemoryMap;
@@ -307,7 +310,8 @@ class GpuExecutable : public Executable {
           persistent_alloc_indices,
       NumAdditionalStreams num_additional_streams,
       CollectiveMemoryCache& collective_memory_cache,
-      bool collective_use_minimal_resource);
+      bool collective_use_minimal_resource,
+      DeferredGpuExecution* deferred_execution);
 
   // Compare current allocation's address with previous run's address, and
   // report the allocation info if memory addressed changed. Useful for identify

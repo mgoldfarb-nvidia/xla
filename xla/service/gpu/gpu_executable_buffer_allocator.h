@@ -52,6 +52,7 @@ class DeviceAddressVmmAllocator;
 namespace xla {
 namespace gpu {
 
+class DeferredGpuExecution;
 class ThunkExecutor;
 
 // Owns executable-scoped buffer allocation state for one GpuExecutable.
@@ -140,7 +141,8 @@ class GpuExecutableBufferAllocator {
             const BufferAllocations&,
             std::optional<absl::Span<const BufferAllocation::Index>>
                 persistent_alloc_indices)>
-            execute);
+            execute,
+        DeferredGpuExecution* deferred_execution = nullptr);
 
    private:
     friend class GpuExecutableBufferAllocator;
@@ -221,6 +223,7 @@ class GpuExecutableBufferAllocator {
 
   struct Remapping {
     absl::Mutex mutex;
+    bool poisoned ABSL_GUARDED_BY(mutex) = false;
     uint64_t granularity = 0;
     uint64_t total_size = 0;
     absl::flat_hash_map<BufferAllocation::Index, uint64_t>

@@ -34,7 +34,7 @@ namespace xla::gpu {
 
 // Caches persistent collective memories (symmetric, multicast) across
 // executable invocations. On the first invocation, collective memory windows
-// registered with the communication library (a collective operation). On
+// are registered with the communication library (a collective operation). On
 // subsequent invocations, the cached windows are reused to avoid redundant
 // registration calls and to keep signal counters consistent. Execution-scoped
 // symmetric windows deliberately bypass this cache because their registrations

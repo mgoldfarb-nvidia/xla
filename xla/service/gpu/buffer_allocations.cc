@@ -18,6 +18,8 @@ limitations under the License.
 #include <cstdint>
 #include <optional>
 #include <set>
+#include <utility>
+#include <vector>
 
 #include "absl/log/check.h"
 #include "absl/status/status.h"
@@ -27,6 +29,21 @@ limitations under the License.
 
 namespace xla {
 namespace gpu {
+
+absl::Status DeallocateBufferAddresses(
+    se::DeviceAddressAllocator* memory_allocator, int device_ordinal,
+    absl::Span<const se::DeviceAddressBase> addresses) {
+  absl::Status status;
+  for (se::DeviceAddressBase address : addresses) {
+    if (address.is_null()) continue;
+    absl::Status deallocate_status =
+        memory_allocator->Deallocate(device_ordinal, address);
+    if (!deallocate_status.ok() && status.ok()) {
+      status = std::move(deallocate_status);
+    }
+  }
+  return status;
+}
 
 absl::Status BufferAllocations::TearDown(
     const std::set<se::DeviceAddressBase>& live_addresses,
@@ -51,6 +68,25 @@ absl::Status BufferAllocations::TearDown(
     }
   }
   return status;
+}
+
+std::vector<se::DeviceAddressBase> BufferAllocations::ExtractTearDownAddresses(
+    const std::set<se::DeviceAddressBase>& live_addresses,
+    absl::Span<const BufferAllocation* const> allocations) {
+  std::set<se::DeviceAddressBase> unique;
+  const int64_t num_buffers = allocations.size();
+  for (BufferAllocation::Index i = 0; i < num_buffers; ++i) {
+    const BufferAllocation& allocation = *allocations[i];
+    se::DeviceAddressBase& buffer_address = buffers_[allocation.index()];
+    if (((allocation.maybe_live_out() &&
+          !live_addresses.count(buffer_address)) ||
+         allocation.IsPreallocatedTempBuffer()) &&
+        !buffer_address.is_null()) {
+      unique.insert(buffer_address);
+      buffer_address = se::DeviceAddressBase();
+    }
+  }
+  return {unique.begin(), unique.end()};
 }
 
 se::DeviceAddressBase BufferAllocations::GetDeviceAddress(

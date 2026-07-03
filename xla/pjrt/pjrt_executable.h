@@ -243,7 +243,10 @@ struct ExecuteOptions {
   // If non-zero, identifies this execution as part of a potentially
   // multi-device launch. This can be used to detect scheduling errors, e.g. if
   // multi-host programs are launched in different orders on different hosts,
-  // the launch IDs may be used by the runtime to detect the mismatch.
+  // the launch IDs may be used by the runtime to detect the mismatch. Callers
+  // must use the same id on every participant and a distinct id for every
+  // concurrently in-flight distributed launch; reusing an id concurrently
+  // makes two different launches intentionally indistinguishable.
   int32_t launch_id = 0;
   // If non-null, an opaque context passed to an execution that may be used to
   // supply additional arguments to a derived class of PjRtExecutable. It is

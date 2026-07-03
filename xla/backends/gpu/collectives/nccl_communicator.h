@@ -362,14 +362,11 @@ class NcclCommunicator : public GpuCommunicator {
   // A clique barrier reuses one bounded pair of host/device buffers. This
   // mutex serializes complete enqueue, device execution, and host validation
   // so concurrent callers cannot overwrite the scratch.
-  absl::Mutex clique_barrier_mutex_;
-  se::DeviceAddressHandle clique_barrier_device_scratch_
-      ABSL_GUARDED_BY(clique_barrier_mutex_);
-  std::unique_ptr<se::MemoryAllocation> clique_barrier_host_scratch_
-      ABSL_GUARDED_BY(clique_barrier_mutex_);
-
-  // Has comm_ been aborted?
-  bool aborted_ = false;
+  absl::Mutex completion_barrier_mutex_;
+  se::DeviceAddressHandle completion_barrier_device_scratch_
+      ABSL_GUARDED_BY(completion_barrier_mutex_);
+  std::unique_ptr<se::MemoryAllocation> completion_barrier_host_scratch_
+      ABSL_GUARDED_BY(completion_barrier_mutex_);
 
   NcclCapabilities capabilities_;
 };

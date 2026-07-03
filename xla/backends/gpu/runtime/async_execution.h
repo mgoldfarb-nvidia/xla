@@ -100,8 +100,8 @@ class AsyncExecution {
 
   // Initializes async execution state on the given executor. Borrows an event
   // from the pool (creating one if needed) and stores it in the execution
-  // scoped state. When the state is destroyed, the event is returned to the
-  // pool.
+  // scoped state together with shared ownership of the pool. When the state is
+  // destroyed, the event is returned before its pool can be destroyed.
   absl::Status Initialize(Thunk::ExecutionScopedState* state,
                           se::StreamExecutor* executor);
 
@@ -125,13 +125,13 @@ class AsyncExecution {
 
  private:
   // Returns or creates an event pool for the given executor.
-  EventPool& GetOrCreatePool(se::StreamExecutor* executor);
+  std::shared_ptr<EventPool> GetOrCreatePool(se::StreamExecutor* executor);
 
   const Thunk::ThunkInfo start_thunk_info_;
 
   absl::Mutex mu_;
-  absl::node_hash_map<se::StreamExecutor*, EventPool> event_pools_
-      ABSL_GUARDED_BY(mu_);
+  absl::node_hash_map<se::StreamExecutor*, std::shared_ptr<EventPool>>
+      event_pools_ ABSL_GUARDED_BY(mu_);
 };
 
 // Map from AsyncExecutionId to shared AsyncExecution, used during

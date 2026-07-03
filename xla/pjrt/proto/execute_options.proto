@@ -13,6 +13,8 @@ enum ExecutionModeProto {
 message ExecuteOptionsProto {
   bool arguments_are_tupled = 1;
   bool untuple_result = 2;
+  // Must be globally identical across participants and unique among
+  // concurrently in-flight distributed launches when non-zero.
   int32 launch_id = 3;
   bool strict_shape_checking = 4;
   bool use_major_to_minor_data_layout_for_callbacks = 8;

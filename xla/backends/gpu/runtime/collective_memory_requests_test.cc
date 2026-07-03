@@ -61,9 +61,11 @@ TEST(CollectiveMemoryRequestsTest, OrderedSymmetricRequests) {
 
 TEST(CollectiveMemoryRequestsTest, TracksExecutionScopePerAllocation) {
   GpuCliqueKey clique({kD0, kD1}, 2);
-  std::array<char, 10> data;
-  se::DeviceAddressBase buffer(data.data(), data.size());
-  BufferAllocations buffers({buffer}, /*device_ordinal=*/0, nullptr);
+  std::array<char, 10> data0;
+  std::array<char, 10> data1;
+  se::DeviceAddressBase buffer0(data0.data(), data0.size());
+  se::DeviceAddressBase buffer1(data1.data(), data1.size());
+  BufferAllocations buffers({buffer0, buffer1}, /*device_ordinal=*/0, nullptr);
   CollectiveMemoryRequests requests(buffers);
 
   TF_ASSERT_OK(requests.RequestSymmetricAllocation(clique, 0));

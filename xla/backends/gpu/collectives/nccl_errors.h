@@ -57,6 +57,8 @@ limitations under the License.
 
 namespace xla::gpu {
 
+struct NcclCommState;
+
 // Polls the provided communicator until it is "done" or cancelled.
 //
 // NCCL communicators can be blocking or non-blocking. Operations performed on
@@ -71,6 +73,13 @@ namespace xla::gpu {
 // documentation and exercise caution when reasoning about whether an operation
 // is really "done".
 absl::Status PollUntilDone(ncclComm_t comm, const CancellationToken& cancel);
+
+// Cancellation-aware polling for operations that may retain host output
+// pointers. It never holds the communicator mutex while observing
+// cancellation, allowing Abort to make progress once the owner-thread call
+// returns.
+absl::Status PollUntilDone(NcclCommState& comm_state,
+                           const CancellationToken& cancel);
 
 }  // namespace xla::gpu
 

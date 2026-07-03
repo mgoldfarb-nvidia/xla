@@ -1996,7 +1996,9 @@ struct PJRT_ExecuteOptions {
   // If non-zero, identifies this execution as part of a potentially
   // multi-device launch. This can be used to detect scheduling errors, e.g. if
   // multi-host programs are launched in different orders on different hosts,
-  // the launch IDs may be used by the runtime to detect the mismatch.
+  // the launch IDs may be used by the runtime to detect the mismatch. It must
+  // be identical on all participants and unique among concurrently in-flight
+  // distributed launches.
   int launch_id;
   // A list of indices denoting the input buffers that should not be donated.
   // An input buffer may be non-donable, for example, if it is referenced more

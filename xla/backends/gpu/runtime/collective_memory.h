@@ -20,6 +20,7 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <utility>
+#include <vector>
 
 #include "absl/container/btree_map.h"
 #include "absl/container/flat_hash_map.h"
@@ -116,7 +117,14 @@ class CollectiveMemory {
       const GpuCliqueKey& clique, RankId rank, se::DeviceAddress<T> addr) const;
 
  private:
-  const BufferAllocations& buffers_;
+  std::optional<BufferAllocation::Index> FindAllocationIndex(
+      se::DeviceAddressBase addr) const;
+  se::DeviceAddressBase GetDeviceAddress(
+      BufferAllocation::Index allocation) const;
+
+  // Keep an immutable address table instead of a reference to the invocation's
+  // BufferAllocations so this object can be retained by deferred completion.
+  std::vector<se::DeviceAddressBase> buffers_;
   absl::flat_hash_map<Key, std::shared_ptr<SymmetricMemory>> sym_memories_;
   absl::flat_hash_map<Key, MulticastMemory> mcast_memories_;
   absl::flat_hash_map<Key, PeerMemory> peer_memories_;

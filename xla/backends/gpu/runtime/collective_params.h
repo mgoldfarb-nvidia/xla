@@ -34,6 +34,8 @@ limitations under the License.
 
 namespace xla::gpu {
 
+class GpuCliqueAgreement;
+
 // Parameters capturing all the details required for collective execution of
 // XLA executables (multiple partitions and replicas).
 struct CollectiveParams {
@@ -74,6 +76,7 @@ struct CollectiveParams {
   const DeviceAssignment* device_assn;
   const GlobalDeviceIdMap* global_device_id_map;
   const CliqueIdCallback* clique_id_callback;
+  GpuCliqueAgreement* clique_agreement;
   const absl::flat_hash_map<GlobalDeviceId, IncarnationId>* incarnations;
 
   int64_t collective_max_nchannels;
@@ -92,6 +95,7 @@ struct CollectiveParams {
       const DeviceAssignment* device_assn,
       const GlobalDeviceIdMap* global_device_id_map,
       const CliqueIdCallback* clique_id_callback,
+      GpuCliqueAgreement* clique_agreement,
       const absl::flat_hash_map<GlobalDeviceId, IncarnationId>* incarnations,
       int64_t collective_max_nchannels, int64_t p2p_max_nchannels,
       int local_device_count, bool collective_use_minimal_resource);

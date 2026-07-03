@@ -28,16 +28,21 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "rocm/include/rccl/rccl.h"
 #include "rocm/rocm_config.h"  // IWYU pragma: keep
 #include "xla/backends/gpu/collectives/cancellation_token.h"
 #include "xla/backends/gpu/collectives/gpu_communicator.h"
+#include "xla/backends/gpu/collectives/rccl_types.h"
 #include "xla/core/collectives/communicator.h"
 #include "xla/core/collectives/rank_id.h"
 #include "xla/core/collectives/reduction_kind.h"
 #include "xla/future.h"
 #include "xla/stream_executor/device_address.h"
+#include "xla/stream_executor/device_address_handle.h"
+#include "xla/stream_executor/memory_allocation.h"
+#include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/concurrency/executor.h"
 #include "xla/tsl/platform/env.h"
 #include "xla/xla_data.pb.h"
@@ -47,6 +52,8 @@ namespace xla::gpu {
 // XLA collectives communicator wrapping an RCCL communicator.
 class RcclCommunicator : public GpuCommunicator {
  public:
+  using GpuCommunicator::CreateSymmetricMemory;
+
   // Creates a RCCL communicator.
   //
   // make_comm should construct and return a new ncclComm_t. For example, it
@@ -57,6 +64,7 @@ class RcclCommunicator : public GpuCommunicator {
   // asynchronously on a separate thread. Otherwise, they are performed
   // synchronously on the calling thread.
   static absl::StatusOr<std::unique_ptr<RcclCommunicator>> Create(
+      se::StreamExecutor* stream_executor,
       absl::AnyInvocable<absl::StatusOr<ncclComm_t>()> make_comm,
       std::shared_ptr<CancellationToken> cancel, bool is_async = false,
       tsl::Env& env = *tsl::Env::Default());
@@ -72,6 +80,11 @@ class RcclCommunicator : public GpuCommunicator {
   absl::Status Abort() final;
   absl::Status HealthCheck() const final;
   absl::StatusOr<size_t> NumRanks() const final;
+
+  bool SupportsCliqueBarrier() const final { return true; }
+
+  absl::Status RunCliqueBarrier(se::Stream* stream,
+                                GpuCliqueBarrierToken token) final;
 
   Future<> GroupExecute(absl::AnyInvocable<absl::Status() &&> group) final;
 
@@ -111,12 +124,20 @@ class RcclCommunicator : public GpuCommunicator {
   Future<> Recv(se::DeviceAddressBase recv_buffer, PrimitiveType dtype,
                 size_t count, RankId peer, const Executor& executor) final;
 
+  absl::StatusOr<std::unique_ptr<SymmetricMemoryPlan>>
+  ResolveSymmetricMemoryPlan(se::DeviceAddressBase addr) final;
+
+  absl::StatusOr<std::unique_ptr<SymmetricMemory>> CreateSymmetricMemory(
+      const SymmetricMemoryPlan& plan) final;
+
   absl::StatusOr<std::unique_ptr<SymmetricMemory>> CreateSymmetricMemory(
       se::DeviceAddressBase addr) final;
 
   std::string ToString() const final;
 
-  ncclComm_t comm() const { return comm_; }
+  std::shared_ptr<RcclCommState> comm_state() const { return comm_; }
+
+  se::StreamExecutor* stream_executor() const final { return stream_executor_; }
 
   bool IsBlocking() const { return executor_ == nullptr; }
 
@@ -127,9 +148,12 @@ class RcclCommunicator : public GpuCommunicator {
  private:
   class RcclRegisteredBufferHandle;
 
-  RcclCommunicator(ncclComm_t comm, std::unique_ptr<tsl::Executor> executor,
+  RcclCommunicator(se::StreamExecutor* stream_executor,
+                   std::shared_ptr<RcclCommState> comm,
+                   std::shared_ptr<tsl::Executor> executor,
                    std::shared_ptr<CancellationToken> cancel)
-      : comm_(comm),
+      : stream_executor_(stream_executor),
+        comm_(std::move(comm)),
         executor_(std::move(executor)),
         cancel_(std::move(cancel)) {
     VLOG(1) << "Created RCCL communicator" << *this;
@@ -196,8 +220,10 @@ class RcclCommunicator : public GpuCommunicator {
     return Execute<T>(std::move(f)).Await();
   }
 
+  se::StreamExecutor* stream_executor_;
+
   // Underlying RCCL communicator.
-  ncclComm_t comm_;
+  std::shared_ptr<RcclCommState> comm_;
 
   // If not null, used to execute methods.
   //
@@ -214,13 +240,19 @@ class RcclCommunicator : public GpuCommunicator {
   // ncclComm_t is accessed from multiple threads. Empirically, the lack of
   // thread safety only manifests as buggy behavior when using non-blocking
   // communicators.
-  std::unique_ptr<tsl::Executor> executor_;
+  std::shared_ptr<tsl::Executor> executor_;
 
   // Should all pending collectives cancel?
   std::shared_ptr<CancellationToken> cancel_;
 
-  // Has comm_ been aborted?
-  bool aborted_ = false;
+  absl::Mutex completion_barrier_mutex_;
+  se::DeviceAddressHandle completion_barrier_device_scratch_
+      ABSL_GUARDED_BY(completion_barrier_mutex_);
+  std::unique_ptr<se::MemoryAllocation> completion_barrier_host_scratch_
+      ABSL_GUARDED_BY(completion_barrier_mutex_);
+  int completion_barrier_rank_ ABSL_GUARDED_BY(completion_barrier_mutex_) = -1;
+  int completion_barrier_team_size_ ABSL_GUARDED_BY(completion_barrier_mutex_) =
+      0;
 };
 
 }  // namespace xla::gpu

@@ -16,13 +16,16 @@ limitations under the License.
 #ifndef XLA_BACKENDS_GPU_COLLECTIVES_GPU_COMMUNICATOR_H_
 #define XLA_BACKENDS_GPU_COLLECTIVES_GPU_COMMUNICATOR_H_
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 #include "absl/container/inlined_vector.h"
 #include "absl/functional/any_invocable.h"
@@ -30,6 +33,7 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "xla/core/collectives/communicator.h"
 #include "xla/core/collectives/rank_id.h"
@@ -83,10 +87,114 @@ struct GpuCliqueBarrierToken {
 };
 
 // Validates the result of a provider all-gather for a clique barrier. Exposed
-// for provider-independent tests.
+// for provider-independent tests and shared by NCCL and RCCL implementations.
 absl::Status ValidateGpuCliqueBarrierTokens(
     GpuCliqueBarrierToken expected,
     absl::Span<const GpuCliqueBarrierToken> gathered);
+
+// Retains host objects whose addresses may still be referenced by an
+// asynchronous provider operation after a failed completion poll. Abort or
+// communicator destruction must call ProviderTeardownComplete only after the
+// provider guarantees that it will not access those addresses again.
+class GpuProviderHostStorage {
+ public:
+  void RetainUntilProviderTeardown(std::shared_ptr<void> storage);
+  void RetainOnFailure(const absl::Status& status,
+                       std::shared_ptr<void> storage);
+  void ProviderTeardownComplete();
+  void ProviderTeardownFailed();
+
+  size_t retained_count_for_test() const;
+
+ private:
+  mutable absl::Mutex mutex_;
+  bool provider_teardown_complete_ ABSL_GUARDED_BY(mutex_) = false;
+  bool provider_teardown_failed_ ABSL_GUARDED_BY(mutex_) = false;
+  std::vector<std::shared_ptr<void>> retained_ ABSL_GUARDED_BY(mutex_);
+};
+
+namespace internal {
+
+// Records that the current thread owns a communicator mutex for the duration
+// of a provider group. Nested launch helpers use this marker to avoid trying to
+// reacquire the non-recursive mutex. The caller is responsible for holding the
+// corresponding mutex for the marker's full lifetime.
+class ScopedGpuCommGroupLockOwnership {
+ public:
+  explicit ScopedGpuCommGroupLockOwnership(const void* comm_state);
+  ~ScopedGpuCommGroupLockOwnership();
+
+  ScopedGpuCommGroupLockOwnership(const ScopedGpuCommGroupLockOwnership&) =
+      delete;
+  ScopedGpuCommGroupLockOwnership& operator=(
+      const ScopedGpuCommGroupLockOwnership&) = delete;
+
+ private:
+  const void* comm_state_;
+};
+
+bool IsGpuCommGroupLockOwnedByCurrentThread(const void* comm_state);
+
+// Locks all communicator states in deterministic address order, marks them as
+// owned by the current provider group, and invokes `launch`. The markers let
+// nested per-operation launch helpers reuse the already-held mutexes. Locks
+// are released before this function returns, so callers can safely poll after
+// it completes.
+template <typename CommState, typename Launch>
+absl::StatusOr<bool> RunGpuCommGroupWithLock(
+    std::vector<std::shared_ptr<CommState>> comm_states,
+    Launch&& launch) ABSL_NO_THREAD_SAFETY_ANALYSIS {
+  std::sort(comm_states.begin(), comm_states.end(),
+            [](const auto& lhs, const auto& rhs) {
+              return std::less<const CommState*>{}(lhs.get(), rhs.get());
+            });
+  comm_states.erase(std::unique(comm_states.begin(), comm_states.end(),
+                                [](const auto& lhs, const auto& rhs) {
+                                  return lhs.get() == rhs.get();
+                                }),
+                    comm_states.end());
+
+  bool any_owned = false;
+  bool all_owned = true;
+  for (const auto& state : comm_states) {
+    if (state->cancel->IsCancelled()) {
+      return absl::FailedPreconditionError("GPU communicator aborted");
+    }
+    bool owned = IsGpuCommGroupLockOwnedByCurrentThread(state.get());
+    any_owned |= owned;
+    all_owned &= owned;
+  }
+
+  if (any_owned) {
+    if (!all_owned) {
+      return absl::FailedPreconditionError(
+          "A nested provider group cannot add an unlocked communicator");
+    }
+    return std::forward<Launch>(launch)();
+  }
+
+  std::vector<std::unique_ptr<absl::MutexLock>> locks;
+  locks.reserve(comm_states.size());
+  for (const auto& state : comm_states) {
+    if (state->cancel->IsCancelled()) {
+      return absl::FailedPreconditionError("GPU communicator aborted");
+    }
+    locks.push_back(std::make_unique<absl::MutexLock>(state->mutex));
+    if (state->cancel->IsCancelled() || state->aborted || state->destroyed) {
+      return absl::FailedPreconditionError("GPU communicator aborted");
+    }
+  }
+
+  std::vector<std::unique_ptr<ScopedGpuCommGroupLockOwnership>> ownership;
+  ownership.reserve(comm_states.size());
+  for (const auto& state : comm_states) {
+    ownership.push_back(
+        std::make_unique<ScopedGpuCommGroupLockOwnership>(state.get()));
+  }
+  return std::forward<Launch>(launch)();
+}
+
+}  // namespace internal
 
 // A device communicator that corresponds to the host side GPU communicator
 // object (it has same rank in the collective clique and shares underlying
@@ -352,9 +460,8 @@ class GpuCommunicator : public Communicator {
     return Unimplemented("Device communicator is not implemented");
   }
 
-  // Legacy convenience wrapper. Runtime collective acquisition uses the
-  // explicit resolve/agree/create sequence above; providers that only
-  // implement this overload continue to work.
+  // Convenience wrapper for direct callers. Runtime collective acquisition
+  // uses the explicit resolve/agree/create sequence above.
   virtual absl::StatusOr<std::unique_ptr<GpuDeviceCommunicator>>
   CreateDeviceComm(const GpuDeviceCommunicator::Requirements& requirements) {
     auto plan = ResolveDeviceCommPlan(requirements);
@@ -386,8 +493,7 @@ class GpuCommunicator : public Communicator {
     return Unimplemented("Symmetric memory is not implemented");
   }
 
-  // Legacy convenience wrapper. Providers that only implement this overload
-  // continue to work.
+  // Convenience wrapper for direct callers.
   virtual absl::StatusOr<std::unique_ptr<SymmetricMemory>>
   CreateSymmetricMemory(se::DeviceAddressBase addr) {
     auto plan = ResolveSymmetricMemoryPlan(addr);

@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/service/gpu/gpu_executable_run_options.h"
 
+#include <memory>
 #include <optional>
 #include <utility>
 
@@ -44,6 +45,17 @@ GpuExecutableRunOptions& GpuExecutableRunOptions::set_clique_id_callback(
 
 const CliqueIdCallback& GpuExecutableRunOptions::clique_id_callback() const {
   return clique_id_callback_;
+}
+
+GpuExecutableRunOptions& GpuExecutableRunOptions::set_clique_agreement(
+    std::shared_ptr<GpuCliqueAgreement> agreement) {
+  clique_agreement_ = std::move(agreement);
+  return *this;
+}
+
+const std::shared_ptr<GpuCliqueAgreement>&
+GpuExecutableRunOptions::clique_agreement() const {
+  return clique_agreement_;
 }
 
 GpuExecutableRunOptions& GpuExecutableRunOptions::set_collectives(

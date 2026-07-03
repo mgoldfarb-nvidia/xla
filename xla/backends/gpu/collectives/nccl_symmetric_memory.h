@@ -52,9 +52,6 @@ class NcclSymmetricMemory final : public SymmetricMemory {
       std::shared_ptr<tsl::Executor> executor,
       stream_executor::StreamExecutor* stream_executor);
 
-  // Creates a window using a provider ABI version validated while resolving a
-  // symmetric-memory plan. This avoids re-resolving provider state after
-  // cross-rank agreement.
   static absl::StatusOr<std::unique_ptr<NcclSymmetricMemory>> Create(
       std::shared_ptr<NcclCommState> comm_state,
       stream_executor::DeviceAddressBase addr,

@@ -17,12 +17,13 @@ limitations under the License.
 #define XLA_BACKENDS_GPU_RUNTIME_COLLECTIVE_CLIQUES_H_
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/string_view.h"
+#include "xla/backends/gpu/collectives/gpu_clique.h"
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
 #include "xla/backends/gpu/collectives/gpu_cliques.h"
 #include "xla/backends/gpu/collectives/gpu_communicator.h"
@@ -34,10 +35,6 @@ limitations under the License.
 #include "xla/util.h"
 
 namespace xla::gpu {
-
-// Returns a canonical clique identity for cross-process agreement. Process-
-// local properties such as the number of locally hosted ranks are excluded.
-std::string GpuCliqueKeyAgreementPayload(const GpuCliqueKey& clique_key);
 
 // A collection of collective cliques acquired based on GPU clique requests
 // collected from all thunks at prepare stage.
@@ -65,15 +62,38 @@ class CollectiveCliques {
   absl::StatusOr<bool> peer_access_enabled(
       const GpuCliqueKey& clique_key) const;
 
-  // Establishes a provider-native agreement across every non-local clique
-  // that requested module-completion ordering. `phase` separates Initialize
-  // and completion rounds; `local_status` is included in the token so ranks
-  // cannot silently disagree about whether it is safe to proceed.
-  absl::Status RunRemoteBarriers(const CollectiveParams& params,
-                                 const CollectiveCliqueRequests& requests,
-                                 stream_executor::Stream* stream,
-                                 absl::string_view phase,
-                                 const absl::Status& local_status) const;
+  absl::StatusOr<std::string> agreement_session_id(
+      const GpuCliqueKey& clique_key) const;
+
+  absl::Status agreement_status(const GpuCliqueKey& clique_key) const;
+
+  // Records cancellation on every acquired clique, then aborts all providers
+  // concurrently. Initialization uses this after a partial multi-clique
+  // failure so disjoint peers cannot continue with an earlier clique.
+  absl::Status PoisonAll(absl::Status status) const;
+
+  // Establishes clique-wide quiescence after all process-local execution
+  // streams have completed. Only non-local device-communication cliques
+  // requesting a module execution barrier participate. A failure records
+  // cancellation on every requested clique before aborting them concurrently,
+  // so a rank waiting in a different overlapping clique is not stranded.
+  //
+  // The provider barrier exchanges and validates the launch id, making a
+  // cross-process launch-order mismatch a terminal error instead of allowing
+  // one execution to release another execution's remotely accessible memory.
+  // A failed barrier poisons the corresponding clique session.
+  absl::Status RunCompletionBarriers(
+      const CollectiveParams& params, const CollectiveCliqueRequests& requests,
+      stream_executor::Stream* stream,
+      const absl::Status& local_completion_status) const;
+
+  // Permanently fails every clique that requested module-completion ordering.
+  // This is called before waiting for streams when execution fails before a
+  // completion barrier: aborting the provider communicator is what releases a
+  // remote peer that may already be blocked in a device-communication kernel.
+  absl::Status PoisonCompletionBarriers(
+      const CollectiveCliqueRequests& requests,
+      const absl::Status& execution_status) const;
 
   // Ties an object to a clique. Clique takes ownership of the object and will
   // destroy it when the clique is destroyed. When TiedRef is destroyed, the

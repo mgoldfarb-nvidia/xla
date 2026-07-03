@@ -31,6 +31,52 @@ limitations under the License.
 namespace xla::gpu {
 namespace {
 
+TEST(GpuExecutableCompletionBarrierTest, SelectsSafeErrorCleanupDisposition) {
+  using BarrierState = GpuExecutableCompletionBarrierState;
+  using Disposition = GpuExecutableErrorCleanupDisposition;
+
+  EXPECT_EQ(GetGpuExecutableErrorCleanupDisposition(
+                BarrierState::kNotRequired,
+                /*deferred_controller_available=*/true,
+                /*tail_cleanup_enabled=*/true),
+            Disposition::kDeferred);
+  EXPECT_EQ(GetGpuExecutableErrorCleanupDisposition(
+                BarrierState::kNotRequired,
+                /*deferred_controller_available=*/false,
+                /*tail_cleanup_enabled=*/true),
+            Disposition::kSynchronous);
+  EXPECT_EQ(GetGpuExecutableErrorCleanupDisposition(
+                BarrierState::kNotRequired,
+                /*deferred_controller_available=*/true,
+                /*tail_cleanup_enabled=*/false),
+            Disposition::kSynchronous);
+  EXPECT_EQ(GetGpuExecutableErrorCleanupDisposition(
+                BarrierState::kSucceeded,
+                /*deferred_controller_available=*/true,
+                /*tail_cleanup_enabled=*/true),
+            Disposition::kSynchronous);
+  EXPECT_EQ(GetGpuExecutableErrorCleanupDisposition(
+                BarrierState::kFailed,
+                /*deferred_controller_available=*/true,
+                /*tail_cleanup_enabled=*/true),
+            Disposition::kQuarantine);
+  EXPECT_EQ(GetGpuExecutableErrorCleanupDisposition(
+                BarrierState::kFailed,
+                /*deferred_controller_available=*/false,
+                /*tail_cleanup_enabled=*/true),
+            Disposition::kFatal);
+  EXPECT_EQ(GetGpuExecutableErrorCleanupDisposition(
+                BarrierState::kRemote,
+                /*deferred_controller_available=*/true,
+                /*tail_cleanup_enabled=*/false),
+            Disposition::kQuarantine);
+  EXPECT_EQ(GetGpuExecutableErrorCleanupDisposition(
+                BarrierState::kRemote,
+                /*deferred_controller_available=*/false,
+                /*tail_cleanup_enabled=*/false),
+            Disposition::kFatal);
+}
+
 TEST(GpuExecutableCompletionBarrierTest, AggregatesLocalRankCompletionFailure) {
   absl::Status first = absl::OkStatus();
   absl::Status second = absl::InternalError("stream synchronization failed");

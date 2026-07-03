@@ -40,6 +40,7 @@ limitations under the License.
 #include "xla/backends/gpu/collectives/gpu_collectives.h"
 #include "xla/backends/gpu/runtime/command.h"
 #include "xla/backends/gpu/runtime/command_buffer_thunk.h"
+#include "xla/backends/gpu/runtime/deferred_gpu_execution_completion.h"
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/backends/gpu/runtime/thunk_executor.h"
 #include "xla/core/collectives/collectives.h"
@@ -545,12 +546,21 @@ GpuExecutableBufferAllocator::ExecutionScope::ExecuteWithBufferAllocations(
         absl::Status(const BufferAllocations&,
                      std::optional<absl::Span<const BufferAllocation::Index>>
                          persistent_alloc_indices)>
-        execute) {
+        execute,
+    DeferredGpuExecution* deferred_execution) {
   if (!command_buffer_active()) {
+    absl::Status execute_status;
     if (!address_policy_active()) {
-      return execute(owning_buffer_allocations, std::nullopt);
+      execute_status = execute(owning_buffer_allocations, std::nullopt);
+    } else {
+      execute_status =
+          execute(owning_buffer_allocations, GetPersistentAllocIndices());
     }
-    return execute(owning_buffer_allocations, GetPersistentAllocIndices());
+    if (deferred_execution != nullptr && deferred_execution->active() &&
+        !deferred_execution->quarantined()) {
+      execute_status.Update(deferred_execution->Schedule());
+    }
+    return execute_status;
   }
 
   RETURN_IF_ERROR(UpdateAllocationAddressPolicy());
@@ -576,6 +586,17 @@ GpuExecutableBufferAllocator::ExecutionScope::ExecuteWithBufferAllocations(
 
   absl::Status execute_status =
       execute(execution_buffer_allocations, persistent_alloc_indices);
+  if (deferred_execution != nullptr && deferred_execution->active()) {
+    TF_RET_CHECK(deferred_execution->quarantined())
+        << "Tail-based deferred cleanup is unsafe with command-buffer VA "
+           "remapping";
+    // Remote quiescence is unknown. Keep aliases mapped and prevent reuse of
+    // this reservation. The quarantined cleanup retains the executable (and
+    // therefore this Remapping object) for process lifetime.
+    remapping_->mutex.AssertHeld();
+    remapping_->poisoned = true;
+    return execute_status;
+  }
   absl::Status unmap_status = UnmapAliases(device_ordinal);
 
   RETURN_IF_ERROR(execute_status);
@@ -729,6 +750,13 @@ GpuExecutableBufferAllocator::CreateExecutionScope(
   }
 
   auto remap_lock = std::make_unique<absl::MutexLock>(&remapping->mutex);
+  remapping->mutex.AssertHeld();
+  if (remapping->poisoned) {
+    return FailedPrecondition(
+        "Command buffer VA remapping for module %s was quarantined after a "
+        "remote device-communication failure",
+        module_name_);
+  }
   if (remapping->vmm_allocator != nullptr &&
       remapping->vmm_allocator != vmm_allocator) {
     return Internal(

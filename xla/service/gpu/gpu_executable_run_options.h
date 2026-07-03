@@ -17,6 +17,7 @@ limitations under the License.
 #define XLA_SERVICE_GPU_GPU_EXECUTABLE_RUN_OPTIONS_H_
 
 #include <functional>
+#include <memory>
 #include <optional>
 
 #include "absl/container/btree_map.h"
@@ -29,6 +30,8 @@ limitations under the License.
 #include "xla/runtime/device_id.h"
 
 namespace xla::gpu {
+
+class GpuCliqueAgreement;
 
 // A callback to get a unique clique ids.
 using CliqueIdCallback =  // NOLINT
@@ -54,6 +57,11 @@ class GpuExecutableRunOptions {
   GpuExecutableRunOptions& set_clique_id_callback(
       CliqueIdCallback clique_id_callback);
   const CliqueIdCallback& clique_id_callback() const;
+
+  // Installs hierarchical agreement used before device communicator creation.
+  GpuExecutableRunOptions& set_clique_agreement(
+      std::shared_ptr<GpuCliqueAgreement> agreement);
+  const std::shared_ptr<GpuCliqueAgreement>& clique_agreement() const;
 
   // Collectives API for running collective operations on the GPU devices.
   GpuExecutableRunOptions& set_collectives(GpuCollectives* collectives);
@@ -89,6 +97,7 @@ class GpuExecutableRunOptions {
   bool enable_mock_collectives_ = false;
   std::optional<DeviceIdMap> gpu_global_device_ids_;
   CliqueIdCallback clique_id_callback_;
+  std::shared_ptr<GpuCliqueAgreement> clique_agreement_;
   GpuCollectives* collectives_ = nullptr;
   std::optional<absl::flat_hash_map<GlobalDeviceId, IncarnationId>>
       incarnations_;

@@ -36,17 +36,18 @@ limitations under the License.
 namespace xla::gpu {
 namespace {
 
-// Per-execution state stored in ExecutionScopedState. Wraps a borrowed event
-// and a counter tracking the async execution lifecycle. Start increments the
-// counter and Done decrements it. Each pair of AsyncStart/AsyncDone thunks can
-// have at most one open async execution scope: Start returns an error if the
-// counter is non-zero, and Done returns an error if the counter is zero. When
-// destroyed at the end of an execution scope, a non-zero counter indicates
-// that some async operations were not properly synchronized with the compute
-// stream.
+// Per-execution state stored in ExecutionScopedState. Wraps a borrowed event,
+// shared ownership of its pool, and a counter tracking the async execution
+// lifecycle. Start increments the counter and Done decrements it. Each pair of
+// AsyncStart/AsyncDone thunks can have at most one open async execution scope:
+// Start returns an error if the counter is non-zero, and Done returns an error
+// if the counter is zero. When destroyed at the end of an execution scope, a
+// non-zero counter indicates that some async operations were not properly
+// synchronized with the compute stream.
 struct ExecutionState {
-  ExecutionState(AsyncExecution::EventPool::BorrowedObject event)  // NOLINT
-      : event(std::move(event)) {}
+  ExecutionState(std::shared_ptr<AsyncExecution::EventPool> event_pool,
+                 AsyncExecution::EventPool::BorrowedObject event)
+      : event_pool(std::move(event_pool)), event(std::move(event)) {}
 
   ~ExecutionState() {
     DCHECK_EQ(counter, 0)
@@ -55,8 +56,11 @@ struct ExecutionState {
   }
 
   ExecutionState(ExecutionState&&) = default;
-  ExecutionState& operator=(ExecutionState&&) = default;
+  ExecutionState& operator=(ExecutionState&&) = delete;
 
+  // Keep the pool alive until after `event` has been returned. Field
+  // destruction is in reverse declaration order.
+  std::shared_ptr<AsyncExecution::EventPool> event_pool;
   AsyncExecution::EventPool::BorrowedObject event;
   int32_t counter = 0;
 };
@@ -79,12 +83,16 @@ AsyncExecution::ExecutionGuard::~ExecutionGuard() {
       << " on a stream " << async_stream_;
 }
 
-AsyncExecution::EventPool& AsyncExecution::GetOrCreatePool(
+std::shared_ptr<AsyncExecution::EventPool> AsyncExecution::GetOrCreatePool(
     se::StreamExecutor* executor) {
   absl::MutexLock lock(mu_);
-  auto [it, _] = event_pools_.try_emplace(
-      executor, [executor] { return executor->CreateEvent(); });
-  return it->second;
+  auto it = event_pools_.find(executor);
+  if (it != event_pools_.end()) return it->second;
+
+  auto pool = std::make_shared<EventPool>(
+      [executor] { return executor->CreateEvent(); });
+  event_pools_.emplace(executor, pool);
+  return pool;
 }
 
 absl::Status AsyncExecution::Initialize(Thunk::ExecutionScopedState* state,
@@ -92,10 +100,11 @@ absl::Status AsyncExecution::Initialize(Thunk::ExecutionScopedState* state,
   XLA_VLOG_DEVICE(1, executor->device_ordinal())
       << absl::StreamFormat("Initialize async execution for `%s`",
                             start_thunk_info_.profile_annotation);
-  EventPool& pool = GetOrCreatePool(executor);
-  ASSIGN_OR_RETURN(auto borrowed, pool.GetOrCreate());
+  std::shared_ptr<EventPool> pool = GetOrCreatePool(executor);
+  ASSIGN_OR_RETURN(auto borrowed, pool->GetOrCreate());
   state->try_emplace(start_thunk_info_.thunk_id,
-                     std::in_place_type<ExecutionState>, std::move(borrowed));
+                     std::in_place_type<ExecutionState>, pool,
+                     std::move(borrowed));
   // For shared async executions (e.g. pipelined send/recv), multiple
   // AsyncStartThunks share the same AsyncExecution and start_thunk_info_, so
   // Initialize may be called more than once with the same key. The first

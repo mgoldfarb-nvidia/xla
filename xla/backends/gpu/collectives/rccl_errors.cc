@@ -17,11 +17,13 @@ limitations under the License.
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "rocm/include/rccl/rccl.h"
 #include "rocm/rocm_config.h"  // IWYU pragma: keep
 #include "xla/backends/gpu/collectives/cancellation_token.h"
+#include "xla/backends/gpu/collectives/rccl_types.h"
 #include "xla/util.h"
 
 namespace xla::gpu {
@@ -49,6 +51,24 @@ absl::Status PollUntilDone(ncclComm_t comm, const CancellationToken& cancel) {
   VLOG(1) << "Polled RCCL communicator " << comm << " for " << (stop - start)
           << ": " << s;
   return s;
+}
+
+absl::Status PollUntilDone(RcclCommState& comm_state,
+                           const CancellationToken& cancel) {
+  while (true) {
+    if (cancel.IsCancelled()) {
+      return Cancelled("RcclCommunicator cancelled");
+    }
+    ncclResult_t state = ncclInProgress;
+    {
+      absl::MutexLock lock(comm_state.mutex);
+      if (cancel.IsCancelled() || comm_state.aborted || comm_state.destroyed) {
+        return Cancelled("RcclCommunicator aborted");
+      }
+      XLA_RCCL_RETURN_IF_ERROR(ncclCommGetAsyncError(comm_state.comm, &state));
+    }
+    if (state != ncclInProgress) return XLA_RCCL_STATUS(state);
+  }
 }
 
 }  // namespace xla::gpu

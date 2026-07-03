@@ -26,6 +26,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "xla/backends/gpu/collectives/cancellation_token.h"
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
@@ -39,6 +40,27 @@ limitations under the License.
 #include "xla/util.h"
 
 namespace xla::gpu {
+namespace {
+
+void AppendField(absl::string_view value, std::string* out) {
+  absl::StrAppendFormat(out, "%d:", value.size());
+  out->append(value.data(), value.size());
+}
+
+void AppendCanonicalCliqueKey(const GpuCliqueKey& key, std::string* out) {
+  absl::StrAppendFormat(out, "devices=%d;", key.devices().size());
+  for (GlobalDeviceId device : key.devices()) {
+    absl::StrAppendFormat(out, "%d,", device.value());
+  }
+  absl::StrAppendFormat(out, ";communication=%d;incarnations=%d;",
+                        key.communication_id().value(),
+                        key.incarnations().size());
+  for (IncarnationId incarnation : key.incarnations()) {
+    absl::StrAppendFormat(out, "%d,", incarnation.value());
+  }
+}
+
+}  // namespace
 
 GpuClique::GpuClique(
     GpuCliqueKey key, std::optional<CliqueIds> ids,
@@ -57,22 +79,121 @@ std::optional<GpuDeviceCommunicator*> GpuClique::device_comm(
   absl::MutexLock lock(mu_);
   if (auto it = device_communicators_.find(std::make_pair(rank, reqs));
       it != device_communicators_.end()) {
-    return it->second.get();
+    return it->second.communicator.get();
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> GpuClique::device_comm_plan(
+    RankId rank, const GpuDeviceCommunicator::Requirements& reqs) const {
+  absl::MutexLock lock(mu_);
+  if (auto it = device_communicators_.find(std::make_pair(rank, reqs));
+      it != device_communicators_.end()) {
+    return it->second.agreement_payload;
   }
   return std::nullopt;
 }
 
 absl::Status GpuClique::AddDeviceComm(
     RankId rank, GpuDeviceCommunicator::Requirements reqs,
+    std::string agreement_payload,
     std::unique_ptr<GpuDeviceCommunicator> communicator) {
+  if (communicator == nullptr) {
+    return InvalidArgument(
+        "Cannot add a null device communicator for rank %v and requirements "
+        "%v",
+        rank, reqs);
+  }
   absl::MutexLock lock(mu_);
-  auto emplaced = device_communicators_.emplace(std::make_pair(rank, reqs),
-                                                std::move(communicator));
+  auto emplaced = device_communicators_.emplace(
+      std::make_pair(rank, reqs),
+      DeviceCommunicatorEntry{std::move(agreement_payload),
+                              std::move(communicator)});
   if (!emplaced.second) {
     return InvalidArgument(
-        "Rank %v and requrements %v already exists in clique", rank, reqs);
+        "Rank %v and requirements %v already exist in clique", rank, reqs);
   }
   return absl::OkStatus();
+}
+
+absl::StatusOr<std::string> GpuClique::agreement_session_id() const {
+  std::string session = "xla-gpu-clique-session-v1;";
+  if (parent_ != nullptr) {
+    auto parent_session = parent_->agreement_session_id();
+    if (!parent_session.ok()) return parent_session.status();
+    absl::StrAppend(&session, "split;");
+    AppendField(*parent_session, &session);
+  } else {
+    absl::StrAppend(&session, "root;");
+    if (!ids_.has_value()) {
+      if (!key_.is_local()) {
+        return FailedPrecondition(
+            "Non-local GPU clique %v has no globally shared clique id", key_);
+      }
+      absl::StrAppend(&session, "local;");
+    } else {
+      absl::StrAppendFormat(&session, "ids=%d;", ids_->size());
+      for (const CliqueId& id : ids_->data()) {
+        AppendField(absl::string_view(id.data().data(), id.data().size()),
+                    &session);
+      }
+    }
+  }
+  AppendCanonicalCliqueKey(key_, &session);
+  return session;
+}
+
+absl::Status GpuClique::agreement_status() const {
+  absl::MutexLock lock(mu_);
+  return agreement_status_;
+}
+
+absl::Status GpuClique::PoisonAgreement(absl::Status status) {
+  status = RecordAgreementFailure(std::move(status));
+  if (status.ok()) return status;
+
+  absl::Status abort_status = AbortAfterAgreementFailure();
+  if (!abort_status.ok()) {
+    LOG(FATAL) << "Failed to abort GPU clique after terminal agreement "
+                  "failure: "
+               << abort_status;
+  }
+  return status;
+}
+
+absl::Status GpuClique::RecordAgreementFailure(absl::Status status) {
+  if (status.ok()) {
+    return InvalidArgument("Cannot poison clique agreement with OK status");
+  }
+
+  {
+    absl::MutexLock lock(mu_);
+    if (agreement_status_.ok()) agreement_status_ = std::move(status);
+    status = agreement_status_;
+  }
+
+  // Cancel immediately so queued communicator work observes the terminal
+  // session failure before batch failure handling starts any blocking aborts.
+  cancel_->Cancel();
+  return status;
+}
+
+absl::Status GpuClique::AbortAfterAgreementFailure() {
+  {
+    absl::MutexLock lock(mu_);
+    if (agreement_status_.ok()) {
+      return FailedPrecondition(
+          "Cannot abort clique before recording an agreement failure");
+    }
+    if (agreement_abort_started_) return absl::OkStatus();
+    agreement_abort_started_ = true;
+  }
+
+  // A local cancellation token is not sufficient on its own: after a
+  // distributed-control failure a remote rank may already have entered a
+  // provider collective. Aborting propagates the failure through the provider
+  // and prevents that peer from waiting for a rank that will never arrive.
+  return Abort();
 }
 
 std::string GpuClique::DebugString() const {

@@ -75,26 +75,33 @@ NcclRegisteredMemory::Create(std::shared_ptr<NcclCommState> comm_state,
         "StreamExecutor is required to create NCCL registered memory");
   }
   auto activation = stream_executor->Activate();
-  CancellationToken never_cancelled;
 
-  void* handle = nullptr;
+  auto handle = std::make_shared<void*>(nullptr);
+  ncclResult_t nccl_status = ncclSuccess;
+  if (comm_state->cancel->IsCancelled()) {
+    return absl::FailedPreconditionError("NcclCommunicator aborted");
+  }
   {
     absl::MutexLock lock(comm_state->mutex);
+    if (comm_state->cancel->IsCancelled() || comm_state->aborted ||
+        comm_state->destroyed) {
+      return absl::FailedPreconditionError("NcclCommunicator aborted");
+    }
     VLOG(3) << absl::StrFormat(
         "Create NCCL registered memory on comm=%p from: ptr=%p; size=%ld",
         comm_state->comm, addr.opaque(), addr.size());
-    ncclResult_t nccl_status =
-        ncclCommRegister(comm_state->comm, addr.opaque(), addr.size(), &handle);
+    nccl_status = ncclCommRegister(comm_state->comm, addr.opaque(), addr.size(),
+                                   handle.get());
     RETURN_IF_ERROR(XLA_NCCL_STATUS(nccl_status));
-    if (nccl_status == ncclInProgress) {
-      // NCCL retains `&handle` until completion, so this poll cannot be
-      // cancelled without invalidating an output pointer still owned by NCCL.
-      RETURN_IF_ERROR(
-          ::xla::gpu::PollUntilDone(comm_state->comm, never_cancelled));
-    }
+  }
+  if (nccl_status == ncclInProgress) {
+    absl::Status status =
+        ::xla::gpu::PollUntilDone(*comm_state, *comm_state->cancel);
+    comm_state->host_storage.RetainOnFailure(status, handle);
+    RETURN_IF_ERROR(status);
   }
   return absl::WrapUnique(new NcclRegisteredMemory(
-      comm_state, handle, addr, std::move(executor), stream_executor));
+      comm_state, *handle, addr, std::move(executor), stream_executor));
 }
 
 NcclRegisteredMemory::~NcclRegisteredMemory() {
@@ -103,13 +110,26 @@ NcclRegisteredMemory::~NcclRegisteredMemory() {
           [this] {
             auto activation = stream_executor_->Activate();
             VLOG(3) << absl::StrFormat("Destroy %v", *this);
-            absl::MutexLock lock(comm_->mutex);
-            ncclResult_t nccl_status = ncclCommDeregister(comm_->comm, handle_);
+            ncclResult_t nccl_status = ncclSuccess;
+            if (comm_->cancel->IsCancelled()) {
+              VLOG(1) << "Skipping NCCL registered memory teardown after "
+                         "parent cancellation";
+              return absl::OkStatus();
+            }
+            {
+              absl::MutexLock lock(comm_->mutex);
+              if (comm_->cancel->IsCancelled() || comm_->aborted ||
+                  comm_->destroyed) {
+                VLOG(1) << "Skipping NCCL registered memory teardown after "
+                           "parent abort or destruction";
+                return absl::OkStatus();
+              }
+              nccl_status = ncclCommDeregister(comm_->comm, handle_);
+            }
             RETURN_IF_ERROR(XLA_NCCL_STATUS(nccl_status));
             if (nccl_status == ncclInProgress) {
-              CancellationToken never_cancelled;
               RETURN_IF_ERROR(
-                  ::xla::gpu::PollUntilDone(comm_->comm, never_cancelled));
+                  ::xla::gpu::PollUntilDone(*comm_, *comm_->cancel));
             }
             return absl::OkStatus();
           },

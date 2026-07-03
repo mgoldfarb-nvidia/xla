@@ -27,6 +27,7 @@ limitations under the License.
 #include "absl/base/casts.h"
 #include "absl/container/btree_map.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -61,16 +62,72 @@ limitations under the License.
 #include "tsl/profiler/lib/traceme.h"
 
 namespace xla::gpu {
+namespace {
+
+void AppendAgreementField(absl::string_view name, absl::string_view value,
+                          std::string* out) {
+  absl::StrAppend(out, name.size(), ":", name, value.size(), ":", value);
+}
+
+absl::Status WithAgreementContext(absl::Status status,
+                                  absl::string_view context) {
+  if (status.ok()) return status;
+  return absl::Status(status.code(),
+                      absl::StrCat(context, ": ", status.message()));
+}
+
+struct SymmetricMemoryState {
+  BufferAllocation::Index allocation;
+  std::unique_ptr<GpuCommunicator::SymmetricMemoryPlan> plan;
+  std::unique_ptr<SymmetricMemory> memory;
+};
+
+GpuCliqueBarrierToken SymmetricMemoryBarrierToken(
+    int64_t execution_id, absl::string_view execution_id_kind,
+    absl::string_view phase, absl::string_view canonical_manifest) {
+  std::string input = "xla-symmetric-memory-barrier-v1;";
+  AppendAgreementField("execution_id_kind", execution_id_kind, &input);
+  AppendAgreementField("execution_id", absl::StrCat(execution_id), &input);
+  AppendAgreementField("phase", phase, &input);
+  AppendAgreementField("manifest", canonical_manifest, &input);
+  tsl::Fprint128 fingerprint = tsl::Fingerprint128(input);
+  GpuCliqueBarrierToken token{fingerprint.high64, fingerprint.low64};
+  // The all-zero value is reserved for an invalid/uninitialized token.
+  if (token == GpuCliqueBarrierToken{}) token.high = 1;
+  return token;
+}
+
+}  // namespace
 
 CollectiveMemory::CollectiveMemory(
     const BufferAllocations& buffers,
     absl::flat_hash_map<Key, std::shared_ptr<SymmetricMemory>> sym_memories,
     absl::flat_hash_map<Key, MulticastMemory> mcast_memories,
     absl::flat_hash_map<Key, PeerMemory> peer_memories)
-    : buffers_(buffers),
+    : buffers_(buffers.buffers().begin(), buffers.buffers().end()),
       sym_memories_(std::move(sym_memories)),
       mcast_memories_(std::move(mcast_memories)),
       peer_memories_(std::move(peer_memories)) {}
+
+std::optional<BufferAllocation::Index> CollectiveMemory::FindAllocationIndex(
+    se::DeviceAddressBase addr) const {
+  for (BufferAllocation::Index i = 0; i < buffers_.size(); ++i) {
+    uintptr_t base =
+        tsl::safe_reinterpret_cast<uintptr_t>(buffers_[i].opaque());
+    uintptr_t ptr = tsl::safe_reinterpret_cast<uintptr_t>(addr.opaque());
+    if (base != 0 && ptr >= base && ptr - base < buffers_[i].size()) {
+      return i;
+    }
+  }
+  return std::nullopt;
+}
+
+se::DeviceAddressBase CollectiveMemory::GetDeviceAddress(
+    BufferAllocation::Index allocation) const {
+  CHECK_GE(allocation, 0);
+  CHECK_LT(allocation, buffers_.size());
+  return buffers_[allocation];
+}
 
 std::pair<SymmetricMemory*, size_t> CollectiveMemory::FindSymmetricMemory(
     const GpuCliqueKey& clique, BufferAllocation::Index allocation) const {
@@ -89,13 +146,13 @@ std::pair<SymmetricMemory*, size_t> CollectiveMemory::FindSymmetricMemory(
 
 std::pair<SymmetricMemory*, size_t> CollectiveMemory::FindSymmetricMemory(
     const GpuCliqueKey& clique, se::DeviceAddressBase addr) const {
-  auto allocation = buffers_.FindAllocationIndex(addr);
+  auto allocation = FindAllocationIndex(addr);
   if (!allocation.has_value()) {
     return std::make_pair(nullptr, 0);
   }
 
   // Find offset from the base allocation.
-  se::DeviceAddressBase base = buffers_.GetDeviceAddress(*allocation);
+  se::DeviceAddressBase base = GetDeviceAddress(*allocation);
   size_t offset = tsl::safe_reinterpret_cast<uintptr_t>(addr.opaque()) -
                   tsl::safe_reinterpret_cast<uintptr_t>(base.opaque());
 
@@ -121,13 +178,13 @@ std::pair<void*, size_t> CollectiveMemory::FindMultimemAddress(
 
 std::pair<void*, size_t> CollectiveMemory::FindMultimemAddress(
     const GpuCliqueKey& clique, se::DeviceAddressBase addr) const {
-  auto allocation = buffers_.FindAllocationIndex(addr);
+  auto allocation = FindAllocationIndex(addr);
   if (!allocation.has_value()) {
     return std::make_pair(nullptr, 0);
   }
 
   // Find offset from the base allocation.
-  se::DeviceAddressBase base = buffers_.GetDeviceAddress(*allocation);
+  se::DeviceAddressBase base = GetDeviceAddress(*allocation);
   size_t offset = tsl::safe_reinterpret_cast<uintptr_t>(addr.opaque()) -
                   tsl::safe_reinterpret_cast<uintptr_t>(base.opaque());
 
@@ -163,13 +220,13 @@ std::optional<se::DeviceAddressBase> CollectiveMemory::FindPeerAddress(
 
 std::optional<se::DeviceAddressBase> CollectiveMemory::FindPeerAddress(
     const GpuCliqueKey& clique, RankId rank, se::DeviceAddressBase addr) const {
-  auto allocation = buffers_.FindAllocationIndex(addr);
+  auto allocation = FindAllocationIndex(addr);
   if (!allocation.has_value()) {
     return std::nullopt;
   }
 
   // Find offset from the base allocation.
-  se::DeviceAddressBase base = buffers_.GetDeviceAddress(*allocation);
+  se::DeviceAddressBase base = GetDeviceAddress(*allocation);
   size_t offset = tsl::safe_reinterpret_cast<uintptr_t>(addr.opaque()) -
                   tsl::safe_reinterpret_cast<uintptr_t>(base.opaque());
 
@@ -234,51 +291,6 @@ struct RankFormatter {
 // Symmetric memory acquisition.
 //===----------------------------------------------------------------------===//
 
-namespace {
-
-void AppendSymmetricManifestField(absl::string_view name,
-                                  absl::string_view value,
-                                  std::string* manifest) {
-  absl::StrAppend(manifest, name.size(), ":", name, value.size(), ":", value);
-}
-
-GpuCliqueBarrierToken SymmetricMemoryBarrierToken(
-    const CollectiveParams& params, absl::string_view phase,
-    absl::string_view manifest) {
-  std::string input = "xla-symmetric-memory-barrier-v1;";
-  AppendSymmetricManifestField(
-      "execution_id_kind", params.launch_id == 0 ? "run" : "launch", &input);
-  AppendSymmetricManifestField(
-      "execution_id",
-      absl::StrCat(params.launch_id == 0 ? params.run_id.ToInt()
-                                         : params.launch_id),
-      &input);
-  AppendSymmetricManifestField("phase", phase, &input);
-  AppendSymmetricManifestField("manifest", manifest, &input);
-  tsl::Fprint128 fingerprint = tsl::Fingerprint128(input);
-  GpuCliqueBarrierToken token{fingerprint.high64, fingerprint.low64};
-  if (token == GpuCliqueBarrierToken{}) token.high = 1;
-  return token;
-}
-
-absl::Status SymmetricMemoryFailure(const GpuCliqueKey& clique,
-                                    absl::Status status) {
-  if (!status.ok() && clique.num_devices() > 1) {
-    LOG(FATAL) << "Multi-rank symmetric-memory initialization failed before "
-                  "clique quiescence was established: "
-               << status;
-  }
-  return status;
-}
-
-struct SymmetricMemoryState {
-  BufferAllocation::Index allocation;
-  std::unique_ptr<GpuCommunicator::SymmetricMemoryPlan> plan;
-  std::unique_ptr<SymmetricMemory> memory;
-};
-
-}  // namespace
-
 // Acquire symmetric memory for all requested allocation.
 static absl::StatusOr<absl::flat_hash_map<CollectiveMemory::Key,
                                           std::shared_ptr<SymmetricMemory>>>
@@ -294,8 +306,9 @@ AcquireSymmetricMemory(
     std::optional<RankId> rank = r.clique.rank(params.global_device_id);
 
     if (!rank.has_value()) {
-      return Internal("Can't find global device id %v in clique key %v",
-                      params.global_device_id, r.clique);
+      return cliques.PoisonAll(
+          Internal("Can't find global device id %v in clique key %v",
+                   params.global_device_id, r.clique));
     }
 
     // TODO(ezhulenev): All of the buffer allocations that we make symmetric
@@ -306,141 +319,175 @@ AcquireSymmetricMemory(
     // 2. Create one big symmetric region from [start, end] addresses, we might
     //    have unused gaps in the middle, but it doesn't matter, we will ignore
     //    them.
-    // 3. Cache symmetric memories in a process-level cache.
-    //
     // Currently it's very simple proof of concept.
 
-    ASSIGN_OR_RETURN(GpuCommunicator * comm, cliques.GetComm(r.clique, *rank));
+    absl::Status agreement_status = cliques.agreement_status(r.clique);
+    if (!agreement_status.ok()) {
+      return cliques.PoisonAll(std::move(agreement_status));
+    }
+    absl::StatusOr<GpuCommunicator*> comm_or = cliques.GetComm(r.clique, *rank);
+    if (!comm_or.ok()) {
+      return cliques.PoisonAll(comm_or.status());
+    }
+    GpuCommunicator* comm = *comm_or;
 
-    // Preserve the existing cache for ordinary collective thunks. Only FFI
-    // allocations explicitly marked execution-scoped use planned windows.
+    // Preserve the executable-level cache for ordinary collective thunks. Only
+    // allocations explicitly requested as execution-scoped use planned
+    // windows tied to the invocation's backing buffers.
     for (BufferAllocation::Index i : r.allocations) {
       if (r.execution_scoped_allocations.contains(i)) continue;
+
       se::DeviceAddressBase addr = buffers.GetDeviceAddress(i);
       CollectiveMemory::Key mem_key = std::make_pair(r.clique, i);
       if (auto cached = memory_cache.FindSymmetricMemory(r.clique, addr)) {
         sym_memories[mem_key] = std::move(cached);
         continue;
       }
-      ASSIGN_OR_RETURN(std::unique_ptr<SymmetricMemory> symm,
-                       comm->CreateSymmetricMemory(addr));
-      ASSIGN_OR_RETURN(tsl::TiedRef<SymmetricMemory> tied_symm,
-                       cliques.Tie(r.clique, std::move(symm)));
-      sym_memories[mem_key] =
-          memory_cache.AddSymmetricMemory(r.clique, addr, std::move(tied_symm));
+
+      absl::StatusOr<std::unique_ptr<SymmetricMemory>> symm =
+          comm->CreateSymmetricMemory(addr);
+      if (!symm.ok() || *symm == nullptr) {
+        absl::Status status =
+            symm.ok() ? Internal(
+                            "Provider returned a null symmetric memory window "
+                            "for persistent allocation %d",
+                            i)
+                      : symm.status();
+        return cliques.PoisonAll(WithAgreementContext(
+            std::move(status),
+            absl::StrCat("failed to create persistent symmetric memory for "
+                         "allocation ",
+                         i)));
+      }
+
+      absl::StatusOr<tsl::TiedRef<SymmetricMemory>> tied_symm =
+          cliques.Tie(r.clique, std::move(*symm));
+      if (!tied_symm.ok()) {
+        return cliques.PoisonAll(WithAgreementContext(
+            tied_symm.status(),
+            absl::StrCat("failed to tie persistent symmetric memory for "
+                         "allocation ",
+                         i)));
+      }
+      sym_memories[mem_key] = memory_cache.AddSymmetricMemory(
+          r.clique, addr, std::move(*tied_symm));
     }
 
     if (r.execution_scoped_allocations.empty()) continue;
-    if (!comm->SupportsCliqueBarrier()) {
-      return absl::UnimplementedError(
-          "Execution-scoped symmetric memory requires a provider-native "
-          "clique barrier");
-    }
-
     if (params.stream == nullptr) {
-      return SymmetricMemoryFailure(
-          r.clique, absl::InvalidArgumentError(
-                        "Symmetric-memory initialization requires a stream"));
+      return cliques.PoisonAll(
+          InvalidArgument("Symmetric memory initialization requires a stream"));
     }
     if (!r.clique.is_local() && params.launch_id == 0) {
-      return absl::FailedPreconditionError(
-          "Non-local symmetric-memory initialization requires a non-zero, "
-          "globally coordinated execution launch id");
+      return cliques.PoisonAll(FailedPrecondition(
+          "Non-local symmetric memory initialization requires a non-zero, "
+          "globally coordinated execution launch id"));
     }
 
     std::vector<SymmetricMemoryState> states;
     states.reserve(r.execution_scoped_allocations.size());
     absl::Status local_status;
     std::string manifest = "xla-symmetric-memory-plan-v1;";
-    AppendSymmetricManifestField(
-        "clique", GpuCliqueKeyAgreementPayload(r.clique), &manifest);
-    AppendSymmetricManifestField("request_id", absl::StrCat(r.id), &manifest);
-    AppendSymmetricManifestField(
-        "count", absl::StrCat(r.execution_scoped_allocations.size()),
-        &manifest);
+    absl::StrAppend(&manifest, "request_id=", r.id,
+                    ";count=", r.execution_scoped_allocations.size(), ";");
 
     for (BufferAllocation::Index i : r.execution_scoped_allocations) {
       se::DeviceAddressBase addr = buffers.GetDeviceAddress(i);
       SymmetricMemoryState& state =
           states.emplace_back(SymmetricMemoryState{i, nullptr, nullptr});
+
       absl::StatusOr<std::unique_ptr<GpuCommunicator::SymmetricMemoryPlan>>
           plan = comm->ResolveSymmetricMemoryPlan(addr);
       if (!plan.ok()) {
-        local_status.Update(plan.status());
+        local_status.Update(WithAgreementContext(
+            plan.status(),
+            absl::StrCat("failed to resolve symmetric memory plan for "
+                         "allocation ",
+                         i)));
       } else if (*plan == nullptr) {
-        local_status.Update(absl::InternalError(
-            "Provider returned a null symmetric-memory plan"));
+        local_status.Update(Internal(
+            "Provider returned a null symmetric memory plan for allocation %d",
+            i));
       } else {
         state.plan = std::move(*plan);
       }
 
-      AppendSymmetricManifestField("allocation", absl::StrCat(i), &manifest);
-      AppendSymmetricManifestField("size", absl::StrCat(addr.size()),
-                                   &manifest);
-      AppendSymmetricManifestField(
+      AppendAgreementField("allocation", absl::StrCat(i), &manifest);
+      AppendAgreementField("size", absl::StrCat(addr.size()), &manifest);
+      AppendAgreementField("resolved", state.plan == nullptr ? "0" : "1",
+                           &manifest);
+      AppendAgreementField(
           "provider",
           state.plan == nullptr ? absl::string_view() : state.plan->provider(),
           &manifest);
-      AppendSymmetricManifestField("plan",
-                                   state.plan == nullptr
-                                       ? absl::string_view()
-                                       : state.plan->agreement_payload(),
-                                   &manifest);
-    }
-    AppendSymmetricManifestField(
-        "status_code", absl::StrCat(static_cast<int>(local_status.code())),
-        &manifest);
-    AppendSymmetricManifestField("status", local_status.message(), &manifest);
-
-    absl::Status preflight = comm->RunCliqueBarrier(
-        params.stream,
-        SymmetricMemoryBarrierToken(params, "resolved-plan", manifest));
-    if (!preflight.ok()) {
-      return SymmetricMemoryFailure(r.clique, std::move(preflight));
-    }
-    if (!local_status.ok()) return local_status;
-
-    for (size_t i = 0; i < states.size(); ++i) {
-      SymmetricMemoryState& state = states[i];
-      absl::StatusOr<std::unique_ptr<SymmetricMemory>> memory =
-          comm->CreateSymmetricMemory(*state.plan);
-      if (!memory.ok()) {
-        if (r.clique.num_devices() > 1) {
-          LOG(FATAL) << "Symmetric-memory creation failed inside a multi-rank "
-                        "provider collective; quiescence is unknown: "
-                     << memory.status();
-        }
-        return memory.status();
-      }
-      if (*memory == nullptr) {
-        absl::Status status = absl::InternalError(
-            "Provider returned a null symmetric-memory window");
-        if (r.clique.num_devices() > 1) {
-          LOG(FATAL) << status;
-        }
-        return status;
-      }
-      state.memory = std::move(*memory);
-
-      std::string outcome = manifest;
-      AppendSymmetricManifestField("created_index", absl::StrCat(i), &outcome);
-      AppendSymmetricManifestField(
-          "created", state.memory == nullptr ? "0" : "1", &outcome);
-      absl::Status post_create = comm->RunCliqueBarrier(
-          params.stream,
-          SymmetricMemoryBarrierToken(params, "post-create", outcome));
-      if (!post_create.ok()) {
-        return SymmetricMemoryFailure(r.clique, std::move(post_create));
-      }
+      AppendAgreementField("plan",
+                           state.plan == nullptr
+                               ? absl::string_view()
+                               : state.plan->agreement_payload(),
+                           &manifest);
     }
 
-    // Planned NCCL windows are owned only by this execution. They must be
-    // destroyed before CollectiveCliques, after the executable completion
-    // barrier establishes remote quiescence.
+    // Do not enter any collective registration if local planning failed. Abort
+    // the clique so peers already waiting in the manifest barrier are released
+    // and no rank can continue into a later registration on its own.
+    if (!local_status.ok()) {
+      return cliques.PoisonAll(std::move(local_status));
+    }
+
+    auto run_barrier_or_poison = [&](absl::string_view phase) {
+      // A nonzero launch id is globally coordinated. Local cliques can use the
+      // process-local run id because all their ranks share it.
+      bool has_global_launch_id = params.launch_id != 0;
+      int64_t execution_id =
+          has_global_launch_id ? params.launch_id : params.run_id.ToInt();
+      absl::string_view execution_id_kind =
+          has_global_launch_id ? "launch" : "run";
+      absl::Status status = comm->RunCliqueBarrier(
+          params.stream, SymmetricMemoryBarrierToken(
+                             execution_id, execution_id_kind, phase, manifest));
+      if (!status.ok()) {
+        return cliques.PoisonAll(WithAgreementContext(
+            std::move(status),
+            absl::StrCat("symmetric memory ", phase, " barrier failed")));
+      }
+      return status;
+    };
+
+    // This is the only pre-registration provider collective for the clique.
+    // Token validation proves every rank resolved the same complete ordered
+    // manifest before any rank enters CreateSymmetricMemory.
+    RETURN_IF_ERROR(run_barrier_or_poison("resolved-plan"));
+
     for (SymmetricMemoryState& state : states) {
-      CollectiveMemory::Key key = std::make_pair(r.clique, state.allocation);
-      sym_memories.emplace(std::move(key), std::shared_ptr<SymmetricMemory>(
-                                               std::move(state.memory)));
+      absl::StatusOr<std::unique_ptr<SymmetricMemory>> symm =
+          comm->CreateSymmetricMemory(*state.plan);
+      if (!symm.ok() || *symm == nullptr) {
+        absl::Status status =
+            symm.ok() ? Internal(
+                            "Provider returned a null symmetric memory "
+                            "window for allocation %d",
+                            state.allocation)
+                      : symm.status();
+        return cliques.PoisonAll(WithAgreementContext(
+            std::move(status),
+            absl::StrCat("failed to create symmetric memory for allocation ",
+                         state.allocation)));
+      }
+      // Keep every provider object private until all ranks finish the complete
+      // deterministic creation sequence.
+      state.memory = std::move(*symm);
+    }
+
+    RETURN_IF_ERROR(run_barrier_or_poison("post-create"));
+
+    // The post-create barrier is the publication point. CollectiveMemory is
+    // execution-scoped and owns every window over the same execution's backing
+    // buffers; no clique- or executable-level cache can outlive those buffers.
+    for (SymmetricMemoryState& state : states) {
+      CollectiveMemory::Key mem_key =
+          std::make_pair(r.clique, state.allocation);
+      sym_memories.emplace(std::move(mem_key), std::shared_ptr<SymmetricMemory>(
+                                                   std::move(state.memory)));
     }
   }
 
@@ -762,17 +809,26 @@ absl::StatusOr<CollectiveMemory> AcquireCollectiveMemory(
                                          {"peer_allocs", peer_allocs.size()}});
   });
 
-  ASSIGN_OR_RETURN(auto sym_memories,
-                   AcquireSymmetricMemory(params, cliques, requests.buffers(),
-                                          sym_allocs, memory_cache));
+  auto sym_memories_or = AcquireSymmetricMemory(
+      params, cliques, requests.buffers(), sym_allocs, memory_cache);
+  if (!sym_memories_or.ok()) {
+    return cliques.PoisonAll(sym_memories_or.status());
+  }
+  auto sym_memories = std::move(*sym_memories_or);
 
-  ASSIGN_OR_RETURN(MulticastMemoryMap mcast_memories,
-                   AcquireMulticastMemory(params, cliques, requests.buffers(),
-                                          mcast_allocs, memory_cache));
+  auto mcast_memories_or = AcquireMulticastMemory(
+      params, cliques, requests.buffers(), mcast_allocs, memory_cache);
+  if (!mcast_memories_or.ok()) {
+    return cliques.PoisonAll(mcast_memories_or.status());
+  }
+  MulticastMemoryMap mcast_memories = std::move(*mcast_memories_or);
 
-  ASSIGN_OR_RETURN(
-      auto peer_memories,
-      AcquirePeerMemory(params, cliques, requests.buffers(), peer_allocs));
+  auto peer_memories_or =
+      AcquirePeerMemory(params, cliques, requests.buffers(), peer_allocs);
+  if (!peer_memories_or.ok()) {
+    return cliques.PoisonAll(peer_memories_or.status());
+  }
+  auto peer_memories = std::move(*peer_memories_or);
 
   XLA_VLOG_DEVICE(2, params.executor->device_ordinal()) << absl::StreamFormat(
       "Acquired collective memory in %s for global device id %v; "

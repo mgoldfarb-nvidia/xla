@@ -147,26 +147,30 @@ NcclSymmetricMemory::Create(std::shared_ptr<NcclCommState> comm_state,
                                               validated_device_abi_version));
   auto activation = stream_executor->Activate();
 
-  ncclWindow_t win = nullptr;
+  auto win = std::make_shared<ncclWindow_t>(nullptr);
   absl::Status registration_status;
-  CancellationToken never_cancelled;
+  ncclResult_t nccl_status = ncclSuccess;
+  if (comm_state->cancel->IsCancelled()) {
+    return absl::FailedPreconditionError("NcclCommunicator aborted");
+  }
   {
     VLOG(3) << absl::StrFormat(
         "Create NCCL symmetric memory on comm=%p from: ptr=%p; size=%ld",
         comm_state->comm, addr.opaque(), addr.size());
     absl::MutexLock lock(comm_state->mutex);
-    ncclResult_t status =
-        ncclCommWindowRegister(comm_state->comm, addr.opaque(), addr.size(),
-                               &win, NCCL_WIN_COLL_SYMMETRIC);
-    registration_status = XLA_NCCL_STATUS(status);
-    if (registration_status.ok() && status == ncclInProgress) {
-      // ncclCommWindowRegister may return ncclInProgress for a non-blocking
-      // communicator. Do not publish the window until NCCL has initialized it.
-      // NCCL retains `&win` until completion, so this poll cannot be cancelled
-      // without invalidating an output pointer still owned by NCCL.
-      registration_status =
-          ::xla::gpu::PollUntilDone(comm_state->comm, never_cancelled);
+    if (comm_state->cancel->IsCancelled() || comm_state->aborted ||
+        comm_state->destroyed) {
+      return absl::FailedPreconditionError("NcclCommunicator aborted");
     }
+    nccl_status =
+        ncclCommWindowRegister(comm_state->comm, addr.opaque(), addr.size(),
+                               win.get(), NCCL_WIN_COLL_SYMMETRIC);
+    registration_status = XLA_NCCL_STATUS(nccl_status);
+  }
+  if (registration_status.ok() && nccl_status == ncclInProgress) {
+    registration_status =
+        ::xla::gpu::PollUntilDone(*comm_state, *comm_state->cancel);
+    comm_state->host_storage.RetainOnFailure(registration_status, win);
   }
 
   if (!registration_status.ok()) {
@@ -175,7 +179,7 @@ NcclSymmetricMemory::Create(std::shared_ptr<NcclCommState> comm_state,
   }
 
   return absl::WrapUnique(
-      new NcclSymmetricMemory(comm_state, win, addr, executor, stream_executor,
+      new NcclSymmetricMemory(comm_state, *win, addr, executor, stream_executor,
                               validated_device_abi_version));
 }
 
@@ -187,17 +191,26 @@ NcclSymmetricMemory::~NcclSymmetricMemory() {
             VLOG(3) << absl::StrFormat(
                 "Destroy %v with addr=%p, size=%ld executor=%p", *this,
                 addr_.opaque(), addr_.size(), executor_.get());
-            absl::MutexLock lock(comm_state_->mutex);
-            ncclResult_t nccl_status =
-                ncclCommWindowDeregister(comm_state_->comm, win_);
+            ncclResult_t nccl_status = ncclSuccess;
+            if (comm_state_->cancel->IsCancelled()) {
+              VLOG(1) << "Skipping NCCL symmetric memory teardown after "
+                         "parent cancellation";
+              return absl::OkStatus();
+            }
+            {
+              absl::MutexLock lock(comm_state_->mutex);
+              if (comm_state_->cancel->IsCancelled() || comm_state_->aborted ||
+                  comm_state_->destroyed) {
+                VLOG(1) << "Skipping NCCL symmetric memory teardown after "
+                           "parent abort or destruction";
+                return absl::OkStatus();
+              }
+              nccl_status = ncclCommWindowDeregister(comm_state_->comm, win_);
+            }
             RETURN_IF_ERROR(XLA_NCCL_STATUS(nccl_status));
             if (nccl_status == ncclInProgress) {
-              // Teardown must not release the window while NCCL still owns it.
-              // Do not use the clique cancellation token: cancellation is
-              // precisely when deterministic teardown matters most.
-              CancellationToken never_cancelled;
-              RETURN_IF_ERROR(::xla::gpu::PollUntilDone(comm_state_->comm,
-                                                        never_cancelled));
+              RETURN_IF_ERROR(::xla::gpu::PollUntilDone(*comm_state_,
+                                                        *comm_state_->cancel));
             }
             return absl::OkStatus();
           },
@@ -218,20 +231,31 @@ NcclSymmetricMemory::multimem_addr() const {
       [this]() -> absl::StatusOr<stream_executor::DeviceAddressBase> {
         auto activation = stream_executor_->Activate();
 #if (NCCL_VERSION_CODE >= 22900) || defined(USE_NCCL_HOST_API)
-        void* multimem = nullptr;
+        auto multimem = std::make_shared<void*>(nullptr);
+        ncclResult_t nccl_status = ncclSuccess;
+        if (comm_state_->cancel->IsCancelled()) {
+          return absl::FailedPreconditionError(
+              "NCCL communicator is no longer usable");
+        }
         {
           absl::MutexLock lock(comm_state_->mutex);
-          ncclResult_t nccl_status =
-              ncclGetLsaMultimemDevicePointer(win_, 0, &multimem);
-          RETURN_IF_ERROR(XLA_NCCL_STATUS(nccl_status));
-          if (nccl_status == ncclInProgress) {
-            CancellationToken never_cancelled;
-            RETURN_IF_ERROR(
-                ::xla::gpu::PollUntilDone(comm_state_->comm, never_cancelled));
+          if (comm_state_->cancel->IsCancelled() || comm_state_->aborted ||
+              comm_state_->destroyed) {
+            return absl::FailedPreconditionError(
+                "NCCL communicator is no longer usable");
           }
+          nccl_status =
+              ncclGetLsaMultimemDevicePointer(win_, 0, multimem.get());
+          RETURN_IF_ERROR(XLA_NCCL_STATUS(nccl_status));
         }
-        if (multimem) {
-          return stream_executor::DeviceAddressBase(multimem, addr_.size());
+        if (nccl_status == ncclInProgress) {
+          absl::Status status =
+              ::xla::gpu::PollUntilDone(*comm_state_, *comm_state_->cancel);
+          comm_state_->host_storage.RetainOnFailure(status, multimem);
+          RETURN_IF_ERROR(status);
+        }
+        if (*multimem) {
+          return stream_executor::DeviceAddressBase(*multimem, addr_.size());
         }
 #endif
         return absl::UnimplementedError(
@@ -246,20 +270,31 @@ NcclSymmetricMemory::peer_addr(RankId peer) const {
       [this, peer]() -> absl::StatusOr<stream_executor::DeviceAddressBase> {
         auto activation = stream_executor_->Activate();
 #if (NCCL_VERSION_CODE >= 22902) || defined(USE_NCCL_HOST_API)
-        void* peer_addr = nullptr;
+        auto peer_addr = std::make_shared<void*>(nullptr);
+        ncclResult_t nccl_status = ncclSuccess;
+        if (comm_state_->cancel->IsCancelled()) {
+          return absl::FailedPreconditionError(
+              "NCCL communicator is no longer usable");
+        }
         {
           absl::MutexLock lock(comm_state_->mutex);
-          ncclResult_t nccl_status =
-              ncclGetPeerDevicePointer(win_, 0, peer.value(), &peer_addr);
-          RETURN_IF_ERROR(XLA_NCCL_STATUS(nccl_status));
-          if (nccl_status == ncclInProgress) {
-            CancellationToken never_cancelled;
-            RETURN_IF_ERROR(
-                ::xla::gpu::PollUntilDone(comm_state_->comm, never_cancelled));
+          if (comm_state_->cancel->IsCancelled() || comm_state_->aborted ||
+              comm_state_->destroyed) {
+            return absl::FailedPreconditionError(
+                "NCCL communicator is no longer usable");
           }
+          nccl_status =
+              ncclGetPeerDevicePointer(win_, 0, peer.value(), peer_addr.get());
+          RETURN_IF_ERROR(XLA_NCCL_STATUS(nccl_status));
         }
-        if (peer_addr) {
-          return stream_executor::DeviceAddressBase(peer_addr, addr_.size());
+        if (nccl_status == ncclInProgress) {
+          absl::Status status =
+              ::xla::gpu::PollUntilDone(*comm_state_, *comm_state_->cancel);
+          comm_state_->host_storage.RetainOnFailure(status, peer_addr);
+          RETURN_IF_ERROR(status);
+        }
+        if (*peer_addr) {
+          return stream_executor::DeviceAddressBase(*peer_addr, addr_.size());
         }
         return absl::FailedPreconditionError(absl::StrFormat(
             "Peer rank %d is not load/store accessible from this rank",

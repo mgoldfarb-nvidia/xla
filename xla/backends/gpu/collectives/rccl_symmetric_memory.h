@@ -18,17 +18,14 @@ limitations under the License.
 
 #include <memory>
 #include <string>
+#include <thread>
 
 #include "absl/status/statusor.h"
-#include "rocm/rocm_config.h"  // IWYU pragma: keep  (defines TF_ROCM_VERSION)
+#include "xla/backends/gpu/collectives/rccl_types.h"
 #include "xla/core/collectives/symmetric_memory.h"
 #include "xla/stream_executor/device_address.h"
-
-#if (TF_ROCM_VERSION >= 50200)
-#include "rocm/include/rccl/rccl.h"
-#else
-#include "rocm/include/rccl.h"
-#endif  // TF_ROCM_VERSION >= 50200
+#include "xla/stream_executor/stream_executor.h"
+#include "xla/tsl/concurrency/executor.h"
 
 namespace xla::gpu {
 
@@ -40,7 +37,10 @@ class RcclSymmetricMemory final : public SymmetricMemory {
   ~RcclSymmetricMemory() final;
 
   static absl::StatusOr<std::unique_ptr<RcclSymmetricMemory>> Create(
-      ncclComm_t comm, stream_executor::DeviceAddressBase addr);
+      std::shared_ptr<RcclCommState> comm,
+      stream_executor::DeviceAddressBase addr,
+      std::shared_ptr<tsl::Executor> executor,
+      stream_executor::StreamExecutor* stream_executor);
 
   stream_executor::DeviceAddressBase addr() const final;
 
@@ -54,12 +54,17 @@ class RcclSymmetricMemory final : public SymmetricMemory {
   PackedKernelArg PackKernelArg() const final;
 
  private:
-  RcclSymmetricMemory(ncclComm_t comm, ncclWindow_t win,
-                      stream_executor::DeviceAddressBase addr);
+  RcclSymmetricMemory(std::shared_ptr<RcclCommState> comm, ncclWindow_t win,
+                      stream_executor::DeviceAddressBase addr,
+                      std::shared_ptr<tsl::Executor> executor,
+                      stream_executor::StreamExecutor* stream_executor);
 
-  ncclComm_t comm_;
+  std::shared_ptr<RcclCommState> comm_;
   ncclWindow_t win_;
   stream_executor::DeviceAddressBase addr_;
+  std::shared_ptr<tsl::Executor> executor_;
+  stream_executor::StreamExecutor* stream_executor_;
+  std::thread::id owner_thread_id_;
 };
 
 }  // namespace xla::gpu

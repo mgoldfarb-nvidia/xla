@@ -364,7 +364,7 @@ class PjRtStreamExecutorClient : public CommonPjRtClient {
   }
 
   virtual absl::StatusOr<PjRtStreamExecutorExecutionOutput> RunAsync(
-      LocalExecutable& exec, PjRtDevice* device,
+      std::shared_ptr<LocalExecutable> exec, PjRtDevice* device,
       absl::Span<const PjRtRawBufferRef> flat_arguments,
       absl::Span<const PjRtRawBufferRef> results,
       ExecutableRunOptions run_options, bool parameter_is_tupled_arguments,

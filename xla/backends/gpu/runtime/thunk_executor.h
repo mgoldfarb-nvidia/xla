@@ -18,11 +18,13 @@ limitations under the License.
 
 #include <cstddef>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
@@ -109,7 +111,7 @@ class ThunkExecutor::ScopedProgressTracker {
 
     absl::Time executed;
     Thunk::Kind kind;
-    absl::string_view name;
+    std::string name;
     std::vector<WhileLoopState> loop_nest;
   };
 
@@ -117,6 +119,18 @@ class ThunkExecutor::ScopedProgressTracker {
 
   ScopedProgressTracker(ScopedProgressTracker&&) = default;
   ScopedProgressTracker& operator=(ScopedProgressTracker&&) = default;
+
+  // Deactivates progress tracking on the current thread and transfers the
+  // recorded events to an opaque owner that may be destroyed on any thread.
+  // Error paths use this to keep pending event handles alive until deferred
+  // GPU completion without violating the thread-affine scoped destructor.
+  std::shared_ptr<void> DeactivateAndRetain();
+
+  // Returns a one-shot watchdog callback backed by shared tracker state. The
+  // callback remains valid after DeactivateAndRetain and can run on the
+  // watchdog thread.
+  absl::AnyInvocable<void() &&> MakeProgressReportCallback(
+      size_t n, int device_ordinal) const;
 
   // Returns the number of unique thunks in the tracked thunk sequence. This
   // includes all thunks nested inside others.
@@ -156,10 +170,13 @@ class ThunkExecutor::ScopedProgressTracker {
   // loop nest). We keep a separate record for each execution to be able to
   // distinguish executions that happens in different loop iterations.
   struct ThunkExecutionEvent {
-    ThunkExecutionEvent(const Thunk* thunk, EventPool::Event event,
+    ThunkExecutionEvent(size_t thunk_idx, Thunk::Kind kind, std::string name,
+                        EventPool::Event event,
                         absl::Span<const WhileLoopState> loop_nest);
 
-    const Thunk* thunk;
+    size_t thunk_idx;
+    Thunk::Kind kind;
+    std::string name;
     absl::Time executed;                    // wall time when thunk was launched
     EventPool::Event event;                 // device event for the launch
     std::vector<WhileLoopState> loop_nest;  // enclosing loop state snapshot
@@ -192,7 +209,7 @@ class ThunkExecutor::ScopedProgressTracker {
   std::vector<ThunkExecution> CollectThunks(se::Event::Status status,
                                             bool most_recent_first, size_t n);
 
-  std::unique_ptr<ProgressTracker> tracker_;
+  std::shared_ptr<ProgressTracker> tracker_;
 };
 
 // Installs a progress tracker for the given sequential thunk in the current
