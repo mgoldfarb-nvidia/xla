@@ -86,7 +86,7 @@ struct XLA_FFI_ExecutionContext {
     xla::gpu::CollectiveMemoryRequests* collective_memory_requests = nullptr;
     const xla::gpu::CollectiveCliques* collective_cliques = nullptr;
     const xla::gpu::CollectiveMemory* collective_memory = nullptr;
-    // Read-only bridge for GetDeviceComm and GetDeviceMemory.
+    // Read-only bridge for GetDeviceComm and GetRegisteredMemoryHandle.
     xla::ffi::GpuCollectivesApi* gpu_collectives = nullptr;
     const stream_executor::GpuComputeCapability* gpu_compute_capability =
         nullptr;

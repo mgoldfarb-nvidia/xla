@@ -39,6 +39,7 @@ filegroup(
         "c_api_gpu_collectives_nccl.h",
         "ffi.h",
         "gpu_collectives.h",
+        "gpu_collectives_nccl.h",
     ],
 )
 
@@ -101,6 +102,15 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "gpu_collectives_nccl",
+    hdrs = ["gpu_collectives_nccl.h"],
+    deps = [
+        ":c_api_gpu_collectives_nccl",
+        ":gpu_collectives",
+    ],
+)
+
 xla_cc_test(
     name = "gpu_collectives_test",
     srcs = ["gpu_collectives_test.cc"],
@@ -110,6 +120,7 @@ xla_cc_test(
         ":c_api_gpu_collectives_nccl",
         ":ffi",
         ":gpu_collectives",
+        ":gpu_collectives_nccl",
         "//xla/ffi:ffi_api",
         "//xla/tsl/platform:test_main",
         "@com_google_googletest//:gtest",

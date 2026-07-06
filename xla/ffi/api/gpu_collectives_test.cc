@@ -26,6 +26,7 @@ limitations under the License.
 #include "xla/ffi/api/c_api_gpu_collectives.h"
 #include "xla/ffi/api/c_api_gpu_collectives_nccl.h"
 #include "xla/ffi/api/ffi.h"
+#include "xla/ffi/api/gpu_collectives_nccl.h"
 
 namespace xla::ffi {
 namespace {
@@ -44,12 +45,27 @@ static_assert(
     XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args_STRUCT_SIZE);
 static_assert(XLA_FFI_GpuCollectives_GetDeviceComm_Args_STRUCT_SIZE_V1_0 <=
               XLA_FFI_GpuCollectives_GetDeviceComm_Args_STRUCT_SIZE);
-static_assert(XLA_FFI_GpuCollectives_GetDeviceMemory_Args_STRUCT_SIZE_V1_0 <=
-              XLA_FFI_GpuCollectives_GetDeviceMemory_Args_STRUCT_SIZE);
+static_assert(
+    XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args_STRUCT_SIZE_V1_0 <=
+    XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args_STRUCT_SIZE);
 
 constexpr uint64_t kNcclAbiVersion = 22907;
 constexpr size_t kDeviceCommSize = 64;
-constexpr size_t kDeviceMemorySize = 8;
+constexpr size_t kRegisteredMemoryHandleSize = 8;
+
+struct TestNcclDeviceComm {
+  std::array<uint8_t, kDeviceCommSize> bytes = {};
+};
+
+using TestNcclDeviceCommCtx =
+    NcclDeviceComm<TestNcclDeviceComm, kNcclAbiVersion>;
+
+static_assert(
+    std::is_same_v<
+        TestNcclDeviceCommCtx,
+        ProviderDeviceComm<TestNcclDeviceComm,
+                           XLA_FFI_GpuCollective_NCCL_DEVICE_COMM_ABI_SCHEMA,
+                           kNcclAbiVersion>>);
 
 struct DeviceCommCall {
   uint64_t expected_abi_schema = 0;
@@ -58,7 +74,7 @@ struct DeviceCommCall {
   size_t destination_size = 0;
 };
 
-struct DeviceMemoryCall {
+struct RegisteredMemoryHandleCall {
   XLA_FFI_DataType dtype = XLA_FFI_DataType_INVALID;
   void* buffer_data = nullptr;
   int64_t buffer_rank = 0;
@@ -79,7 +95,7 @@ struct DeviceCommunicationInfoCall {
 };
 
 DeviceCommCall device_comm_call;
-DeviceMemoryCall device_memory_call;
+RegisteredMemoryHandleCall registered_memory_handle_call;
 DeviceCommunicationRequestCall device_communication_request_call;
 DeviceCommunicationInfoCall device_communication_info_call;
 
@@ -109,9 +125,9 @@ XLA_FFI_Error* GetDeviceCommUnavailable(
                      "device communicator unavailable");
 }
 
-XLA_FFI_Error* GetDeviceMemorySuccess(
-    XLA_FFI_GpuCollectives_GetDeviceMemory_Args* args) {
-  device_memory_call = DeviceMemoryCall{
+XLA_FFI_Error* GetRegisteredMemoryHandleSuccess(
+    XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args* args) {
+  registered_memory_handle_call = RegisteredMemoryHandleCall{
       args->buffer->dtype,       args->buffer->data,         args->buffer->rank,
       args->expected_abi_schema, args->expected_abi_version, args->destination,
       args->destination_size,
@@ -161,7 +177,7 @@ XLA_FFI_GpuCollectives_Extension MakeExtension() {
   extension.api_major_version = XLA_FFI_GPU_COLLECTIVES_API_MAJOR;
   extension.api_minor_version = XLA_FFI_GPU_COLLECTIVES_API_MINOR;
   extension.get_device_comm = GetDeviceCommSuccess;
-  extension.get_device_memory = GetDeviceMemorySuccess;
+  extension.get_registered_memory_handle = GetRegisteredMemoryHandleSuccess;
   extension.request_device_communication = RequestDeviceCommunicationSuccess;
   extension.get_device_communication_info = GetDeviceCommunicationInfoSuccess;
   return extension;
@@ -206,21 +222,22 @@ TEST(GpuCollectivesTest, FindsExtensionInChainAndForwardsBothOperations) {
       /*rank=*/1,
       dims,
   };
-  std::array<uint8_t, kDeviceMemorySize> memory = {};
+  std::array<uint8_t, kRegisteredMemoryHandleSize> memory = {};
   uint64_t offset = 0;
-  error = collectives.GetDeviceMemory(
+  error = collectives.GetRegisteredMemoryHandle(
       AnyBuffer(&buffer),
       XLA_FFI_GpuCollective_NCCL_SYMMETRIC_MEMORY_ABI_SCHEMA, kNcclAbiVersion,
       memory.data(), memory.size(), &offset);
   EXPECT_TRUE(error.success());
-  EXPECT_EQ(device_memory_call.dtype, XLA_FFI_DataType_F32);
-  EXPECT_EQ(device_memory_call.buffer_data, buffer.data);
-  EXPECT_EQ(device_memory_call.buffer_rank, 1);
-  EXPECT_EQ(device_memory_call.expected_abi_schema,
+  EXPECT_EQ(registered_memory_handle_call.dtype, XLA_FFI_DataType_F32);
+  EXPECT_EQ(registered_memory_handle_call.buffer_data, buffer.data);
+  EXPECT_EQ(registered_memory_handle_call.buffer_rank, 1);
+  EXPECT_EQ(registered_memory_handle_call.expected_abi_schema,
             XLA_FFI_GpuCollective_NCCL_SYMMETRIC_MEMORY_ABI_SCHEMA);
-  EXPECT_EQ(device_memory_call.expected_abi_version, kNcclAbiVersion);
-  EXPECT_EQ(device_memory_call.destination, memory.data());
-  EXPECT_EQ(device_memory_call.destination_size, memory.size());
+  EXPECT_EQ(registered_memory_handle_call.expected_abi_version,
+            kNcclAbiVersion);
+  EXPECT_EQ(registered_memory_handle_call.destination, memory.data());
+  EXPECT_EQ(registered_memory_handle_call.destination_size, memory.size());
   EXPECT_EQ(memory[0], 0xa5);
   EXPECT_EQ(offset, 128);
 }
@@ -339,15 +356,15 @@ TEST(GpuCollectivesTest, RejectsInvalidBufferDestinationAndOffset) {
   EXPECT_EQ(error.errc(), ErrorCode::kInvalidArgument);
 
   XLA_FFI_Buffer buffer = {XLA_FFI_Buffer_STRUCT_SIZE};
-  std::array<uint8_t, kDeviceMemorySize> memory = {};
+  std::array<uint8_t, kRegisteredMemoryHandleSize> memory = {};
   uint64_t offset = 0;
-  error = collectives.GetDeviceMemory(
+  error = collectives.GetRegisteredMemoryHandle(
       /*buffer=*/nullptr,
       XLA_FFI_GpuCollective_NCCL_SYMMETRIC_MEMORY_ABI_SCHEMA, kNcclAbiVersion,
       memory.data(), memory.size(), &offset);
   EXPECT_EQ(error.errc(), ErrorCode::kInvalidArgument);
 
-  error = collectives.GetDeviceMemory(
+  error = collectives.GetRegisteredMemoryHandle(
       &buffer, XLA_FFI_GpuCollective_NCCL_SYMMETRIC_MEMORY_ABI_SCHEMA,
       kNcclAbiVersion, memory.data(), memory.size(), /*offset=*/nullptr);
   EXPECT_EQ(error.errc(), ErrorCode::kInvalidArgument);
@@ -393,17 +410,17 @@ TEST(GpuCollectivesTest, ChecksCompatibilityPerOperation) {
   EXPECT_FALSE(collectives.available());
 
   XLA_FFI_Buffer buffer = {XLA_FFI_Buffer_STRUCT_SIZE};
-  std::array<uint8_t, kDeviceMemorySize> memory = {};
+  std::array<uint8_t, kRegisteredMemoryHandleSize> memory = {};
   uint64_t offset = 0;
-  error = collectives.GetDeviceMemory(
+  error = collectives.GetRegisteredMemoryHandle(
       &buffer, XLA_FFI_GpuCollective_NCCL_SYMMETRIC_MEMORY_ABI_SCHEMA,
       kNcclAbiVersion, memory.data(), memory.size(), &offset);
   EXPECT_EQ(error.errc(), ErrorCode::kUnimplemented);
 
-  extension.extension_base.struct_size =
-      XLA_FFI_STRUCT_SIZE(XLA_FFI_GpuCollectives_Extension, get_device_memory);
+  extension.extension_base.struct_size = XLA_FFI_STRUCT_SIZE(
+      XLA_FFI_GpuCollectives_Extension, get_registered_memory_handle);
   EXPECT_TRUE(collectives.available());
-  error = collectives.GetDeviceMemory(
+  error = collectives.GetRegisteredMemoryHandle(
       &buffer, XLA_FFI_GpuCollective_NCCL_SYMMETRIC_MEMORY_ABI_SCHEMA,
       kNcclAbiVersion, memory.data(), memory.size(), &offset);
   EXPECT_TRUE(error.success()) << error.message();
@@ -467,6 +484,71 @@ TEST(GpuCollectivesTest, AcceptsFutureMinorAndLargerExtension) {
   GpuCollectives collectives(
       &api, reinterpret_cast<XLA_FFI_ExecutionContext*>(uintptr_t{1}));
   EXPECT_TRUE(collectives.available());
+}
+
+TEST(GpuCollectivesTest, DecodesInfoAsTypedContext) {
+  XLA_FFI_GpuCollectives_Extension extension = MakeExtension();
+  XLA_FFI_Api api = MakeApi(&extension.extension_base);
+  XLA_FFI_ExecutionContext* ctx =
+      reinterpret_cast<XLA_FFI_ExecutionContext*>(uintptr_t{1});
+  DiagnosticEngine diagnostic;
+
+  std::optional<DeviceCommunicationInfo> info =
+      CtxDecoding<DeviceCommunicationInfo>::Decode(&api, ctx, diagnostic);
+
+  ASSERT_TRUE(info.has_value()) << diagnostic.Result();
+  EXPECT_EQ(device_communication_info_call.ctx, ctx);
+  EXPECT_EQ(info->rank, 3);
+  EXPECT_EQ(info->team_size, 8);
+  EXPECT_EQ(info->topology, CommunicationTopology::kHierarchical);
+  EXPECT_TRUE(info->enabled_features.contains(
+      DeviceCommunicationFeature::kNetworkDeviceOperations));
+}
+
+TEST(GpuCollectivesTest, DecodesProviderDeviceCommAsTypedContext) {
+  XLA_FFI_GpuCollectives_Extension extension = MakeExtension();
+  XLA_FFI_Api api = MakeApi(&extension.extension_base);
+  DiagnosticEngine diagnostic;
+
+  std::optional<TestNcclDeviceComm> device_comm =
+      CtxDecoding<TestNcclDeviceCommCtx>::Decode(
+          &api, reinterpret_cast<XLA_FFI_ExecutionContext*>(uintptr_t{1}),
+          diagnostic);
+
+  ASSERT_TRUE(device_comm.has_value()) << diagnostic.Result();
+  EXPECT_EQ(device_comm_call.expected_abi_schema,
+            XLA_FFI_GpuCollective_NCCL_DEVICE_COMM_ABI_SCHEMA);
+  EXPECT_EQ(device_comm_call.expected_abi_version, kNcclAbiVersion);
+  EXPECT_EQ(device_comm_call.destination_size, sizeof(TestNcclDeviceComm));
+  EXPECT_EQ(device_comm->bytes[0], 0x5a);
+}
+
+TEST(GpuCollectivesTest, TypedContextsCanBeUsedInBinding) {
+  auto handler = Ffi::Bind()
+                     .Ctx<DeviceCommunicationInfo>()
+                     .Ctx<TestNcclDeviceCommCtx>()
+                     .To([](DeviceCommunicationInfo, TestNcclDeviceComm) {
+                       return Error::Success();
+                     });
+
+  EXPECT_NE(handler, nullptr);
+}
+
+TEST(GpuCollectivesTest, TypedContextReportsProviderFailure) {
+  XLA_FFI_GpuCollectives_Extension extension = MakeExtension();
+  extension.get_device_comm = GetDeviceCommUnavailable;
+  XLA_FFI_Api api = MakeApi(&extension.extension_base);
+  DiagnosticEngine diagnostic;
+
+  std::optional<TestNcclDeviceComm> device_comm =
+      CtxDecoding<TestNcclDeviceCommCtx>::Decode(
+          &api, reinterpret_cast<XLA_FFI_ExecutionContext*>(uintptr_t{1}),
+          diagnostic);
+
+  EXPECT_FALSE(device_comm.has_value());
+  EXPECT_EQ(diagnostic.Result(),
+            "Failed to get provider device communicator: device communicator "
+            "unavailable");
 }
 
 }  // namespace

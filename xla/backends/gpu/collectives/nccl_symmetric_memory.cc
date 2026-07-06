@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/backends/gpu/collectives/nccl_symmetric_memory.h"
 
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <thread>
@@ -28,6 +29,7 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/types/span.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/backends/gpu/collectives/cancellation_token.h"
 #include "xla/backends/gpu/collectives/nccl_errors.h"
@@ -279,7 +281,9 @@ std::string NcclSymmetricMemory::ToString() const {
 
 NcclSymmetricMemory::PackedKernelArg NcclSymmetricMemory::PackKernelArg()
     const {
-  return win_;
+  return PackedKernelArg(sizeof(win_), [&](absl::Span<char> packed) {
+    std::memcpy(packed.data(), &win_, sizeof(win_));
+  });
 }
 
 }  // namespace xla::gpu

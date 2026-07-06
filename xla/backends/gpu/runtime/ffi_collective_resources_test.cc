@@ -18,21 +18,26 @@ limitations under the License.
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/container/btree_set.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "xla/backends/gpu/collectives/loopback_collectives.h"
 #include "xla/backends/gpu/runtime/collective_clique_requests.h"
+#include "xla/backends/gpu/runtime/collective_memory.h"
 #include "xla/backends/gpu/runtime/collective_memory_requests.h"
 #include "xla/backends/gpu/runtime/collective_params.h"
 #include "xla/backends/gpu/runtime/thunk_id.h"
@@ -46,6 +51,7 @@ limitations under the License.
 #include "xla/service/gpu/gpu_executable_run_options.h"
 #include "xla/service/service_executable_run_options.h"
 #include "xla/service/shaped_slice.h"
+#include "xla/stream_executor/kernel_args.h"
 #include "xla/shape_util.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/platform.h"
@@ -121,6 +127,32 @@ Shape MakeU8Shape(int64_t size, int64_t memory_space) {
   shape.mutable_layout()->set_memory_space(memory_space);
   return shape;
 }
+
+class TestSymmetricMemory final : public SymmetricMemory {
+ public:
+  static constexpr uint64_t kAbiSchema = 0x746573745f6d656d;
+  static constexpr uint64_t kAbiVersion = 7;
+  using Handle = std::array<uint64_t, 5>;
+
+  TestSymmetricMemory(se::DeviceAddressBase address, Handle handle)
+      : SymmetricMemory(kAbiSchema, kAbiVersion),
+        address_(address),
+        handle_(handle) {}
+
+  se::DeviceAddressBase addr() const override { return address_; }
+
+  std::string ToString() const override { return "test symmetric memory"; }
+
+  PackedKernelArg PackKernelArg() const override {
+    return PackedKernelArg(sizeof(handle_), [&](absl::Span<char> packed) {
+      std::memcpy(packed.data(), handle_.data(), sizeof(handle_));
+    });
+  }
+
+ private:
+  se::DeviceAddressBase address_;
+  Handle handle_;
+};
 
 TEST(FfiCollectiveResourcesTest, CallsiteDomainIsStableAndIsolated) {
   FfiCollectiveResources first = MakeResources(ThunkId(7));
@@ -443,9 +475,20 @@ TEST(FfiCollectiveResourcesTest,
   EXPECT_EQ(memory_request[0].allocations,
             (absl::btree_set<BufferAllocation::Index>{0, 1}));
 
+  TestSymmetricMemory::Handle expected_handle = {11, 22, 33, 44, 55};
+  absl::flat_hash_map<CollectiveMemory::Key,
+                      std::shared_ptr<SymmetricMemory>>
+      symmetric_memories;
+  symmetric_memories.emplace(
+      CollectiveMemory::Key{clique_request[0].key, first.index()},
+      std::make_shared<TestSymmetricMemory>(addresses[0], expected_handle));
+  CollectiveMemory collective_memory(
+      buffers, std::move(symmetric_memories),
+      /*mcast_memories=*/{}, /*peer_memories=*/{});
+
   ASSERT_OK(resources.BeginInvocation(XLA_FFI_ExecutionStage_EXECUTE, &buffers,
                                       nullptr, nullptr, nullptr, nullptr,
-                                      nullptr));
+                                      &collective_memory));
   int64_t dim = 4;
   XLA_FFI_Buffer buffer{XLA_FFI_Buffer_STRUCT_SIZE,
                         /*extension_start=*/nullptr,
@@ -458,6 +501,24 @@ TEST(FfiCollectiveResourcesTest,
       FfiCollectiveResourcesTestPeer::FindBufferView(resources, buffer));
   EXPECT_EQ(std::get<0>(first_view), 0);
   EXPECT_EQ(std::get<1>(first_view), 12);
+
+  TestSymmetricMemory::Handle actual_handle = {};
+  XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args get_memory = {};
+  get_memory.struct_size =
+      XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args_STRUCT_SIZE;
+  get_memory.buffer = &buffer;
+  get_memory.expected_abi_schema = TestSymmetricMemory::kAbiSchema;
+  get_memory.expected_abi_version = TestSymmetricMemory::kAbiVersion;
+  get_memory.destination = actual_handle.data();
+  get_memory.destination_size = sizeof(actual_handle);
+  ASSERT_OK(resources.GetRegisteredMemoryHandle(&get_memory));
+  EXPECT_EQ(actual_handle, expected_handle);
+  EXPECT_EQ(get_memory.offset, 12);
+
+  get_memory.destination_size = sizeof(uint64_t);
+  EXPECT_THAT(resources.GetRegisteredMemoryHandle(&get_memory),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("destination size mismatch")));
 
   dim = 8;
   buffer.data = second_storage.data() + 24;

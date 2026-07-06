@@ -735,22 +735,24 @@ static XLA_FFI_Error* GpuCollectivesGetDeviceComm(
   return ToFfiError((*api)->GetDeviceComm(args));
 }
 
-static XLA_FFI_Error* GpuCollectivesGetDeviceMemory(
-    XLA_FFI_GpuCollectives_GetDeviceMemory_Args* args) {
+static XLA_FFI_Error* GpuCollectivesGetRegisteredMemoryHandle(
+    XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args* args) {
   if (args == nullptr) {
-    return ToFfiError(InvalidArgument("GetDeviceMemory args are null"));
+    return ToFfiError(
+        InvalidArgument("GetRegisteredMemoryHandle args are null"));
   }
   XLA_FFI_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
-      "XLA_FFI_GpuCollectives_GetDeviceMemory_Args",
-      XLA_FFI_GpuCollectives_GetDeviceMemory_Args_STRUCT_SIZE_V1_0,
+      "XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args",
+      XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args_STRUCT_SIZE_V1_0,
       args->struct_size));
   absl::Status stage =
-      ValidateDeviceCommunicationStage(args->ctx, "GetDeviceMemory");
+      ValidateDeviceCommunicationStage(args->ctx,
+                                       "GetRegisteredMemoryHandle");
   if (!stage.ok()) return ToFfiError(std::move(stage));
 
   absl::StatusOr<GpuCollectivesApi*> api = GetGpuCollectivesApi(args->ctx);
   if (!api.ok()) return ToFfiError(api.status());
-  return ToFfiError((*api)->GetDeviceMemory(args));
+  return ToFfiError((*api)->GetRegisteredMemoryHandle(args));
 }
 
 //===----------------------------------------------------------------------===//
@@ -767,7 +769,7 @@ const XLA_FFI_Api* GetXlaFfiApi() {
       XLA_FFI_GPU_COLLECTIVES_API_MAJOR,
       XLA_FFI_GPU_COLLECTIVES_API_MINOR,
       GpuCollectivesGetDeviceComm,
-      GpuCollectivesGetDeviceMemory,
+      GpuCollectivesGetRegisteredMemoryHandle,
       GpuCollectivesRequestDeviceCommunication,
       GpuCollectivesGetDeviceCommunicationInfo,
   };

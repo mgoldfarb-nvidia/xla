@@ -35,8 +35,8 @@ class GpuCollectivesApi {
       XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo_Args* args) = 0;
   virtual absl::Status GetDeviceComm(
       XLA_FFI_GpuCollectives_GetDeviceComm_Args* args) = 0;
-  virtual absl::Status GetDeviceMemory(
-      XLA_FFI_GpuCollectives_GetDeviceMemory_Args* args) = 0;
+  virtual absl::Status GetRegisteredMemoryHandle(
+      XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args* args) = 0;
 };
 
 }  // namespace xla::ffi

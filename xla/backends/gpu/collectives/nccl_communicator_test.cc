@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include <cstddef>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <utility>
@@ -29,6 +30,7 @@ limitations under the License.
 #include "xla/backends/gpu/collectives/collectives_test_util.h"
 #include "xla/backends/gpu/collectives/gpu_collectives.h"
 #include "xla/backends/gpu/collectives/gpu_communicator.h"
+#include "xla/backends/gpu/collectives/nccl_symmetric_memory.h"
 #include "xla/core/collectives/rank_id.h"
 #include "xla/core/collectives/reduction_kind.h"
 #include "xla/core/collectives/registered_memory.h"
@@ -201,8 +203,16 @@ TEST(NcclCommunicatorTest, NonBlockingDeviceResourceCreation) {
       auto symmetric_memory,
       AwaitSymmetricMemory(std::move(symmetric_memory_futures)));
   EXPECT_EQ(symmetric_memory.size(), 2);
-  EXPECT_NE(symmetric_memory[0]->PackKernelArg(), nullptr);
-  EXPECT_NE(symmetric_memory[1]->PackKernelArg(), nullptr);
+  for (const std::unique_ptr<SymmetricMemory>& memory : symmetric_memory) {
+    auto* nccl_memory = dynamic_cast<NcclSymmetricMemory*>(memory.get());
+    ASSERT_NE(nccl_memory, nullptr);
+
+    auto packed = memory->PackKernelArg();
+    ASSERT_EQ(packed.size_bytes(), sizeof(ncclWindow_t));
+    ncclWindow_t packed_win;
+    std::memcpy(&packed_win, packed.data(), sizeof(packed_win));
+    EXPECT_EQ(packed_win, nccl_memory->win());
+  }
   ASSERT_OK_AND_ASSIGN(se::DeviceAddressBase peer0,
                        symmetric_memory[0]->peer_addr(RankId(1)));
   ASSERT_OK_AND_ASSIGN(se::DeviceAddressBase peer1,

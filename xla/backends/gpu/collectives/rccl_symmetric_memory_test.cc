@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/backends/gpu/collectives/rccl_symmetric_memory.h"
 
 #include <cstddef>
+#include <cstring>
 #include <memory>
 #include <string>
 
@@ -118,8 +119,7 @@ TEST_F(RcclSymmetricMemoryTest, ToStringContainsExpectedFields) {
   EXPECT_THAT(str, HasSubstr("ptr="));
 }
 
-// Verifies that PackKernelArg() returns a non-null handle, and that the
-// win() accessor returns the same underlying ncclWindow_t.
+// Verifies that PackKernelArg() packs the window handle by value.
 // NOTE: RCCL returns a null ncclWindow_t for single-rank communicators (no
 // remote peers to establish a window with). This test is skipped in that case.
 TEST_F(RcclSymmetricMemoryTest, PackKernelArgReturnsValidWindowHandle) {
@@ -131,11 +131,11 @@ TEST_F(RcclSymmetricMemoryTest, PackKernelArgReturnsValidWindowHandle) {
            "communicators or RCCL versions without window support); "
            "skipping window-handle assertions.";
   }
-  // PackKernelArg() returns a void* (PackedKernelArg) wrapping the window.
   auto packed = symm_mem->PackKernelArg();
-  EXPECT_NE(packed, nullptr);
-  // win() returns the typed ncclWindow_t handle directly.
-  EXPECT_NE(symm_mem->win(), nullptr);
+  ASSERT_EQ(packed.size_bytes(), sizeof(ncclWindow_t));
+  ncclWindow_t packed_win;
+  std::memcpy(&packed_win, packed.data(), sizeof(packed_win));
+  EXPECT_EQ(packed_win, symm_mem->win());
 }
 
 // Verifies that multimem_addr() returns Unimplemented — RCCL does not support

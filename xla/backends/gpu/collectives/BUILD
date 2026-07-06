@@ -408,6 +408,7 @@ xla_test(
         ":gpu_collectives",
         ":gpu_communicator",
         ":nccl_or_rccl_collectives",  # buildcleaner: keep
+        ":nccl_symmetric_memory",
         "//xla:future",
         "//xla:xla_data_proto_cc",
         "//xla/core/collectives:rank_id",
@@ -707,6 +708,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
     ],
 )
 
@@ -1036,6 +1038,7 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/types:span",
         "@local_config_rocm//rocm:rccl",  # buildcleaner: keep
         "@local_config_rocm//rocm:rocm_headers",
     ],

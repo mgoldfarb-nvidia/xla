@@ -347,9 +347,10 @@ absl::Status FfiCollectiveResources::FinalizeDeviceCommunication() {
       return InvalidArgument(
           "Invalid collective-memory FFI buffer allocation or slice");
     }
-    // Empty FFI buffers do not need a provider window. GetDeviceMemory rejects
-    // empty views because providers do not define a useful packed argument for
-    // them, but their presence must not make Prepare fail.
+    // Empty FFI buffers do not need a provider window.
+    // GetRegisteredMemoryHandle rejects empty views because providers do not
+    // define a useful packed argument for them, but their presence must not
+    // make Prepare fail.
     if (buffer.size == 0) continue;
     if (std::find(allocations.begin(), allocations.end(), buffer.allocation) ==
         allocations.end()) {
@@ -570,7 +571,7 @@ FfiCollectiveResources::FindBufferView(const XLA_FFI_Buffer& buffer) const {
   }
   if (buffer_allocations_ == nullptr) {
     return FailedPrecondition(
-        "GetDeviceMemory requires runtime buffer allocations");
+        "GetRegisteredMemoryHandle requires runtime buffer allocations");
   }
 
   uintptr_t view_begin = reinterpret_cast<uintptr_t>(buffer.data);
@@ -655,15 +656,15 @@ FfiCollectiveResources::FindBufferView(const XLA_FFI_Buffer& buffer) const {
       "Device-communication buffer is not an FFI operand or result view");
 }
 
-absl::Status FfiCollectiveResources::GetDeviceMemory(
-    XLA_FFI_GpuCollectives_GetDeviceMemory_Args* args) {
-  RETURN_IF_ERROR(CheckStageForGet("GetDeviceMemory"));
+absl::Status FfiCollectiveResources::GetRegisteredMemoryHandle(
+    XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args* args) {
+  RETURN_IF_ERROR(CheckStageForGet("GetRegisteredMemoryHandle"));
   if (args == nullptr || args->buffer == nullptr) {
-    return InvalidArgument("GetDeviceMemory requires a buffer");
+    return InvalidArgument("GetRegisteredMemoryHandle requires a buffer");
   }
   if (collective_memory_ == nullptr) {
     return FailedPrecondition(
-        "GetDeviceMemory requires acquired collective memory");
+        "GetRegisteredMemoryHandle requires acquired collective memory");
   }
 
   ASSIGN_OR_RETURN(BufferView view, FindBufferView(*args->buffer));
@@ -677,7 +678,7 @@ absl::Status FfiCollectiveResources::GetDeviceMemory(
       collective_memory_->FindSymmetricMemory(collective_->key,
                                               view.allocation);
   if (symmetric_memory == nullptr) {
-    return NotFound("Registered device memory was not acquired");
+    return NotFound("Registered-memory handle was not acquired");
   }
   if (view.offset > std::numeric_limits<uint64_t>::max() - symmetric_offset) {
     return Internal("Device-memory view offset overflows");
@@ -692,8 +693,8 @@ absl::Status FfiCollectiveResources::GetDeviceMemory(
 
   SymmetricMemory::PackedKernelArg packed = symmetric_memory->PackKernelArg();
   RETURN_IF_ERROR(ValidateKernelArgDestination(
-      args->destination, args->destination_size, sizeof(packed)));
-  std::memcpy(args->destination, &packed, sizeof(packed));
+      args->destination, args->destination_size, packed.size_bytes()));
+  std::memcpy(args->destination, packed.data(), packed.size_bytes());
   args->offset = offset;
   return absl::OkStatus();
 }

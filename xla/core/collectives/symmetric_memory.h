@@ -90,9 +90,10 @@ class SymmetricMemory {
 
   virtual std::string ToString() const = 0;
 
-  // A packed kernel argument type for passing symmetric memory to device
-  // kernels (a platform-specific POD data type, happens to be a pointer).
-  using PackedKernelArg = void*;
+  // A packed kernel argument type for passing a provider-specific symmetric
+  // memory handle by value to device kernels without exposing its concrete
+  // type or size through this interface.
+  using PackedKernelArg = stream_executor::PackedKernelArg;
 
   // Checks that this provider's packed kernel argument ABI matches the ABI
   // expected by a separately compiled consumer.
@@ -122,6 +123,8 @@ class SymmetricMemory {
 
 }  // namespace xla
 
+// Pack provider-specific symmetric-memory handles as dynamically-sized opaque
+// kernel arguments.
 namespace stream_executor {
 template <>
 struct KernelArgPacking<xla::SymmetricMemory*> {

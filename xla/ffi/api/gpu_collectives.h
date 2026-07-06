@@ -20,6 +20,7 @@ limitations under the License.
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 #include "xla/ffi/api/c_api.h"
@@ -118,11 +119,21 @@ struct DeviceCommunicationInfo {
   uint32_t completion_slot_count = 0;
 };
 
+// Context tag for a provider-defined device communicator passed by value to an
+// FFI handler. The schema identifies the provider ABI, while the version must
+// exactly match the provider headers used to compile the handler.
+//
+// Example:
+//   using DeviceComm = ProviderDeviceComm<MyDeviceComm, kSchema, kVersion>;
+//   Ffi::Bind().Ctx<DeviceComm>().To([](MyDeviceComm comm) { ... });
+template <typename T, uint64_t abi_schema, uint64_t abi_version>
+struct ProviderDeviceComm {};
+
 // Header-only wrapper for the GPU device-communication C extension. XLA owns
 // resource selection, registration, and lifetime; handlers can retrieve the
-// resulting device communicator and each of any number of tagged device-memory
-// arguments independently. Buffer registration does not change normal FFI
-// argument/result access rules.
+// resulting device communicator and the provider's registered-memory handle
+// for each of any number of tagged buffers independently. Buffer registration
+// does not change normal FFI argument/result access rules.
 class GpuCollectives {
  public:
   GpuCollectives(const XLA_FFI_Api* api, XLA_FFI_ExecutionContext* ctx)
@@ -132,7 +143,7 @@ class GpuCollectives {
   // Individual version 1.1 operations perform their own compatibility checks.
   bool available() const {
     return CheckExtension(XLA_FFI_STRUCT_SIZE(XLA_FFI_GpuCollectives_Extension,
-                                              get_device_memory),
+                                              get_registered_memory_handle),
                           /*required_minor_version=*/0)
         .has_value();
   }
@@ -257,9 +268,11 @@ class GpuCollectives {
     return error ? TakeError(error) : Error::Success();
   }
 
-  Error GetDeviceMemory(AnyBuffer buffer, uint64_t expected_abi_schema,
-                        uint64_t expected_abi_version, void* destination,
-                        size_t destination_size, uint64_t* offset) const {
+  Error GetRegisteredMemoryHandle(AnyBuffer buffer,
+                                  uint64_t expected_abi_schema,
+                                  uint64_t expected_abi_version,
+                                  void* destination, size_t destination_size,
+                                  uint64_t* offset) const {
     AnyBuffer::Dimensions dimensions = buffer.dimensions();
     XLA_FFI_Buffer c_buffer = {
         XLA_FFI_Buffer_STRUCT_SIZE,
@@ -269,21 +282,23 @@ class GpuCollectives {
         static_cast<int64_t>(dimensions.size()),
         const_cast<int64_t*>(dimensions.begin()),
     };
-    return GetDeviceMemory(&c_buffer, expected_abi_schema, expected_abi_version,
-                           destination, destination_size, offset);
+    return GetRegisteredMemoryHandle(&c_buffer, expected_abi_schema,
+                                     expected_abi_version, destination,
+                                     destination_size, offset);
   }
 
-  Error GetDeviceMemory(const XLA_FFI_Buffer* buffer,
-                        uint64_t expected_abi_schema,
-                        uint64_t expected_abi_version, void* destination,
-                        size_t destination_size, uint64_t* offset) const {
+  Error GetRegisteredMemoryHandle(const XLA_FFI_Buffer* buffer,
+                                  uint64_t expected_abi_schema,
+                                  uint64_t expected_abi_version,
+                                  void* destination, size_t destination_size,
+                                  uint64_t* offset) const {
     ErrorOr<const XLA_FFI_GpuCollectives_Extension*> extension =
         CheckExtension(XLA_FFI_STRUCT_SIZE(XLA_FFI_GpuCollectives_Extension,
-                                           get_device_memory),
+                                           get_registered_memory_handle),
                        /*required_minor_version=*/0);
     if (!extension.has_value()) return extension.error();
-    if ((*extension)->get_device_memory == nullptr) {
-      return Unimplemented("GetDeviceMemory is unavailable");
+    if ((*extension)->get_registered_memory_handle == nullptr) {
+      return Unimplemented("GetRegisteredMemoryHandle is unavailable");
     }
     if (buffer == nullptr) {
       return Error::InvalidArgument("buffer must not be null");
@@ -298,8 +313,9 @@ class GpuCollectives {
       return Error::InvalidArgument("offset must not be null");
     }
 
-    XLA_FFI_GpuCollectives_GetDeviceMemory_Args args = {};
-    args.struct_size = XLA_FFI_GpuCollectives_GetDeviceMemory_Args_STRUCT_SIZE;
+    XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args args = {};
+    args.struct_size =
+        XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args_STRUCT_SIZE;
     args.ctx = ctx_;
     args.buffer = buffer;
     args.expected_abi_schema = expected_abi_schema;
@@ -307,7 +323,7 @@ class GpuCollectives {
     args.destination = destination;
     args.destination_size = destination_size;
 
-    XLA_FFI_Error* error = (*extension)->get_device_memory(&args);
+    XLA_FFI_Error* error = (*extension)->get_registered_memory_handle(&args);
     if (error != nullptr) return TakeError(error);
     *offset = args.offset;
     return Error::Success();
@@ -393,6 +409,50 @@ struct CtxDecoding<GpuCollectives> {
                                     XLA_FFI_ExecutionContext* ctx,
                                     DiagnosticEngine&) {
     return GpuCollectives(api, ctx);
+  }
+};
+
+// Decodes immutable, provider-neutral information about the resources XLA
+// acquired for this handler.
+template <>
+struct CtxDecoding<DeviceCommunicationInfo> {
+  using Type = DeviceCommunicationInfo;
+
+  static std::optional<Type> Decode(const XLA_FFI_Api* api,
+                                    XLA_FFI_ExecutionContext* ctx,
+                                    DiagnosticEngine& diagnostic) {
+    Type info;
+    Error error = GpuCollectives(api, ctx).GetInfo(&info);
+    if (!error.success()) {
+      return diagnostic.Emit("Failed to get device communication info: ")
+             << error.message();
+    }
+    return info;
+  }
+};
+
+// Decodes a provider-specific device communicator while keeping provider ABI
+// details out of the generic FFI C extension.
+template <typename T, uint64_t abi_schema, uint64_t abi_version>
+struct CtxDecoding<ProviderDeviceComm<T, abi_schema, abi_version>> {
+  using Type = T;
+
+  static_assert(std::is_trivially_copyable_v<Type>,
+                "provider device communicator must be trivially copyable");
+  static_assert(!std::is_array_v<Type>,
+                "provider device communicator must not be an array");
+
+  static std::optional<Type> Decode(const XLA_FFI_Api* api,
+                                    XLA_FFI_ExecutionContext* ctx,
+                                    DiagnosticEngine& diagnostic) {
+    Type device_comm{};
+    Error error = GpuCollectives(api, ctx).GetDeviceComm(
+        abi_schema, abi_version, &device_comm, sizeof(Type));
+    if (!error.success()) {
+      return diagnostic.Emit("Failed to get provider device communicator: ")
+             << error.message();
+    }
+    return device_comm;
   }
 };
 

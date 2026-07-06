@@ -188,7 +188,8 @@ enum {
 typedef XLA_FFI_Error* XLA_FFI_GpuCollectives_GetDeviceComm(
     XLA_FFI_GpuCollectives_GetDeviceComm_Args* args);
 
-// Returns the device-memory handle for a tagged FFI argument or result buffer.
+// Returns the provider's registered-memory handle for a tagged FFI argument or
+// result buffer.
 // A handler can retrieve any number of tagged buffers independently; no buffer
 // count or registration list is part of the API. For this callsite's
 // communication team, XLA registers each complete backing allocation once, and
@@ -198,9 +199,10 @@ typedef XLA_FFI_Error* XLA_FFI_GpuCollectives_GetDeviceComm(
 // custom-call operand/result (set by frontends with operands_memory_spaces/
 // results_memory_spaces). The provider kernel argument is copied into
 // caller-owned storage after validating the expected provider schema, ABI
-// version, and exact destination size. This operation is available during the
-// Initialize and Execute stages.
-struct XLA_FFI_GpuCollectives_GetDeviceMemory_Args {
+// version, and exact destination size. It is a provider-defined registration
+// handle, not buffer->data or an ordinary device pointer. This operation is
+// available during the Initialize and Execute stages.
+struct XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args {
   size_t struct_size;
   XLA_FFI_Extension_Base* extension_start;
 
@@ -213,15 +215,16 @@ struct XLA_FFI_GpuCollectives_GetDeviceMemory_Args {
   uint64_t offset;  // out: requested view offset in the registered allocation
 };
 
-XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_GpuCollectives_GetDeviceMemory_Args,
-                             offset);
+XLA_FFI_DEFINE_STRUCT_TRAITS(
+    XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args, offset);
 enum {
-  XLA_FFI_GpuCollectives_GetDeviceMemory_Args_STRUCT_SIZE_V1_0 =
-      XLA_FFI_STRUCT_SIZE(XLA_FFI_GpuCollectives_GetDeviceMemory_Args, offset)
+  XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args_STRUCT_SIZE_V1_0 =
+      XLA_FFI_STRUCT_SIZE(
+          XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args, offset)
 };
 
-typedef XLA_FFI_Error* XLA_FFI_GpuCollectives_GetDeviceMemory(
-    XLA_FFI_GpuCollectives_GetDeviceMemory_Args* args);
+typedef XLA_FFI_Error* XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle(
+    XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args* args);
 
 // GPU device-communication extension table.
 struct XLA_FFI_GpuCollectives_Extension {
@@ -230,7 +233,8 @@ struct XLA_FFI_GpuCollectives_Extension {
   int32_t api_minor_version;
 
   XLA_FFI_GpuCollectives_GetDeviceComm* get_device_comm;
-  XLA_FFI_GpuCollectives_GetDeviceMemory* get_device_memory;
+  XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle*
+      get_registered_memory_handle;
   XLA_FFI_GpuCollectives_RequestDeviceCommunication*
       request_device_communication;
   XLA_FFI_GpuCollectives_GetDeviceCommunicationInfo*

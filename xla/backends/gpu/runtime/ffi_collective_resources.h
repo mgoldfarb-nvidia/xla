@@ -108,8 +108,8 @@ class FfiCollectiveResources final : public ffi::GpuCollectivesApi {
 
   absl::Status GetDeviceComm(
       XLA_FFI_GpuCollectives_GetDeviceComm_Args* args) override;
-  absl::Status GetDeviceMemory(
-      XLA_FFI_GpuCollectives_GetDeviceMemory_Args* args) override;
+  absl::Status GetRegisteredMemoryHandle(
+      XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args* args) override;
 
   uint64_t resource_domain() const { return resource_domain_; }
 

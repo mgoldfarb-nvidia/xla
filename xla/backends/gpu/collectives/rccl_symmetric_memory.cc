@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/backends/gpu/collectives/rccl_symmetric_memory.h"
 
+#include <cstring>
 #include <memory>
 #include <string>
 
@@ -23,6 +24,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
+#include "absl/types/span.h"
 #include "xla/backends/gpu/collectives/rccl_errors.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/util.h"
@@ -64,7 +66,9 @@ std::string RcclSymmetricMemory::ToString() const {
 
 RcclSymmetricMemory::PackedKernelArg RcclSymmetricMemory::PackKernelArg()
     const {
-  return win_;
+  return PackedKernelArg(sizeof(win_), [&](absl::Span<char> packed) {
+    std::memcpy(packed.data(), &win_, sizeof(win_));
+  });
 }
 
 }  // namespace xla::gpu

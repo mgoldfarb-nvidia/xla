@@ -52,20 +52,20 @@ class TestGpuCollectivesApi final : public GpuCollectivesApi {
     return device_comm_status;
   }
 
-  absl::Status GetDeviceMemory(
-      XLA_FFI_GpuCollectives_GetDeviceMemory_Args*) override {
-    ++device_memory_gets;
-    return device_memory_status;
+  absl::Status GetRegisteredMemoryHandle(
+      XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args*) override {
+    ++registered_memory_handle_gets;
+    return registered_memory_handle_status;
   }
 
   absl::Status device_communication_request_status = absl::OkStatus();
   absl::Status device_communication_info_status = absl::OkStatus();
   absl::Status device_comm_status = absl::OkStatus();
-  absl::Status device_memory_status = absl::OkStatus();
+  absl::Status registered_memory_handle_status = absl::OkStatus();
   int device_communication_requests = 0;
   int device_communication_info_gets = 0;
   int device_comm_gets = 0;
-  int device_memory_gets = 0;
+  int registered_memory_handle_gets = 0;
 };
 
 const XLA_FFI_GpuCollectives_Extension* GpuCollectivesExtension() {
@@ -138,7 +138,7 @@ TEST(GpuCollectivesApiTest, RootApiPublishesVersionedExtension) {
   EXPECT_EQ(extension->api_major_version, XLA_FFI_GPU_COLLECTIVES_API_MAJOR);
   EXPECT_EQ(extension->api_minor_version, XLA_FFI_GPU_COLLECTIVES_API_MINOR);
   EXPECT_NE(extension->get_device_comm, nullptr);
-  EXPECT_NE(extension->get_device_memory, nullptr);
+  EXPECT_NE(extension->get_registered_memory_handle, nullptr);
   EXPECT_NE(extension->request_device_communication, nullptr);
   EXPECT_NE(extension->get_device_communication_info, nullptr);
 }
@@ -195,7 +195,7 @@ TEST(GpuCollectivesApiTest, RejectsNullOperationArgs) {
 
   EXPECT_EQ(TakeErrorCode(extension->get_device_comm(nullptr)),
             XLA_FFI_Error_Code_INVALID_ARGUMENT);
-  EXPECT_EQ(TakeErrorCode(extension->get_device_memory(nullptr)),
+  EXPECT_EQ(TakeErrorCode(extension->get_registered_memory_handle(nullptr)),
             XLA_FFI_Error_Code_INVALID_ARGUMENT);
   EXPECT_EQ(TakeErrorCode(extension->request_device_communication(nullptr)),
             XLA_FFI_Error_Code_INVALID_ARGUMENT);
@@ -341,17 +341,18 @@ TEST(GpuCollectivesApiTest, ForwardsOperationsAtAuthoritativeStages) {
 
   XLA_FFI_ExecutionContext execute =
       GpuContext(XLA_FFI_ExecutionStage_EXECUTE, &adapter);
-  XLA_FFI_GpuCollectives_GetDeviceMemory_Args device_memory = {};
-  device_memory.struct_size =
-      XLA_FFI_GpuCollectives_GetDeviceMemory_Args_STRUCT_SIZE;
-  device_memory.ctx = &execute;
-  EXPECT_EQ(GpuCollectivesExtension()->get_device_memory(&device_memory),
+  XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args memory_handle = {};
+  memory_handle.struct_size =
+      XLA_FFI_GpuCollectives_GetRegisteredMemoryHandle_Args_STRUCT_SIZE;
+  memory_handle.ctx = &execute;
+  EXPECT_EQ(GpuCollectivesExtension()->get_registered_memory_handle(
+                &memory_handle),
             nullptr);
 
   EXPECT_EQ(adapter.device_communication_requests, 1);
   EXPECT_EQ(adapter.device_communication_info_gets, 1);
   EXPECT_EQ(adapter.device_comm_gets, 1);
-  EXPECT_EQ(adapter.device_memory_gets, 1);
+  EXPECT_EQ(adapter.registered_memory_handle_gets, 1);
 }
 
 TEST(GpuCollectivesApiTest, PreservesAdapterStatusCode) {

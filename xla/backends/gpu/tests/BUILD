@@ -1263,6 +1263,7 @@ cc_binary(
     deps = [
         "//xla/ffi/api:c_api_gpu_collectives_nccl",
         "//xla/ffi/api:gpu_collectives",
+        "//xla/ffi/api:gpu_collectives_nccl",
     ] + if_cuda_is_configured([
         ":gpu_collectives_ffi_plugin_kernel",
         "@local_config_nccl//:nccl_headers",
