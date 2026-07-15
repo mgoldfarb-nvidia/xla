@@ -40,14 +40,19 @@ extern "C" {
 //
 //   Prepare:    Request, then Commit.
 //   Initialize: Initialize, then Resolve.
-//   Execute:    BeginCollective, if entry synchronization was requested.
+//   Execute:    EnqueueBarrierBeforeLaunch, if requested.
 //   Any stage:  Destroy after all device work using the resource has finished.
 //
 // The extension ABI is versioned independently from the root XLA FFI API.
 // Existing structs are frozen. A major version change may break compatibility.
 // A minor version may only append fields to the extension table or add new
-// structs; callers must use struct_size before reading an appended field.
-#define XLA_FFI_NCCL_COLLECTIVE_RESOURCES_ABI_MAJOR 1
+// structs. A client built against ABI 0.1 can use an XLA runtime providing ABI
+// 0.2 because 0.2 preserves the complete 0.1 table prefix. A client built
+// against ABI 0.2 must reject an XLA runtime providing only ABI 0.1. Clients
+// must require an exact major version, a runtime minor version greater than or
+// equal to the client minor version, and sufficient struct_size before reading
+// the table.
+#define XLA_FFI_NCCL_COLLECTIVE_RESOURCES_ABI_MAJOR 0
 #define XLA_FFI_NCCL_COLLECTIVE_RESOURCES_ABI_MINOR 1
 
 typedef struct XLA_FFI_NcclCollectiveResource XLA_FFI_NcclCollectiveResource;
@@ -306,7 +311,7 @@ typedef XLA_FFI_Error* XLA_FFI_NcclCollectiveResources_Resolve(
 // every rank in the NCCL LSA reaches the same boundary. This operation is
 // valid only during FFI Execute, only when Request set barrier_before_launch,
 // and at most once per resource. It does not synchronize multiple LSA teams.
-struct XLA_FFI_NcclCollectiveResources_BeginCollective_Args {
+struct XLA_FFI_NcclCollectiveResources_EnqueueBarrierBeforeLaunch_Args {
   size_t struct_size;
   XLA_FFI_Extension_Base* extension_start;
 
@@ -315,10 +320,11 @@ struct XLA_FFI_NcclCollectiveResources_BeginCollective_Args {
 };
 
 XLA_FFI_DEFINE_STRUCT_TRAITS(
-    XLA_FFI_NcclCollectiveResources_BeginCollective_Args, resource);
+    XLA_FFI_NcclCollectiveResources_EnqueueBarrierBeforeLaunch_Args, resource);
 
-typedef XLA_FFI_Error* XLA_FFI_NcclCollectiveResources_BeginCollective(
-    XLA_FFI_NcclCollectiveResources_BeginCollective_Args* args);
+typedef XLA_FFI_Error*
+XLA_FFI_NcclCollectiveResources_EnqueueBarrierBeforeLaunch(
+    XLA_FFI_NcclCollectiveResources_EnqueueBarrierBeforeLaunch_Args* args);
 
 // Releases the host-side token and resources owned specifically by it. This
 // does not synchronize a GPU stream or invalidate XLA's underlying buffer
@@ -336,11 +342,11 @@ XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_NcclCollectiveResources_Destroy_Args,
 typedef void XLA_FFI_NcclCollectiveResources_Destroy(
     XLA_FFI_NcclCollectiveResources_Destroy_Args* args);
 
-// Extension table published through XLA_FFI_Api::extension_start. Callers must
-// require an exact ABI major-version match. They may use fields introduced by a
-// minor version only when abi_minor_version and extension_base.struct_size both
-// include that field. Callers must also check optional callbacks for null.
-// destroy is required for every returned resource.
+// Extension table published through XLA_FFI_Api::extension_start. Minor
+// versions preserve this table as a prefix and append new fields at the end.
+// Callers must apply the version and struct-size rules documented above and
+// check optional callbacks for null. destroy is required for every returned
+// resource.
 struct XLA_FFI_NcclCollectiveResources_Extension {
   XLA_FFI_Extension_Base extension_base;
   int32_t abi_major_version;
@@ -350,21 +356,17 @@ struct XLA_FFI_NcclCollectiveResources_Extension {
   XLA_FFI_NcclCollectiveResources_Commit* commit;
   XLA_FFI_NcclCollectiveResources_Initialize* initialize;
   XLA_FFI_NcclCollectiveResources_Resolve* resolve;
-  XLA_FFI_NcclCollectiveResources_BeginCollective* begin_collective;
+  XLA_FFI_NcclCollectiveResources_EnqueueBarrierBeforeLaunch*
+      enqueue_barrier_before_launch;
   XLA_FFI_NcclCollectiveResources_Destroy* destroy;
-  // Added in ABI minor version 1. Appended to preserve existing field offsets.
   XLA_FFI_NcclCollectiveResources_QueryTopology* query_topology;
 };
 
 XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_NcclCollectiveResources_Extension,
                              query_topology);
 
-// Minimum table size for ABI 1.0. Later minor versions preserve this prefix.
-#define XLA_FFI_NCCL_COLLECTIVE_RESOURCES_ABI_1_0_STRUCT_SIZE \
-  XLA_FFI_STRUCT_SIZE(XLA_FFI_NcclCollectiveResources_Extension, destroy)
-
-// Minimum table size for ABI 1.1. Later minor versions preserve this prefix.
-#define XLA_FFI_NCCL_COLLECTIVE_RESOURCES_ABI_1_1_STRUCT_SIZE \
+// Minimum table size for ABI 0.1. Later minor versions preserve this prefix.
+#define XLA_FFI_NCCL_COLLECTIVE_RESOURCES_ABI_0_1_STRUCT_SIZE \
   XLA_FFI_STRUCT_SIZE(XLA_FFI_NcclCollectiveResources_Extension, query_topology)
 
 #ifdef __cplusplus

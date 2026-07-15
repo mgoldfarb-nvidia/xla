@@ -123,8 +123,8 @@ XLA_FFI_Error* QueryTopology(
   return nullptr;
 }
 
-XLA_FFI_Error* BeginCollective(
-    XLA_FFI_NcclCollectiveResources_BeginCollective_Args* args) {
+XLA_FFI_Error* EnqueueBarrierBeforeLaunch(
+    XLA_FFI_NcclCollectiveResources_EnqueueBarrierBeforeLaunch_Args* args) {
   TestState* state = GetState(args->resource);
   ++state->enqueue_count;
   EXPECT_EQ(args->ctx, state->context);
@@ -145,7 +145,7 @@ XLA_FFI_NcclCollectiveResources_Extension TestExtension() {
       Commit,
       Initialize,
       Resolve,
-      BeginCollective,
+      EnqueueBarrierBeforeLaunch,
       Destroy,
       QueryTopology,
   };
@@ -209,7 +209,7 @@ TEST(NcclCollectiveResourcesTest, DispatchesResourceLifecycle) {
                                                               addresses.size()))
                   .success());
   EXPECT_EQ(addresses, (std::vector<uint64_t>{100, 200}));
-  EXPECT_TRUE(resources.BeginCollective(*resource).success());
+  EXPECT_TRUE(resources.EnqueueBarrierBeforeLaunch(*resource).success());
   resource.reset();
 
   EXPECT_EQ(state.request_count, 1);
@@ -221,15 +221,13 @@ TEST(NcclCollectiveResourcesTest, DispatchesResourceLifecycle) {
   EXPECT_EQ(state.destroy_count, 1);
 }
 
-TEST(NcclCollectiveResourcesTest, SupportsOlderAbiMinorVersion) {
+TEST(NcclCollectiveResourcesTest, AcceptsNewerAbiMinorVersion) {
   TestState state;
   state.context = reinterpret_cast<XLA_FFI_ExecutionContext*>(&state);
   state.resource.state = &state;
 
   XLA_FFI_NcclCollectiveResources_Extension extension = TestExtension();
-  extension.extension_base.struct_size =
-      XLA_FFI_NCCL_COLLECTIVE_RESOURCES_ABI_1_0_STRUCT_SIZE;
-  extension.abi_minor_version = 0;
+  ++extension.abi_minor_version;
   XLA_FFI_Api api = {};
   api.struct_size = XLA_FFI_Api_STRUCT_SIZE;
   api.extension_start = &extension.extension_base;
@@ -241,9 +239,19 @@ TEST(NcclCollectiveResourcesTest, SupportsOlderAbiMinorVersion) {
   ASSERT_TRUE(requested.has_value()) << requested.error().message();
   ErrorOr<NcclCollectiveTopology> topology =
       resources.QueryTopology(**requested);
-  ASSERT_TRUE(topology.has_error());
-  EXPECT_EQ(topology.error().errc(), ErrorCode::kUnimplemented);
-  EXPECT_EQ(state.query_topology_count, 0);
+  ASSERT_TRUE(topology.has_value()) << topology.error().message();
+  EXPECT_EQ(state.query_topology_count, 1);
+}
+
+TEST(NcclCollectiveResourcesTest, RejectsOlderAbiMinorVersion) {
+  XLA_FFI_NcclCollectiveResources_Extension extension = TestExtension();
+  --extension.abi_minor_version;
+  XLA_FFI_Api api = {};
+  api.struct_size = XLA_FFI_Api_STRUCT_SIZE;
+  api.extension_start = &extension.extension_base;
+
+  NcclCollectiveResources resources(&api, /*ctx=*/nullptr);
+  EXPECT_FALSE(resources.available());
 }
 
 TEST(NcclCollectiveResourcesTest, RejectsIncompatibleAbiMajorVersion) {

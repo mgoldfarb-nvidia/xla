@@ -164,7 +164,7 @@ class NcclCollectiveResource {
 //
 //   Prepare:    Request, then Commit.
 //   Initialize: Initialize, then ResolveAddresses.
-//   Execute:    BeginCollective, if entry synchronization was requested.
+//   Execute:    EnqueueBarrierBeforeLaunch, if requested.
 //
 // The resource token must remain alive until all enqueued device work using its
 // addresses or barrier has completed.
@@ -296,10 +296,7 @@ class NcclCollectiveResources {
       const NcclCollectiveResource& resource) const {
     Error association = CheckResource(resource);
     if (association.failure()) return Unexpected(std::move(association));
-    if (extension_->abi_minor_version < 1 ||
-        extension_->extension_base.struct_size <
-            XLA_FFI_NCCL_COLLECTIVE_RESOURCES_ABI_1_1_STRUCT_SIZE ||
-        extension_->query_topology == nullptr) {
+    if (extension_->query_topology == nullptr) {
       return Unexpected(
           Unimplemented("NCCL collective topology operation is unavailable"));
     }
@@ -362,20 +359,21 @@ class NcclCollectiveResources {
   // Begins collective execution by enqueueing the entry synchronization
   // requested during Prepare. This may be called at most once and does not
   // synchronize multiple LSA teams.
-  Error BeginCollective(const NcclCollectiveResource& resource) const {
+  Error EnqueueBarrierBeforeLaunch(
+      const NcclCollectiveResource& resource) const {
     Error association = CheckResource(resource);
     if (association.failure()) return association;
-    if (extension_->begin_collective == nullptr) {
+    if (extension_->enqueue_barrier_before_launch == nullptr) {
       return Unimplemented(
-          "NCCL collective BeginCollective operation is unavailable");
+          "NCCL collective pre-launch barrier operation is unavailable");
     }
 
-    XLA_FFI_NcclCollectiveResources_BeginCollective_Args args = {};
+    XLA_FFI_NcclCollectiveResources_EnqueueBarrierBeforeLaunch_Args args = {};
     args.struct_size =
-        XLA_FFI_NcclCollectiveResources_BeginCollective_Args_STRUCT_SIZE;
+        XLA_FFI_NcclCollectiveResources_EnqueueBarrierBeforeLaunch_Args_STRUCT_SIZE;
     args.ctx = ctx_;
     args.resource = resource.resource_;
-    XLA_FFI_Error* error = extension_->begin_collective(&args);
+    XLA_FFI_Error* error = extension_->enqueue_barrier_before_launch(&args);
     return error == nullptr ? Error::Success() : TakeError(error);
   }
 
@@ -404,7 +402,7 @@ class NcclCollectiveResources {
           Unimplemented("NCCL collective-resources extension not found"));
     }
     if (extension_->extension_base.struct_size <
-        XLA_FFI_NCCL_COLLECTIVE_RESOURCES_ABI_1_0_STRUCT_SIZE) {
+        XLA_FFI_NCCL_COLLECTIVE_RESOURCES_ABI_0_1_STRUCT_SIZE) {
       return Unexpected(Unimplemented(
           "NCCL collective-resources extension table is incomplete"));
     }
@@ -414,9 +412,11 @@ class NcclCollectiveResources {
           Unimplemented("Incompatible NCCL collective-resources extension ABI "
                         "major version"));
     }
-    if (extension_->abi_minor_version < 0) {
+    if (extension_->abi_minor_version <
+        XLA_FFI_NCCL_COLLECTIVE_RESOURCES_ABI_MINOR) {
       return Unexpected(Unimplemented(
-          "Invalid NCCL collective-resources extension ABI minor version"));
+          "NCCL collective-resources extension ABI minor version is older "
+          "than the client requires"));
     }
     if (extension_->destroy == nullptr) {
       return Unexpected(Unimplemented(
