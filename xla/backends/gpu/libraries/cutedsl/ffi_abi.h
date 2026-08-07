@@ -24,17 +24,17 @@ namespace xla::gpu::cutedsl {
 
 // A POD descriptor matching cutlass.jax.types.JaxArray. Generated CuTeDSL
 // wrappers receive a pointer to one descriptor for each XLA buffer.
-struct CuteXlaFfiBuffer {
+struct alignas(8) CuteXlaFfiBuffer {
   void* buffer;
   const int64_t* shape;
 };
 
 static_assert(std::is_standard_layout_v<CuteXlaFfiBuffer>);
 static_assert(std::is_trivially_copyable_v<CuteXlaFfiBuffer>);
-static_assert(alignof(CuteXlaFfiBuffer) == alignof(void*));
-static_assert(sizeof(CuteXlaFfiBuffer) == 2 * sizeof(void*));
+static_assert(alignof(CuteXlaFfiBuffer) == 8);
+static_assert(sizeof(CuteXlaFfiBuffer) == 16);
 static_assert(offsetof(CuteXlaFfiBuffer, buffer) == 0);
-static_assert(offsetof(CuteXlaFfiBuffer, shape) == sizeof(void*));
+static_assert(offsetof(CuteXlaFfiBuffer, shape) == 8);
 
 // A host-only POD decoded by cutlass.jax.collective's outer JIT wrapper.
 struct alignas(8) CollectiveContextAbi {

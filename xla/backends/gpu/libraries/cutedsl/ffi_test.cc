@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include "xla/ffi/ffi.h"
+
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -20,7 +22,6 @@ limitations under the License.
 #include <vector>
 
 #include <gtest/gtest.h>
-#include "xla/ffi/ffi.h"
 #include "xla/hlo/builder/xla_computation.h"
 #include "xla/hlo/parser/hlo_parser.h"
 #include "xla/literal.h"
