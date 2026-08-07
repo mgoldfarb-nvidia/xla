@@ -16,6 +16,7 @@
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("//xla:xla.default.bzl", "xla_cc_binary", "xla_cc_test")
+load("//xla/tests:build_defs.bzl", "xla_test")
 load("//xla/tsl:tsl.bzl", "if_google")
 load("//xla/tsl/platform:build_config.bzl", "tf_proto_library")
 
@@ -310,5 +311,33 @@ xla_cc_test(
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",
         "@llvm-project//llvm:Support",
+    ],
+)
+
+xla_test(
+    name = "ffi_test",
+    srcs = ["ffi_test.cc"],
+    backends = ["b200"],
+    data = ["vector_add.hlo"],
+    target_compatible_with = if_google(
+        [],
+        ["@platforms//:incompatible"],
+    ),
+    deps = [
+        ":runtime",
+        "//xla:literal",
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
+        "//xla/ffi",
+        "//xla/hlo/builder:xla_computation",
+        "//xla/hlo/parser:hlo_parser",
+        "//xla/pjrt:pjrt_client",
+        "//xla/pjrt:pjrt_executable",
+        "//xla/pjrt/plugin/xla_gpu:xla_gpu_pjrt_client",
+        "//xla/stream_executor/cuda:cuda_platform",
+        "//xla/tsl/platform:env",
+        "//xla/tsl/platform:resource_loader",
+        "//xla/tsl/platform:status_matchers",
+        "@com_google_googletest//:gtest_main",
     ],
 )
