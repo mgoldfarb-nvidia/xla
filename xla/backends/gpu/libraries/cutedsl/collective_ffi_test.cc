@@ -17,11 +17,9 @@ limitations under the License.
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <future>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -108,7 +106,7 @@ constexpr GlobalDeviceId kDevice1(1);
 constexpr char kCollectiveTarget[] = "__xla_gpu_cutedsl_collective_v3";
 
 struct CapturedBuffer {
-  void *buffer;
+  void* buffer;
   std::vector<int64_t> shape;
 };
 
@@ -123,10 +121,10 @@ struct FakeRuntime {
   std::vector<std::string> invoked_function_prefixes;
   std::vector<size_t> expected_buffer_ranks;
   size_t expected_peer_address_count = 0;
-  void *stream = nullptr;
+  void* stream = nullptr;
   std::vector<CapturedBuffer> buffers;
   std::vector<uint64_t> peer_addresses;
-  const uint64_t *peer_addresses_pointer = nullptr;
+  const uint64_t* peer_addresses_pointer = nullptr;
   bool peer_addresses_pointer_is_null = false;
   int32_t rank = -1;
   int32_t clique_size = -1;
@@ -138,22 +136,21 @@ struct FakeRuntime {
   bool fail_get_function = false;
 };
 
-FakeRuntime *fake_runtime = nullptr;
+FakeRuntime* fake_runtime = nullptr;
 
-CuteDSLRT_Error_t ModuleCreate(CuteDSLRT_Module_t **module,
-                               const unsigned char *bytes, size_t size,
-                               const char **, size_t) {
+CuteDSLRT_Error_t ModuleCreate(CuteDSLRT_Module_t** module,
+                               const unsigned char* bytes, size_t size,
+                               const char**, size_t) {
   ++fake_runtime->create_count;
-  fake_runtime->module_bytes.assign(reinterpret_cast<const char *>(bytes),
-                                    size);
-  *module = reinterpret_cast<CuteDSLRT_Module_t *>(fake_runtime);
+  fake_runtime->module_bytes.assign(reinterpret_cast<const char*>(bytes), size);
+  *module = reinterpret_cast<CuteDSLRT_Module_t*>(fake_runtime);
   return CuteDSLRT_Error_Success;
 }
 
-CuteDSLRT_Error_t ModuleGetFunction(CuteDSLRT_Function_t **function,
-                                    CuteDSLRT_Module_t *module,
-                                    const char *prefix) {
-  EXPECT_EQ(module, reinterpret_cast<CuteDSLRT_Module_t *>(fake_runtime));
+CuteDSLRT_Error_t ModuleGetFunction(CuteDSLRT_Function_t** function,
+                                    CuteDSLRT_Module_t* module,
+                                    const char* prefix) {
+  EXPECT_EQ(module, reinterpret_cast<CuteDSLRT_Module_t*>(fake_runtime));
   ++fake_runtime->get_function_count;
   fake_runtime->function_prefixes.emplace_back(prefix);
   if (fake_runtime->fail_get_function) {
@@ -161,18 +158,18 @@ CuteDSLRT_Error_t ModuleGetFunction(CuteDSLRT_Function_t **function,
   }
   fake_runtime->function_handles.push_back(
       std::make_unique<FakeFunctionHandle>(FakeFunctionHandle{prefix}));
-  *function = reinterpret_cast<CuteDSLRT_Function_t *>(
+  *function = reinterpret_cast<CuteDSLRT_Function_t*>(
       fake_runtime->function_handles.back().get());
   return CuteDSLRT_Error_Success;
 }
 
-CuteDSLRT_Error_t FunctionRun(void *function, void **arguments,
+CuteDSLRT_Error_t FunctionRun(void* function, void** arguments,
                               size_t num_arguments) {
-  auto *handle = reinterpret_cast<FakeFunctionHandle *>(function);
+  auto* handle = reinterpret_cast<FakeFunctionHandle*>(function);
   auto loaded =
       std::find_if(fake_runtime->function_handles.begin(),
                    fake_runtime->function_handles.end(),
-                   [&](const std::unique_ptr<FakeFunctionHandle> &candidate) {
+                   [&](const std::unique_ptr<FakeFunctionHandle>& candidate) {
                      return candidate.get() == handle;
                    });
   if (loaded == fake_runtime->function_handles.end()) {
@@ -191,12 +188,12 @@ CuteDSLRT_Error_t FunctionRun(void *function, void **arguments,
   }
 
   size_t index = 0;
-  fake_runtime->stream = *reinterpret_cast<void **>(arguments[index++]);
-  void *context_address = *static_cast<void **>(arguments[index++]);
+  fake_runtime->stream = *reinterpret_cast<void**>(arguments[index++]);
+  void* context_address = *static_cast<void**>(arguments[index++]);
   fake_runtime->buffers.clear();
   for (size_t buffer_rank : fake_runtime->expected_buffer_ranks) {
-    auto *descriptor =
-        *reinterpret_cast<CuteXlaFfiBuffer **>(arguments[index++]);
+    auto* descriptor =
+        *reinterpret_cast<CuteXlaFfiBuffer**>(arguments[index++]);
     if (descriptor == nullptr ||
         (buffer_rank != 0 && descriptor->shape == nullptr)) {
       ADD_FAILURE() << "Invalid JaxArray descriptor";
@@ -235,75 +232,56 @@ CuteDSLRT_Error_t FunctionRun(void *function, void **arguments,
   }
   fake_runtime->rank = context.rank;
   fake_runtime->clique_size = context.clique_size;
-  *static_cast<int32_t *>(arguments[index++]) = fake_runtime->cuda_error;
+  *static_cast<int32_t*>(arguments[index++]) = fake_runtime->cuda_error;
   EXPECT_EQ(index, num_arguments);
   return CuteDSLRT_Error_Success;
 }
 
-CuteDSLRT_Error_t ModuleDestroy(CuteDSLRT_Module_t *module) {
-  EXPECT_EQ(module, reinterpret_cast<CuteDSLRT_Module_t *>(fake_runtime));
+CuteDSLRT_Error_t ModuleDestroy(CuteDSLRT_Module_t* module) {
+  EXPECT_EQ(module, reinterpret_cast<CuteDSLRT_Module_t*>(fake_runtime));
   ++fake_runtime->destroy_count;
   return CuteDSLRT_Error_Success;
 }
 
-const char *GetErrorName(CuteDSLRT_Error_t) { return "FakeRuntimeError"; }
-const char *GetErrorString(CuteDSLRT_Error_t) { return "fake failure"; }
+const char* GetErrorName(CuteDSLRT_Error_t) { return "FakeRuntimeError"; }
+const char* GetErrorString(CuteDSLRT_Error_t) { return "fake failure"; }
 
 const RuntimeApi kRuntimeApi = {
     ModuleCreate,  ModuleGetFunction, FunctionRun,
     ModuleDestroy, GetErrorName,      GetErrorString,
 };
 
-class NotifyingEvent final : public se::Event {
- public:
-  NotifyingEvent(std::shared_ptr<std::promise<void>> synchronized,
-                 std::shared_ptr<std::promise<void>> destroyed)
-      : synchronized_(std::move(synchronized)),
-        destroyed_(std::move(destroyed)) {}
-
-  ~NotifyingEvent() override { destroyed_->set_value(); }
-
-  absl::Status Synchronize() override {
-    synchronized_->set_value();
-    return absl::OkStatus();
-  }
-
- private:
-  std::shared_ptr<std::promise<void>> synchronized_;
-  std::shared_ptr<std::promise<void>> destroyed_;
-};
-
 }  // namespace
 
 #if defined(PLATFORM_GOOGLE)
 extern "C" CuteDSLRT_Error_t __wrap_CuteDSLRT_Module_Create_From_Bytes(
-    CuteDSLRT_Module_t **module, const unsigned char *bytes, size_t size,
-    const char **shared_libraries, size_t shared_library_count) {
+    CuteDSLRT_Module_t** module, const unsigned char* bytes, size_t size,
+    const char** shared_libraries, size_t shared_library_count) {
   return ModuleCreate(module, bytes, size, shared_libraries,
                       shared_library_count);
 }
 
 extern "C" CuteDSLRT_Error_t __wrap_CuteDSLRT_Module_Get_Function(
-    CuteDSLRT_Function_t **function, CuteDSLRT_Module_t *module,
-    const char *prefix) {
+    CuteDSLRT_Function_t** function, CuteDSLRT_Module_t* module,
+    const char* prefix) {
   return ModuleGetFunction(function, module, prefix);
 }
 
 extern "C" CuteDSLRT_Error_t __wrap_CuteDSLRT_Function_Run(
-    void *function, void **arguments, size_t argument_count) {
+    void* function, void** arguments, size_t argument_count) {
   return FunctionRun(function, arguments, argument_count);
 }
 
 extern "C" CuteDSLRT_Error_t __wrap_CuteDSLRT_Module_Destroy(
-    CuteDSLRT_Module_t *module) {
+    CuteDSLRT_Module_t* module) {
   return ModuleDestroy(module);
 }
 
-extern "C" const char *__wrap_CuteDSLRT_GetErrorName(CuteDSLRT_Error_t error) {
+extern "C" const char* __wrap_CuteDSLRT_GetErrorName(CuteDSLRT_Error_t error) {
   return GetErrorName(error);
 }
 
-extern "C" const char *__wrap_CuteDSLRT_GetErrorString(
+extern "C" const char* __wrap_CuteDSLRT_GetErrorString(
     CuteDSLRT_Error_t error) {
   return GetErrorString(error);
 }
@@ -313,7 +291,7 @@ namespace {
 
 class ScopedFakeRuntime {
  public:
-  explicit ScopedFakeRuntime(FakeRuntime *runtime) {
+  explicit ScopedFakeRuntime(FakeRuntime* runtime) {
 #if !defined(PLATFORM_GOOGLE)
     EXPECT_TRUE(internal::RegisterRuntimeApiForTest(&kRuntimeApi).ok());
 #endif
@@ -329,13 +307,13 @@ struct TestAttributes {
     wire::CollectiveCallConfigV3Wire config;
     config.set_abi_clique_size(abi_clique_size);
     config.set_barrier_before_launch(barrier_before_launch);
-    wire::CollectiveGroupWire *collective_group = config.mutable_group();
+    wire::CollectiveGroupWire* collective_group = config.mutable_group();
     collective_group->set_mode(
         static_cast<wire::CollectiveGroupWire::Mode>(group_mode + 1));
     collective_group->set_communication_id(communication_id);
     for (size_t group_index = 0; group_index + 1 < replica_group_offsets.size();
          ++group_index) {
-      wire::ReplicaGroupWire *group = collective_group->add_replica_groups();
+      wire::ReplicaGroupWire* group = collective_group->add_replica_groups();
       for (int64_t member_index = replica_group_offsets[group_index];
            member_index < replica_group_offsets[group_index + 1];
            ++member_index) {
@@ -343,7 +321,7 @@ struct TestAttributes {
       }
     }
     for (size_t offset = 0; offset + 5 < peer_regions.size(); offset += 6) {
-      wire::PeerRegionWire *region = config.add_peer_regions();
+      wire::PeerRegionWire* region = config.add_peer_regions();
       region->set_endpoint(static_cast<wire::PeerRegionWire::Endpoint>(
           peer_regions[offset] + 1));
       region->set_buffer_index(peer_regions[offset + 1]);
@@ -485,13 +463,13 @@ wire::PeerRegionProto Region(int64_t offset, int64_t size,
 wire::CollectiveCallConfigV3 ConfigWithRegions(
     absl::Span<const wire::PeerRegionProto> regions) {
   wire::CollectiveCallConfigV3 config;
-  for (const wire::PeerRegionProto &region : regions) {
+  for (const wire::PeerRegionProto& region : regions) {
     *config.add_peer_regions() = region;
   }
   return config;
 }
 
-uint64_t AddressValue(void *address, uint64_t offset = 0) {
+uint64_t AddressValue(void* address, uint64_t offset = 0) {
   return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(address)) + offset;
 }
 
@@ -534,14 +512,15 @@ class CollectiveFfiInvocation {
     ON_CALL(platform_, Name()).WillByDefault(ReturnRef(platform_name_));
     ON_CALL(executor_, HostMemoryAllocate(testing::_))
         .WillByDefault(
-            [](uint64_t size)
+            [this](uint64_t size)
                 -> absl::StatusOr<std::unique_ptr<se::MemoryAllocation>> {
+              ++host_allocation_count_;
               return std::make_unique<TestHostMemoryAllocation>(size);
             });
-    ON_CALL(stream_, Memcpy(testing::A<se::DeviceAddressBase *>(),
-                            testing::A<const void *>(), testing::_))
-        .WillByDefault([this](se::DeviceAddressBase *destination,
-                              const void *source, uint64_t size) {
+    ON_CALL(stream_, Memcpy(testing::A<se::DeviceAddressBase*>(),
+                            testing::A<const void*>(), testing::_))
+        .WillByDefault([this](se::DeviceAddressBase* destination,
+                              const void* source, uint64_t size) {
           ++h2d_copy_count_;
           if (destination == nullptr || destination->size() < size ||
               (size != 0 && (destination->is_null() || source == nullptr))) {
@@ -600,7 +579,7 @@ class CollectiveFfiInvocation {
     UpdateGpuContext();
   }
 
-  const absl::Status &status() const { return status_; }
+  const absl::Status& status() const { return status_; }
 
   absl::Status Instantiate() {
     if (!status_.ok()) return status_;
@@ -655,24 +634,25 @@ class CollectiveFfiInvocation {
     UpdateGpuContext();
   }
 
-  const CollectiveCliqueRequests &clique_requests() const {
+  const CollectiveCliqueRequests& clique_requests() const {
     return clique_requests_;
   }
 
-  const CollectiveMemoryRequests &memory_requests() const {
+  const CollectiveMemoryRequests& memory_requests() const {
     return *memory_requests_;
   }
 
-  se::MockStream &stream() { return stream_; }
-  se::MockStreamExecutor &executor() { return executor_; }
-  void *platform_stream() { return &fake_stream_handle_; }
+  se::MockStream& stream() { return stream_; }
+  se::MockStreamExecutor& executor() { return executor_; }
+  void* platform_stream() { return &fake_stream_handle_; }
   int h2d_copy_count() const { return h2d_copy_count_; }
+  int host_allocation_count() const { return host_allocation_count_; }
 
   void SetPeerAddressTableDimensions(std::array<int64_t, 2> dimensions) {
     peer_address_table_dimensions_ = dimensions;
   }
 
-  const uint64_t *peer_address_table_data() const {
+  const uint64_t* peer_address_table_data() const {
     return peer_address_table_.data();
   }
 
@@ -695,18 +675,18 @@ class CollectiveFfiInvocation {
 
   ffi::CallFrame BuildCallFrame() const {
     ffi::CallFrameBuilder builder(arguments_.size(), results_.size() + 1);
-    for (const se::DeviceAddressBase &argument : arguments_) {
+    for (const se::DeviceAddressBase& argument : arguments_) {
       std::array<int64_t, 1> dimensions = {
           static_cast<int64_t>(argument.size())};
       builder.AddBufferArg(argument, U8, dimensions);
     }
-    void *peer_address_table =
+    void* peer_address_table =
         peer_address_table_.empty() ? nullptr : peer_address_table_.data();
     builder.AddBufferRet(
         se::DeviceAddressBase(peer_address_table,
                               peer_address_table_.size() * sizeof(uint64_t)),
         U64, peer_address_table_dimensions_);
-    for (const se::DeviceAddressBase &result : results_) {
+    for (const se::DeviceAddressBase& result : results_) {
       std::array<int64_t, 1> dimensions = {static_cast<int64_t>(result.size())};
       builder.AddBufferRet(result, U8, dimensions);
     }
@@ -720,6 +700,7 @@ class CollectiveFfiInvocation {
   mutable std::vector<uint64_t> peer_address_table_;
   std::array<int64_t, 2> peer_address_table_dimensions_ = {};
   int h2d_copy_count_ = 0;
+  int host_allocation_count_ = 0;
   int fake_stream_handle_ = 0;
   std::string platform_name_ = "CUDA";
   NiceMock<se::MockPlatform> platform_;
@@ -894,7 +875,7 @@ TEST(CollectiveFfiPrepareTest, ResolvesEverySupportedCollectiveGroupMode) {
   ScopedFakeRuntime scoped_runtime(&runtime);
 
   struct TestCase {
-    const char *name;
+    const char* name;
     CollectiveOpGroupMode mode;
     std::vector<int64_t> group_offsets;
     std::vector<int64_t> group_members;
@@ -924,7 +905,7 @@ TEST(CollectiveFfiPrepareTest, ResolvesEverySupportedCollectiveGroupMode) {
        {kDevice0, GlobalDeviceId(3)}},
   }};
 
-  for (const TestCase &test_case : test_cases) {
+  for (const TestCase& test_case : test_cases) {
     SCOPED_TRACE(test_case.name);
     TestAttributes attributes;
     attributes.module = std::string("module for ") + test_case.name;
@@ -1188,12 +1169,7 @@ TEST(CollectiveFfiExecuteTest, ExecutesSingleCutlassCall) {
   ASSERT_THAT(invocation.Initialize(), IsOk());
   EXPECT_EQ(invocation.h2d_copy_count(), 0);
 
-  EXPECT_CALL(invocation.executor(), CreateEvent())
-      .WillOnce([]() -> absl::StatusOr<std::unique_ptr<se::Event>> {
-        return absl::UnavailableError("injected completion-event failure");
-      });
-  EXPECT_CALL(invocation.stream(), BlockHostUntilDone())
-      .WillOnce(Return(absl::OkStatus()));
+  EXPECT_CALL(invocation.executor(), CreateEvent()).Times(0);
   ASSERT_THAT(invocation.Execute(), IsOk());
   EXPECT_EQ(invocation.h2d_copy_count(), 0);
 
@@ -1207,7 +1183,7 @@ TEST(CollectiveFfiExecuteTest, ExecutesSingleCutlassCall) {
   EXPECT_EQ(runtime.clique_size, 2);
 }
 
-TEST(CollectiveFfiExecuteTest, RetainsResourcesUntilCompletionEvent) {
+TEST(CollectiveFfiExecuteTest, DoesNotCreateCompletionEventWithoutStaging) {
   FakeRuntime runtime;
   ScopedFakeRuntime scoped_runtime(&runtime);
 
@@ -1223,34 +1199,16 @@ TEST(CollectiveFfiExecuteTest, RetainsResourcesUntilCompletionEvent) {
   ASSERT_THAT(invocation.Prepare(), IsOk());
   ASSERT_THAT(invocation.Initialize(), IsOk());
 
-  auto synchronized = std::make_shared<std::promise<void>>();
-  std::future<void> synchronized_future = synchronized->get_future();
-  auto destroyed = std::make_shared<std::promise<void>>();
-  std::future<void> destroyed_future = destroyed->get_future();
-  se::Event *created_event = nullptr;
-  EXPECT_CALL(invocation.executor(), CreateEvent())
-      .WillOnce([&]() -> absl::StatusOr<std::unique_ptr<se::Event>> {
-        auto event = std::make_unique<NotifyingEvent>(synchronized, destroyed);
-        created_event = event.get();
-        return std::unique_ptr<se::Event>(std::move(event));
-      });
-  EXPECT_CALL(invocation.stream(), RecordEvent(testing::_))
-      .WillOnce([&](se::Event *recorded_event) {
-        EXPECT_EQ(recorded_event, created_event);
-        return absl::OkStatus();
-      });
+  EXPECT_CALL(invocation.executor(), CreateEvent()).Times(0);
+  EXPECT_CALL(invocation.stream(), RecordEvent(testing::_)).Times(0);
   EXPECT_CALL(invocation.stream(), BlockHostUntilDone()).Times(0);
   ASSERT_THAT(invocation.Execute(), IsOk());
 
-  EXPECT_EQ(synchronized_future.wait_for(std::chrono::seconds(5)),
-            std::future_status::ready);
-  EXPECT_EQ(destroyed_future.wait_for(std::chrono::seconds(5)),
-            std::future_status::ready);
   EXPECT_THAT(runtime.invoked_function_prefixes, ElementsAre("cutlass_call"));
 }
 
 TEST(CollectiveFfiExecuteTest,
-     CopiesRegionAddressesToDeviceAndPacksCanonicalLaunchFrame) {
+     CopiesRegionAddressesPacksLaunchFrameAndReusesStagingMemory) {
   FakeRuntime runtime;
   runtime.expected_buffer_ranks = {1, 1};
   runtime.expected_peer_address_count = 4;
@@ -1295,7 +1253,7 @@ TEST(CollectiveFfiExecuteTest,
   std::vector<CollectiveCliqueRequests::CliqueRequest> requests =
       invocation.clique_requests().OrderedRequestedCliques();
   ASSERT_EQ(requests.size(), 1);
-  const GpuCliqueKey &clique_key = requests[0].key;
+  const GpuCliqueKey& clique_key = requests[0].key;
 
   auto symmetric0 = std::make_shared<FakeSymmetricMemory>(
       local0.address(),
@@ -1312,7 +1270,7 @@ TEST(CollectiveFfiExecuteTest,
 
   ASSERT_THAT(invocation.Initialize(), IsOk());
   EXPECT_EQ(invocation.h2d_copy_count(), 0);
-  const uint64_t *initialized_table = invocation.peer_address_table_data();
+  const uint64_t* initialized_table = invocation.peer_address_table_data();
   invocation.RelocatePeerAddressTable();
   ASSERT_NE(invocation.peer_address_table_data(), initialized_table);
   EXPECT_CALL(invocation.executor(), CreateEvent())
@@ -1323,6 +1281,12 @@ TEST(CollectiveFfiExecuteTest,
       .WillOnce(Return(absl::OkStatus()));
   ASSERT_THAT(invocation.Execute(), IsOk());
   EXPECT_EQ(invocation.h2d_copy_count(), 1);
+  EXPECT_EQ(invocation.host_allocation_count(), 1);
+
+  invocation.ResetPerExecutionState();
+  ASSERT_THAT(invocation.Prepare(), IsOk());
+  ASSERT_THAT(invocation.Initialize(), IsOk());
+  EXPECT_EQ(invocation.host_allocation_count(), 1);
 
   EXPECT_EQ(runtime.run_count, 1);
   EXPECT_EQ(runtime.stream, invocation.platform_stream());
@@ -1360,12 +1324,7 @@ TEST(CollectiveFfiExecuteTest, PropagatesCudaErrorWrittenByGeneratedFunction) {
   ASSERT_THAT(invocation.Prepare(), IsOk());
   ASSERT_THAT(invocation.Initialize(), IsOk());
 
-  EXPECT_CALL(invocation.executor(), CreateEvent())
-      .WillOnce([]() -> absl::StatusOr<std::unique_ptr<se::Event>> {
-        return absl::UnavailableError("injected completion-event failure");
-      });
-  EXPECT_CALL(invocation.stream(), BlockHostUntilDone())
-      .WillOnce(Return(absl::OkStatus()));
+  EXPECT_CALL(invocation.executor(), CreateEvent()).Times(0);
   EXPECT_THAT(invocation.Execute(),
               StatusIs(absl::StatusCode::kInternal,
                        HasSubstr("returned CUDA error 719")));
@@ -1720,7 +1679,7 @@ TEST(CollectiveFfiPeerAddressesTest, RejectsAddressOverflow) {
   constexpr uintptr_t kNearAddressLimit =
       std::numeric_limits<uintptr_t>::max() - 7;
   se::DeviceAddressBase overflowing_peer(
-      reinterpret_cast<void *>(kNearAddressLimit), /*size=*/64);
+      reinterpret_cast<void*>(kNearAddressLimit), /*size=*/64);
   auto symmetric = std::make_shared<FakeSymmetricMemory>(
       local.address(),
       std::vector<se::DeviceAddressBase>{local.address(), overflowing_peer});

@@ -26,12 +26,14 @@ limitations under the License.
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
@@ -103,6 +105,95 @@ constexpr size_t kInlineBufferCount = 8;
 static_assert(sizeof(void*) == sizeof(uint64_t));
 static_assert(sizeof(uintptr_t) <= sizeof(uint64_t));
 
+struct CollectiveCallPreparedState {
+  GpuCliqueKey clique_key;
+  RankId rank;
+  int32_t clique_size;
+  se::StreamExecutor* executor;
+  std::shared_ptr<LoadedModule> module;
+  LoadedModule::FunctionHandle function;
+};
+
+struct BarrierBacking {
+  std::unique_ptr<se::MemoryAllocation> signal_buffer;
+  std::unique_ptr<se::MemoryAllocation> signal_value;
+};
+
+// Fields are declared so that reverse-order destruction releases the symmetric
+// registration before its backing allocations.
+struct BarrierResources {
+  std::shared_ptr<BarrierBacking> backing;
+  tsl::TiedRef<SymmetricMemory> symmetric_memory_ref;
+  std::shared_ptr<SymmetricMemory> symmetric_memory;
+  std::vector<se::DeviceAddressBase> peer_addresses;
+};
+
+struct BarrierCacheEntry {
+  bool IsIdle() const ABSL_SHARED_LOCKS_REQUIRED(mutex) {
+    return !initializing;
+  }
+
+  absl::Mutex mutex;
+  bool initializing ABSL_GUARDED_BY(mutex) = false;
+  std::shared_ptr<BarrierBacking> backing ABSL_GUARDED_BY(mutex);
+  std::shared_ptr<BarrierResources> resources ABSL_GUARDED_BY(mutex);
+};
+
+class ExecutionResourcePool {
+ public:
+  absl::StatusOr<std::unique_ptr<se::MemoryAllocation>> AcquireHostAllocation(
+      se::StreamExecutor* executor, uint64_t size) {
+    {
+      absl::MutexLock lock(&mutex_);
+      auto& allocations = host_allocations_[executor];
+      auto allocation = std::find_if(
+          allocations.begin(), allocations.end(),
+          [size](const std::unique_ptr<se::MemoryAllocation>& candidate) {
+            return candidate->address().size() >= size;
+          });
+      if (allocation != allocations.end()) {
+        std::unique_ptr<se::MemoryAllocation> result = std::move(*allocation);
+        allocations.erase(allocation);
+        return result;
+      }
+    }
+    return executor->HostMemoryAllocate(size);
+  }
+
+  absl::StatusOr<std::unique_ptr<se::Event>> AcquireEvent(
+      se::StreamExecutor* executor) {
+    {
+      absl::MutexLock lock(&mutex_);
+      auto& events = events_[executor];
+      if (!events.empty()) {
+        std::unique_ptr<se::Event> event = std::move(events.back());
+        events.pop_back();
+        return event;
+      }
+    }
+    return executor->CreateEvent();
+  }
+
+  void Release(se::StreamExecutor* executor,
+               std::unique_ptr<se::MemoryAllocation> host_allocation,
+               std::unique_ptr<se::Event> event) {
+    absl::MutexLock lock(&mutex_);
+    if (host_allocation != nullptr) {
+      host_allocations_[executor].push_back(std::move(host_allocation));
+    }
+    if (event != nullptr) events_[executor].push_back(std::move(event));
+  }
+
+ private:
+  absl::Mutex mutex_;
+  absl::flat_hash_map<se::StreamExecutor*,
+                      std::vector<std::unique_ptr<se::MemoryAllocation>>>
+      host_allocations_ ABSL_GUARDED_BY(mutex_);
+  absl::flat_hash_map<se::StreamExecutor*,
+                      std::vector<std::unique_ptr<se::Event>>>
+      events_ ABSL_GUARDED_BY(mutex_);
+};
+
 class CollectiveCallState {
  public:
   CollectiveCallState(wire::CollectiveCallConfigV3 config, ModuleImage image)
@@ -114,42 +205,42 @@ class CollectiveCallState {
     return module_loader_.GetOrLoad(image_);
   }
 
+  std::shared_ptr<BarrierCacheEntry> GetBarrierCacheEntry(
+      se::StreamExecutor* executor, const GpuCliqueKey& clique_key) {
+    absl::MutexLock lock(&barrier_cache_mutex_);
+    auto& entry = barrier_cache_[executor][clique_key];
+    if (entry == nullptr) entry = std::make_shared<BarrierCacheEntry>();
+    return entry;
+  }
+
+  const std::shared_ptr<ExecutionResourcePool>& execution_resource_pool() {
+    return execution_resource_pool_;
+  }
+
  private:
   const wire::CollectiveCallConfigV3 config_;
   ModuleImage image_;
   ModuleLoader module_loader_;
-};
-
-struct CollectiveCallPreparedState {
-  GpuCliqueKey clique_key;
-  RankId rank;
-  int32_t clique_size;
-  se::StreamExecutor* executor;
-  std::shared_ptr<LoadedModule> module;
-  LoadedModule::FunctionHandle function;
-};
-
-// Fields are declared so that reverse-order destruction releases the symmetric
-// registration before either backing allocation.
-struct BarrierResources {
-  std::unique_ptr<se::MemoryAllocation> signal_buffer;
-  std::unique_ptr<se::MemoryAllocation> signal_value;
-  tsl::TiedRef<SymmetricMemory> symmetric_memory_ref;
-  std::shared_ptr<SymmetricMemory> symmetric_memory;
-  std::vector<se::DeviceAddressBase> peer_addresses;
+  absl::Mutex barrier_cache_mutex_;
+  absl::flat_hash_map<
+      se::StreamExecutor*,
+      absl::flat_hash_map<GpuCliqueKey, std::shared_ptr<BarrierCacheEntry>>>
+      barrier_cache_ ABSL_GUARDED_BY(barrier_cache_mutex_);
+  std::shared_ptr<ExecutionResourcePool> execution_resource_pool_ =
+      std::make_shared<ExecutionResourcePool>();
 };
 
 struct CollectiveCallInitializedState {
   se::StreamExecutor* executor;
   size_t peer_address_count;
-  std::shared_ptr<se::MemoryAllocation> peer_addresses_host;
+  std::unique_ptr<se::MemoryAllocation> peer_addresses_host;
   std::shared_ptr<BarrierResources> barrier;
 };
 
 struct RetainedExecutionResources {
-  std::shared_ptr<LoadedModule> module;
-  std::shared_ptr<BarrierResources> barrier;
-  std::shared_ptr<se::MemoryAllocation> peer_addresses_host;
+  se::StreamExecutor* executor;
+  std::shared_ptr<ExecutionResourcePool> pool;
+  std::unique_ptr<se::MemoryAllocation> peer_addresses_host;
 };
 
 using PeerAddressTableResult = ffi::Result<ffi::BufferR2<U64>>;
@@ -646,7 +737,8 @@ absl::StatusOr<std::unique_ptr<CollectiveCallPreparedState>> Prepare(
 }
 
 absl::StatusOr<std::shared_ptr<BarrierResources>> InitializeBarrier(
-    se::Stream* stream, const CollectiveCallPreparedState& prepared,
+    se::Stream* stream, CollectiveCallState& state,
+    const CollectiveCallPreparedState& prepared,
     CollectiveCliques& collective_cliques) {
   if (prepared.clique_size > se::gpu::MultiGpuBarrierKernel::kMaxPeers) {
     return absl::InvalidArgumentError(absl::StrFormat(
@@ -655,86 +747,134 @@ absl::StatusOr<std::shared_ptr<BarrierResources>> InitializeBarrier(
         prepared.clique_size, se::gpu::MultiGpuBarrierKernel::kMaxPeers));
   }
 
-  ABSL_ASSIGN_OR_RETURN(
-      std::unique_ptr<se::MemoryAllocator> collective_allocator,
-      stream->parent()->CreateMemoryAllocator(se::MemorySpace::kCollective));
-  auto resources = std::make_shared<BarrierResources>();
-  ABSL_ASSIGN_OR_RETURN(
-      resources->signal_buffer,
-      collective_allocator->Allocate(GetMultiGpuBarrierSignalBufferSize()));
-  ABSL_ASSIGN_OR_RETURN(
-      resources->signal_value,
-      collective_allocator->Allocate(GetMultiGpuBarrierSignalValueSize()));
+  std::shared_ptr<BarrierCacheEntry> entry =
+      state.GetBarrierCacheEntry(prepared.executor, prepared.clique_key);
+  std::shared_ptr<BarrierBacking> backing;
+  bool created_backing = false;
+  {
+    absl::MutexLock lock(&entry->mutex);
+    entry->mutex.Await(
+        absl::Condition(entry.get(), &BarrierCacheEntry::IsIdle));
+    if (entry->resources != nullptr &&
+        !entry->resources->symmetric_memory_ref.Expired()) {
+      return entry->resources;
+    }
+    entry->initializing = true;
+    backing = entry->backing;
+  }
 
-  if (resources->signal_buffer == nullptr ||
-      resources->signal_buffer->address().is_null() ||
-      resources->signal_buffer->address().size() <
+  if (backing == nullptr) {
+    created_backing = true;
+    absl::StatusOr<std::unique_ptr<se::MemoryAllocator>> allocator =
+        stream->parent()->CreateMemoryAllocator(se::MemorySpace::kCollective);
+    if (!allocator.ok()) {
+      absl::MutexLock lock(&entry->mutex);
+      entry->initializing = false;
+      return allocator.status();
+    }
+    backing = std::make_shared<BarrierBacking>();
+    absl::StatusOr<std::unique_ptr<se::MemoryAllocation>> signal_buffer =
+        (*allocator)->Allocate(GetMultiGpuBarrierSignalBufferSize());
+    if (!signal_buffer.ok()) {
+      absl::MutexLock lock(&entry->mutex);
+      entry->initializing = false;
+      return signal_buffer.status();
+    }
+    backing->signal_buffer = std::move(*signal_buffer);
+    absl::StatusOr<std::unique_ptr<se::MemoryAllocation>> signal_value =
+        (*allocator)->Allocate(GetMultiGpuBarrierSignalValueSize());
+    if (!signal_value.ok()) {
+      absl::MutexLock lock(&entry->mutex);
+      entry->initializing = false;
+      return signal_value.status();
+    }
+    backing->signal_value = std::move(*signal_value);
+  }
+
+  if (backing->signal_buffer == nullptr ||
+      backing->signal_buffer->address().is_null() ||
+      backing->signal_buffer->address().size() <
           GetMultiGpuBarrierSignalBufferSize() ||
-      resources->signal_value == nullptr ||
-      resources->signal_value->address().is_null() ||
-      resources->signal_value->address().size() <
+      backing->signal_value == nullptr ||
+      backing->signal_value->address().is_null() ||
+      backing->signal_value->address().size() <
           GetMultiGpuBarrierSignalValueSize()) {
+    absl::MutexLock lock(&entry->mutex);
+    entry->initializing = false;
     return absl::ResourceExhaustedError(
         "Failed to allocate CuTeDSL collective barrier control memory");
   }
 
   se::DeviceAddressBase signal_buffer =
-      resources->signal_buffer->address().GetByteSlice(
+      backing->signal_buffer->address().GetByteSlice(
           0, GetMultiGpuBarrierSignalBufferSize());
   se::DeviceAddressBase signal_value =
-      resources->signal_value->address().GetByteSlice(
+      backing->signal_value->address().GetByteSlice(
           0, GetMultiGpuBarrierSignalValueSize());
-  ABSL_RETURN_IF_ERROR(stream->MemZero(&signal_buffer, signal_buffer.size()));
-  ABSL_RETURN_IF_ERROR(stream->MemZero(&signal_value, signal_value.size()));
-  // Initialization must complete before any rank registers and launches the
-  // monotonic barrier state.
-  ABSL_RETURN_IF_ERROR(stream->BlockHostUntilDone());
-
-  ABSL_ASSIGN_OR_RETURN(
-      GpuCommunicator * communicator,
-      collective_cliques.GetComm(prepared.clique_key, prepared.rank));
-  ABSL_ASSIGN_OR_RETURN(std::unique_ptr<SymmetricMemory> symmetric_memory,
-                        communicator->CreateSymmetricMemory(signal_buffer));
-  ABSL_ASSIGN_OR_RETURN(
-      resources->symmetric_memory_ref,
-      collective_cliques.Tie(prepared.clique_key, std::move(symmetric_memory)));
-  resources->symmetric_memory = resources->symmetric_memory_ref.Lock();
-  if (resources->symmetric_memory == nullptr) {
-    return absl::InternalError(
-        "CuTeDSL collective barrier registration expired during Initialize");
-  }
-
-  // The tied reference keeps the registration associated with the cached XLA
-  // clique, while the locked shared pointer keeps it alive through deferred
-  // stream completion cleanup. NCCL's implementation also retains its shared
-  // communicator state. Both handles are released before backing allocations.
-  se::DeviceAddressBase barrier_backing = resources->symmetric_memory->addr();
-  if (barrier_backing.opaque() != signal_buffer.opaque() ||
-      barrier_backing.size() < signal_buffer.size()) {
-    return absl::FailedPreconditionError(
-        "CuTeDSL collective barrier symmetric-memory backing address does not "
-        "match its XLA allocation");
-  }
-
-  resources->peer_addresses.reserve(prepared.clique_size);
-  for (int32_t peer = 0; peer < prepared.clique_size; ++peer) {
-    se::DeviceAddressBase peer_address;
-    if (peer == prepared.rank.value()) {
-      peer_address = signal_buffer;
-    } else {
-      ABSL_ASSIGN_OR_RETURN(
-          peer_address, resources->symmetric_memory->peer_addr(RankId(peer)));
+  absl::StatusOr<std::shared_ptr<BarrierResources>> initialized =
+      [&]() -> absl::StatusOr<std::shared_ptr<BarrierResources>> {
+    if (created_backing) {
+      ABSL_RETURN_IF_ERROR(
+          stream->MemZero(&signal_buffer, signal_buffer.size()));
+      ABSL_RETURN_IF_ERROR(stream->MemZero(&signal_value, signal_value.size()));
+      // Barrier state is monotonic, so zeroing is required only when the
+      // backing allocations are first created.
+      ABSL_RETURN_IF_ERROR(stream->BlockHostUntilDone());
     }
-    if (peer_address.is_null() || peer_address.size() < signal_buffer.size()) {
-      return absl::FailedPreconditionError(absl::StrFormat(
-          "CuTeDSL collective barrier peer address for rank %d is unavailable "
-          "or too small",
-          peer));
+
+    auto resources = std::make_shared<BarrierResources>();
+    resources->backing = backing;
+    ABSL_ASSIGN_OR_RETURN(
+        GpuCommunicator * communicator,
+        collective_cliques.GetComm(prepared.clique_key, prepared.rank));
+    ABSL_ASSIGN_OR_RETURN(std::unique_ptr<SymmetricMemory> symmetric_memory,
+                          communicator->CreateSymmetricMemory(signal_buffer));
+    ABSL_ASSIGN_OR_RETURN(resources->symmetric_memory_ref,
+                          collective_cliques.Tie(prepared.clique_key,
+                                                 std::move(symmetric_memory)));
+    resources->symmetric_memory = resources->symmetric_memory_ref.Lock();
+    if (resources->symmetric_memory == nullptr) {
+      return absl::InternalError(
+          "CuTeDSL collective barrier registration expired during "
+          "Initialize");
     }
-    resources->peer_addresses.push_back(
-        peer_address.GetByteSlice(0, signal_buffer.size()));
-  }
-  return resources;
+
+    se::DeviceAddressBase registered = resources->symmetric_memory->addr();
+    if (registered.opaque() != signal_buffer.opaque() ||
+        registered.size() < signal_buffer.size()) {
+      return absl::FailedPreconditionError(
+          "CuTeDSL collective barrier symmetric-memory backing address does "
+          "not match its XLA allocation");
+    }
+
+    resources->peer_addresses.reserve(prepared.clique_size);
+    for (int32_t peer = 0; peer < prepared.clique_size; ++peer) {
+      se::DeviceAddressBase peer_address;
+      if (peer == prepared.rank.value()) {
+        peer_address = signal_buffer;
+      } else {
+        ABSL_ASSIGN_OR_RETURN(
+            peer_address, resources->symmetric_memory->peer_addr(RankId(peer)));
+      }
+      if (peer_address.is_null() ||
+          peer_address.size() < signal_buffer.size()) {
+        return absl::FailedPreconditionError(absl::StrFormat(
+            "CuTeDSL collective barrier peer address for rank %d is "
+            "unavailable or too small",
+            peer));
+      }
+      resources->peer_addresses.push_back(
+          peer_address.GetByteSlice(0, signal_buffer.size()));
+    }
+    return resources;
+  }();
+
+  absl::MutexLock lock(&entry->mutex);
+  entry->initializing = false;
+  if (!initialized.ok()) return initialized.status();
+  entry->backing = std::move(backing);
+  entry->resources = *initialized;
+  return *initialized;
 }
 
 absl::StatusOr<std::unique_ptr<CollectiveCallInitializedState>> Initialize(
@@ -777,13 +917,14 @@ absl::StatusOr<std::unique_ptr<CollectiveCallInitializedState>> Initialize(
 
   // XLA may reuse the result allocation before this thunk executes. Keep only
   // pinned staging data in Initialize and populate the result in Execute.
-  std::shared_ptr<se::MemoryAllocation> peer_addresses_host;
+  std::unique_ptr<se::MemoryAllocation> peer_addresses_host;
   if (!peer_addresses.empty()) {
     ABSL_ASSIGN_OR_RETURN(uint64_t peer_addresses_size,
                           PeerAddressTableByteSize(peer_addresses.size()));
     ABSL_ASSIGN_OR_RETURN(
         std::unique_ptr<se::MemoryAllocation> allocation,
-        prepared->executor->HostMemoryAllocate(peer_addresses_size));
+        state->execution_resource_pool()->AcquireHostAllocation(
+            prepared->executor, peer_addresses_size));
     if (allocation == nullptr || allocation->address().is_null() ||
         allocation->address().size() < peer_addresses_size) {
       return absl::ResourceExhaustedError(
@@ -796,8 +937,8 @@ absl::StatusOr<std::unique_ptr<CollectiveCallInitializedState>> Initialize(
 
   std::shared_ptr<BarrierResources> barrier;
   if (config.barrier_before_launch()) {
-    ABSL_ASSIGN_OR_RETURN(
-        barrier, InitializeBarrier(stream, *prepared, *collective_cliques));
+    ABSL_ASSIGN_OR_RETURN(barrier, InitializeBarrier(stream, *state, *prepared,
+                                                     *collective_cliques));
   }
 
   return std::make_unique<CollectiveCallInitializedState>(
@@ -868,7 +1009,7 @@ absl::Status ExecuteKernel(se::Stream* stream,
           "CuTeDSL collective barrier state is unavailable");
     }
     se::DeviceAddressBase signal_value =
-        initialized.barrier->signal_value->address().GetByteSlice(
+        initialized.barrier->backing->signal_value->address().GetByteSlice(
             0, GetMultiGpuBarrierSignalValueSize());
     ABSL_RETURN_IF_ERROR(LaunchMultiGpuBarrier(
         stream, prepared.clique_size, prepared.rank,
@@ -890,21 +1031,27 @@ absl::Status ExecuteKernel(se::Stream* stream,
 }
 
 absl::Status RetainResourcesUntilStreamComplete(
-    se::Stream* stream, std::shared_ptr<LoadedModule> module,
-    std::shared_ptr<BarrierResources> barrier,
-    std::shared_ptr<se::MemoryAllocation> peer_addresses_host) {
-  auto retained = std::make_unique<RetainedExecutionResources>(
-      RetainedExecutionResources{std::move(module), std::move(barrier),
-                                 std::move(peer_addresses_host)});
+    se::Stream* stream, std::shared_ptr<ExecutionResourcePool> pool,
+    std::unique_ptr<se::MemoryAllocation> peer_addresses_host) {
+  if (peer_addresses_host == nullptr) return absl::OkStatus();
+
+  auto retained =
+      std::make_unique<RetainedExecutionResources>(RetainedExecutionResources{
+          stream->parent(), std::move(pool), std::move(peer_addresses_host)});
 
   absl::StatusOr<std::unique_ptr<se::Event>> created_event =
-      stream->parent()->CreateEvent();
+      retained->pool->AcquireEvent(retained->executor);
   if (!created_event.ok()) {
     LOG(WARNING) << "Could not create a completion event for CuTeDSL "
                     "collective resources; synchronizing the stream: "
                  << created_event.status();
     absl::Status synchronized = stream->BlockHostUntilDone();
-    if (synchronized.ok()) return absl::OkStatus();
+    if (synchronized.ok()) {
+      retained->pool->Release(retained->executor,
+                              std::move(retained->peer_addresses_host),
+                              /*event=*/nullptr);
+      return absl::OkStatus();
+    }
 
     // Work may still reference these objects. Keeping them alive is safer
     // than releasing module or registered barrier resources after a failed
@@ -923,7 +1070,12 @@ absl::Status RetainResourcesUntilStreamComplete(
                     "collective resources; synchronizing the stream: "
                  << recorded;
     absl::Status synchronized = stream->BlockHostUntilDone();
-    if (synchronized.ok()) return absl::OkStatus();
+    if (synchronized.ok()) {
+      retained->pool->Release(retained->executor,
+                              std::move(retained->peer_addresses_host),
+                              /*event=*/nullptr);
+      return absl::OkStatus();
+    }
 
     event.release();
     retained.release();
@@ -944,7 +1096,11 @@ absl::Status RetainResourcesUntilStreamComplete(
                      << synchronized << "; retaining execution resources";
           event.release();
           retained.release();
+          return;
         }
+        retained->pool->Release(retained->executor,
+                                std::move(retained->peer_addresses_host),
+                                std::move(event));
       });
   return absl::OkStatus();
 }
@@ -1021,8 +1177,8 @@ absl::Status Execute(se::Stream* stream, CollectiveCallState* state,
   // A failed copy or launch can still leave work in flight, so arrange safe
   // teardown for every Execute attempt that can enqueue work.
   absl::Status retention = RetainResourcesUntilStreamComplete(
-      stream, prepared->module, initialized->barrier,
-      initialized->peer_addresses_host);
+      stream, state->execution_resource_pool(),
+      std::move(initialized->peer_addresses_host));
   if (!execution.ok()) {
     if (!retention.ok()) {
       LOG(ERROR) << "CuTeDSL collective execution failed and resource "
