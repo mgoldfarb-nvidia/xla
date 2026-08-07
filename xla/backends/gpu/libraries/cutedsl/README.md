@@ -30,26 +30,24 @@ allocation layout.
 
 ## Runtime linkage
 
-XLA owns the runtime ABI used by this FFI handler and declares its six
-required C entry points in `runtime_api.h`. The function table used by the
-module loader is private to XLA; the CuTeDSL runtime does not expose or
-negotiate a separate API table.
+OSS XLA compiles against `CuteDSLRuntime.h` from the pinned CUTLASS release.
+The function table used by the module loader is private to XLA; the CuTeDSL
+runtime does not expose or negotiate a separate API table.
 
 Google builds select the combined static runtime through the
-`cutedsl_runtime_static` label flag. OSS builds can compile against the ABI
-header from a pinned CUTLASS release by selecting the target matching the
-build architecture and CUDA major version. For example, a CUDA 13 x86_64
-build uses:
+`cutedsl_runtime_static` label flag. OSS builds always use the ABI header from
+the pinned CUTLASS release. The header is byte-identical across the release's
+supported architectures and CUDA major versions. CuTeDSL support can be
+removed from the GPU plugin explicitly with:
 
 ```
---//xla/backends/gpu/libraries/cutedsl:cutedsl_runtime_headers=@cutlass_cutedsl_runtime_x86_64_cuda13//:headers
+--//xla/backends/gpu/libraries/cutedsl:enable_cutedsl_support=false
 ```
 
-The selected release target supplies `CuteDSLRuntime.h`. Update
 `third_party/cutlass_cutedsl_runtime/workspace.bzl` to bump the release version
-and artifact digests. CUTLASS 4.6.1's static archive is not linked in OSS: it
-contains process-load initializers and depends on a newer private libstdc++ ABI
-than XLA's hermetic toolchain provides.
+and artifact digest together. CUTLASS 4.6.1's static archive is not linked in
+OSS: it contains process-load initializers and depends on a newer private
+libstdc++ ABI than XLA's hermetic toolchain provides.
 
 By default, OSS builds compile the handler without a link-time CuTeDSL
 dependency. On first use, XLA loads `libcute_dsl_runtime.so` with

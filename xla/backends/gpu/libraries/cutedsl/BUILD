@@ -13,19 +13,23 @@
 # limitations under the License.
 # ==============================================================================
 
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("//xla:xla.default.bzl", "xla_cc_binary", "xla_cc_test")
 load("//xla/tsl:tsl.bzl", "if_google")
 load("//xla/tsl/platform:build_config.bzl", "tf_proto_library")
 
-_RUNTIME_TEST_LINKOPTS = if_google([
-    "-Wl,--wrap=CuteDSLRT_Function_Run",
-    "-Wl,--wrap=CuteDSLRT_GetErrorName",
-    "-Wl,--wrap=CuteDSLRT_GetErrorString",
-    "-Wl,--wrap=CuteDSLRT_Module_Create_From_Bytes",
-    "-Wl,--wrap=CuteDSLRT_Module_Destroy",
-    "-Wl,--wrap=CuteDSLRT_Module_Get_Function",
-], [])
+_RUNTIME_TEST_LINKOPTS = if_google(
+    [
+        "-Wl,--wrap=CuteDSLRT_Function_Run",
+        "-Wl,--wrap=CuteDSLRT_GetErrorName",
+        "-Wl,--wrap=CuteDSLRT_GetErrorString",
+        "-Wl,--wrap=CuteDSLRT_Module_Create_From_Bytes",
+        "-Wl,--wrap=CuteDSLRT_Module_Destroy",
+        "-Wl,--wrap=CuteDSLRT_Module_Get_Function",
+    ],
+    [],
+)
 
 package(
     # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
@@ -60,10 +64,15 @@ label_flag(
     visibility = ["//visibility:public"],
 )
 
-label_flag(
-    name = "cutedsl_runtime_headers",
-    build_setting_default = ":runtime_static_unavailable",
+bool_flag(
+    name = "enable_cutedsl_support",
+    build_setting_default = True,
     visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "cutedsl_support_enabled",
+    flag_values = {":enable_cutedsl_support": "True"},
 )
 
 cc_library(
@@ -82,19 +91,25 @@ cc_library(
 cc_library(
     name = "runtime_api",
     hdrs = ["runtime_api.h"],
+    deps = if_google(
+        ["//third_party/py/cutlass:runtime"],
+        ["@cutlass_cutedsl_runtime//:headers"],
+    ),
 )
 
 cc_library(
     name = "runtime",
     srcs = ["runtime_api.cc"],
     hdrs = ["runtime.h"],
-    linkopts = if_google([], select({
-        "@platforms//os:linux": ["-ldl"],
-        "//conditions:default": [],
-    })),
+    linkopts = if_google(
+        [],
+        select({
+            "@platforms//os:linux": ["-ldl"],
+            "//conditions:default": [],
+        }),
+    ),
     local_defines = if_google(["XLA_CUTEDSL_RUNTIME_STATIC"]),
     deps = [
-        ":cutedsl_runtime_headers",
         ":cutedsl_runtime_static",
         ":runtime_api",
         "@com_google_absl//absl/base:no_destructor",
@@ -133,7 +148,10 @@ xla_cc_binary(
     testonly = True,
     srcs = ["runtime_test_library.cc"],
     linkshared = True,
-    target_compatible_with = if_google(["@platforms//:incompatible"], []),
+    target_compatible_with = if_google(
+        ["@platforms//:incompatible"],
+        [],
+    ),
     deps = [":runtime_api"],
 )
 
@@ -142,7 +160,10 @@ xla_cc_test(
     srcs = ["runtime_test.cc"],
     data = [":libcute_dsl_runtime.so"],
     linkopts = ["-Wl,-rpath,$$ORIGIN"],
-    target_compatible_with = if_google(["@platforms//:incompatible"], []) + select({
+    target_compatible_with = if_google(
+        ["@platforms//:incompatible"],
+        [],
+    ) + select({
         "@platforms//os:linux": [],
         "//conditions:default": ["@platforms//:incompatible"],
     }),
@@ -225,7 +246,10 @@ cc_library(
 cc_library(
     name = "handlers",
     visibility = ["//xla/service:__pkg__"],
-    deps = [":collective_ffi"],
+    deps = select({
+        ":cutedsl_support_enabled": [":collective_ffi"],
+        "//conditions:default": [],
+    }),
 )
 
 xla_cc_test(

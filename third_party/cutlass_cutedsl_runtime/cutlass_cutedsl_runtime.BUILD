@@ -22,6 +22,5 @@ package(default_visibility = ["//visibility:public"])
 cc_library(
     name = "headers",
     hdrs = ["include/CuteDSLRuntime.h"],
-    defines = ["XLA_CUTEDSL_RUNTIME_EXTERNAL_HEADER"],
     includes = ["include"],
 )
