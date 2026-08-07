@@ -18,6 +18,9 @@ limitations under the License.
 
 #include <stddef.h>
 
+#if defined(XLA_CUTEDSL_RUNTIME_EXTERNAL_HEADER)
+#include "CuteDSLRuntime.h"
+#else
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -63,7 +66,10 @@ XLA_CUTEDSL_RUNTIME_EXPORT const char* CuteDSLRT_GetErrorString(
 
 #ifdef __cplusplus
 }
+#endif
+#endif  // XLA_CUTEDSL_RUNTIME_EXTERNAL_HEADER
 
+#ifdef __cplusplus
 namespace xla::gpu::cutedsl {
 
 // XLA's private dispatch table for the CuTeDSL runtime ABI.

@@ -36,16 +36,29 @@ module loader is private to XLA; the CuTeDSL runtime does not expose or
 negotiate a separate API table.
 
 Google builds select the combined static runtime through the
-`cutedsl_runtime_static` label flag. The module loader calls its linked
-runtime functions directly.
+`cutedsl_runtime_static` label flag. OSS builds can opt in to a pinned CUTLASS
+release artifact by selecting the target matching the build architecture and
+CUDA major version. For example, a CUDA 13 x86_64 build uses:
 
-OSS builds compile the handler without a link-time CuTeDSL dependency. On
-first use, XLA loads `libcute_dsl_runtime.so` with `RTLD_NOW | RTLD_LOCAL`,
-resolves the six required symbols, and retains the library for the process
-lifetime. The platform dynamic-loader search path locates the library, so a
-package or deployment can provide it through `LD_LIBRARY_PATH` or an
-equivalent mechanism. Loading remains lazy and does not affect users that do
-not use CuTeDSL.
+```
+--//xla/backends/gpu/libraries/cutedsl:cutedsl_runtime_static=@cutlass_cutedsl_runtime_x86_64_cuda13//:runtime
+```
+
+The selected release target supplies both `CuteDSLRuntime.h` and
+`libcute_dsl_runtime.a` and links the configured CUDA runtime. The module
+loader calls the linked runtime functions directly. Static linkage is opt-in
+because the combined runtime archive increases plugin size and contains
+process-load initializers, even when no CuTeDSL call executes. Update
+`third_party/cutlass_cutedsl_runtime/workspace.bzl` to bump the release version
+and artifact digests.
+
+By default, OSS builds compile the handler without a link-time CuTeDSL
+dependency. On first use, XLA loads `libcute_dsl_runtime.so` with
+`RTLD_NOW | RTLD_LOCAL`, resolves the six required symbols, and retains the
+library for the process lifetime. The platform dynamic-loader search path
+locates the library, so a package or deployment can provide it through
+`LD_LIBRARY_PATH` or an equivalent mechanism. Loading remains lazy and does
+not affect users that do not use CuTeDSL.
 
 Both runtime variants register CUDA helper functions directly with their ORC
 JIT, so the plugin passes no runtime path in `shared_libs`. That argument

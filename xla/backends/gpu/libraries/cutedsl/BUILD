@@ -87,9 +87,8 @@ cc_library(
         "//conditions:default": [],
     })),
     local_defines = if_google(["XLA_CUTEDSL_RUNTIME_STATIC"]),
-    deps = if_google([
+    deps = [
         ":cutedsl_runtime_static",
-    ], []) + [
         ":runtime_api",
         "@com_google_absl//absl/base:no_destructor",
         "@com_google_absl//absl/status",
