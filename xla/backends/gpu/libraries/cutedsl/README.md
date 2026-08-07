@@ -36,21 +36,20 @@ module loader is private to XLA; the CuTeDSL runtime does not expose or
 negotiate a separate API table.
 
 Google builds select the combined static runtime through the
-`cutedsl_runtime_static` label flag. OSS builds can opt in to a pinned CUTLASS
-release artifact by selecting the target matching the build architecture and
-CUDA major version. For example, a CUDA 13 x86_64 build uses:
+`cutedsl_runtime_static` label flag. OSS builds can compile against the ABI
+header from a pinned CUTLASS release by selecting the target matching the
+build architecture and CUDA major version. For example, a CUDA 13 x86_64
+build uses:
 
 ```
---//xla/backends/gpu/libraries/cutedsl:cutedsl_runtime_static=@cutlass_cutedsl_runtime_x86_64_cuda13//:runtime
+--//xla/backends/gpu/libraries/cutedsl:cutedsl_runtime_headers=@cutlass_cutedsl_runtime_x86_64_cuda13//:headers
 ```
 
-The selected release target supplies both `CuteDSLRuntime.h` and
-`libcute_dsl_runtime.a` and links the configured CUDA runtime. The module
-loader calls the linked runtime functions directly. Static linkage is opt-in
-because the combined runtime archive increases plugin size and contains
-process-load initializers, even when no CuTeDSL call executes. Update
+The selected release target supplies `CuteDSLRuntime.h`. Update
 `third_party/cutlass_cutedsl_runtime/workspace.bzl` to bump the release version
-and artifact digests.
+and artifact digests. CUTLASS 4.6.1's static archive is not linked in OSS: it
+contains process-load initializers and depends on a newer private libstdc++ ABI
+than XLA's hermetic toolchain provides.
 
 By default, OSS builds compile the handler without a link-time CuTeDSL
 dependency. On first use, XLA loads `libcute_dsl_runtime.so` with

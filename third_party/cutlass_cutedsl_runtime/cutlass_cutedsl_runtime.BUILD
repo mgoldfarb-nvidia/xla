@@ -13,28 +13,15 @@
 # limitations under the License.
 # ==============================================================================
 
-load("@rules_cc//cc:cc_import.bzl", "cc_import")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 
 licenses(["restricted"])  # NVIDIA proprietary license
 
 package(default_visibility = ["//visibility:public"])
 
-cc_import(
-    name = "runtime_archive",
-    static_library = "lib/libcute_dsl_runtime.a",
-)
-
 cc_library(
-    name = "runtime",
+    name = "headers",
     hdrs = ["include/CuteDSLRuntime.h"],
-    defines = [
-        "XLA_CUTEDSL_RUNTIME_EXTERNAL_HEADER",
-        "XLA_CUTEDSL_RUNTIME_STATIC",
-    ],
+    defines = ["XLA_CUTEDSL_RUNTIME_EXTERNAL_HEADER"],
     includes = ["include"],
-    deps = [
-        ":runtime_archive",
-        "@local_config_cuda//cuda:cuda_runtime",
-    ],
 )

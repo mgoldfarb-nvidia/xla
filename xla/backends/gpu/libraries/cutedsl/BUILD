@@ -60,6 +60,12 @@ label_flag(
     visibility = ["//visibility:public"],
 )
 
+label_flag(
+    name = "cutedsl_runtime_headers",
+    build_setting_default = ":runtime_static_unavailable",
+    visibility = ["//visibility:public"],
+)
+
 cc_library(
     name = "module_image",
     srcs = ["module_image.cc"],
@@ -88,6 +94,7 @@ cc_library(
     })),
     local_defines = if_google(["XLA_CUTEDSL_RUNTIME_STATIC"]),
     deps = [
+        ":cutedsl_runtime_headers",
         ":cutedsl_runtime_static",
         ":runtime_api",
         "@com_google_absl//absl/base:no_destructor",
