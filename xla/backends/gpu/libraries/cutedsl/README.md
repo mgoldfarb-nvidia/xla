@@ -12,12 +12,10 @@ compiled `cutlass_call` entry point using CuTeDSL's `JaxArray` layout. They
 create the module during prepare and use an explicit no-op initialize stage.
 
 The collective target accepts the same top-level `module` and `key` attributes
-as the buffer-only targets, plus a `config` string containing the ProtoJSON
-encoding of `CollectiveCallConfigV3`. ProtoJSON lets CuTeDSL construct the
-configuration using Python's standard `json` module without a Python protobuf
-dependency. Unknown JSON fields are ignored; known fields, the complete
-collective configuration, and the module digest are validated during
-Instantiate. The config records the clique width used to compile the
+as the buffer-only targets, plus a `config_format="protobuf"` discriminator and
+a `config` string containing the serialized `CollectiveCallConfigV3` wire
+message. The complete collective configuration and module digest are validated
+during Instantiate. The config records the clique width used to compile the
 region-major address table. The first FFI result is an internal
 `U64[peer_region_count, abi_clique_size]` scratch buffer allocated by XLA in
 device memory; remaining results are the generated function's ordinary

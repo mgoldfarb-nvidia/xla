@@ -62,10 +62,10 @@ class CutlassCallState {
       if (module_.module != nullptr) return absl::OkStatus();
     }
 
-    ASSIGN_OR_RETURN(std::shared_ptr<LoadedModule> loaded,
-                     loader_.GetOrLoad(image_));
-    ASSIGN_OR_RETURN(LoadedModule::FunctionHandle function,
-                     loaded->GetFunction(kFunctionPrefix));
+    ABSL_ASSIGN_OR_RETURN(std::shared_ptr<LoadedModule> loaded,
+                          loader_.GetOrLoad(image_));
+    ABSL_ASSIGN_OR_RETURN(LoadedModule::FunctionHandle function,
+                          loaded->GetFunction(kFunctionPrefix));
 
     absl::MutexLock lock(&mu_);
     if (module_.module == nullptr) {
@@ -92,7 +92,7 @@ class CutlassCallState {
 
 absl::StatusOr<std::unique_ptr<CutlassCallState>> Instantiate(
     absl::string_view module, absl::string_view key) {
-  ASSIGN_OR_RETURN(ModuleImage image, ModuleImage::Create(module, key));
+  ABSL_ASSIGN_OR_RETURN(ModuleImage image, ModuleImage::Create(module, key));
   // Runtime access remains deferred to Prepare; Instantiate only validates
   // device-independent attributes.
   return std::make_unique<CutlassCallState>(std::move(image));

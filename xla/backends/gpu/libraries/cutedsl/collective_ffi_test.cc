@@ -68,7 +68,6 @@ limitations under the License.
 #include "xla/stream_executor/mock_stream_executor.h"
 #include "xla/tsl/platform/status_matchers.h"
 #include "xla/types.h"
-#include "tsl/platform/protobuf.h"
 
 namespace xla::gpu::cutedsl {
 
@@ -327,31 +326,33 @@ class ScopedFakeRuntime {
 
 struct TestAttributes {
   ffi::AttributesMap Build() const {
-    wire::CollectiveCallConfigV3 config;
+    wire::CollectiveCallConfigV3Wire config;
     config.set_abi_clique_size(abi_clique_size);
-    config.set_group_mode(static_cast<CollectiveOpGroupMode>(group_mode));
-    config.set_communication_id(communication_id);
+    config.set_barrier_before_launch(barrier_before_launch);
+    wire::CollectiveGroupWire *collective_group = config.mutable_group();
+    collective_group->set_mode(
+        static_cast<wire::CollectiveGroupWire::Mode>(group_mode + 1));
+    collective_group->set_communication_id(communication_id);
     for (size_t group_index = 0; group_index + 1 < replica_group_offsets.size();
          ++group_index) {
-      xla::ReplicaGroup *group = config.add_replica_groups();
+      wire::ReplicaGroupWire *group = collective_group->add_replica_groups();
       for (int64_t member_index = replica_group_offsets[group_index];
            member_index < replica_group_offsets[group_index + 1];
            ++member_index) {
-        group->add_replica_ids(replica_group_members[member_index]);
+        group->add_members(replica_group_members[member_index]);
       }
     }
     for (size_t offset = 0; offset + 5 < peer_regions.size(); offset += 6) {
-      wire::PeerRegionProto *region = config.add_peer_regions();
-      region->set_endpoint(
-          static_cast<wire::PeerRegionEndpointProto>(peer_regions[offset]));
+      wire::PeerRegionWire *region = config.add_peer_regions();
+      region->set_endpoint(static_cast<wire::PeerRegionWire::Endpoint>(
+          peer_regions[offset] + 1));
       region->set_buffer_index(peer_regions[offset + 1]);
       region->set_byte_offset(peer_regions[offset + 2]);
       region->set_byte_size(peer_regions[offset + 3]);
       region->set_required_alignment(peer_regions[offset + 4]);
-      region->set_memory_kind(
-          static_cast<wire::PeerMemoryKindProto>(peer_regions[offset + 5]));
+      region->set_memory_kind(static_cast<wire::PeerRegionWire::MemoryKind>(
+          peer_regions[offset + 5] + 1));
     }
-    config.set_barrier_before_launch(barrier_before_launch);
 
     ffi::CallFrameBuilder::AttributesBuilder attributes;
     if (!omit_module) {
@@ -376,13 +377,14 @@ struct TestAttributes {
       if (config_as_i64) {
         attributes.Insert("config", int64_t{1});
       } else {
-        tsl::protobuf::util::JsonPrintOptions options;
-        options.preserve_proto_field_names = true;
-        std::string json;
-        absl::Status status =
-            tsl::protobuf::util::MessageToJsonString(config, &json, options);
-        EXPECT_TRUE(status.ok()) << status;
-        attributes.Insert("config", std::move(json));
+        attributes.Insert("config", config.SerializeAsString());
+      }
+    }
+    if (!omit_config_format) {
+      if (config_format_as_i64) {
+        attributes.Insert("config_format", int64_t{1});
+      } else {
+        attributes.Insert("config_format", config_format);
       }
     }
     if (add_unknown_attribute) {
@@ -408,14 +410,17 @@ struct TestAttributes {
   bool key_as_i64 = false;
   bool omit_config = false;
   bool config_as_i64 = false;
+  bool omit_config_format = false;
+  bool config_format_as_i64 = false;
+  std::string config_format = "protobuf";
 };
 
 class FakeSymmetricMemory final : public SymmetricMemory {
  public:
-  FakeSymmetricMemory(se::DeviceAddressBase local_address,
-                      std::vector<se::DeviceAddressBase> peer_addresses,
-                      std::optional<se::DeviceAddressBase> multimem_address =
-                          std::nullopt)
+  FakeSymmetricMemory(
+      se::DeviceAddressBase local_address,
+      std::vector<se::DeviceAddressBase> peer_addresses,
+      std::optional<se::DeviceAddressBase> multimem_address = std::nullopt)
       : local_address_(local_address),
         peer_addresses_(std::move(peer_addresses)),
         multimem_address_(multimem_address) {}
@@ -753,7 +758,7 @@ TEST(CollectiveFfiTest, RegistersOnlyCollectiveV3WithoutTraits) {
   }
 }
 
-TEST(CollectiveFfiTest, RequiresProtoJsonConfigAttribute) {
+TEST(CollectiveFfiTest, RequiresProtobufConfigAttribute) {
   TestAttributes attributes;
   attributes.omit_config = true;
   CollectiveFfiInvocation missing(std::move(attributes), /*replica_count=*/2,
@@ -773,6 +778,29 @@ TEST(CollectiveFfiTest, RequiresProtoJsonConfigAttribute) {
   EXPECT_THAT(wrong_type.Instantiate(),
               StatusIs(absl::StatusCode::kInvalidArgument,
                        HasSubstr("attribute `config`")));
+}
+
+TEST(CollectiveFfiTest, ValidatesConfigFormatAttribute) {
+  TestAttributes attributes;
+  attributes.omit_config_format = true;
+  CollectiveFfiInvocation missing(std::move(attributes), /*replica_count=*/2,
+                                  /*partition_count=*/1,
+                                  /*current_device=*/0);
+  ASSERT_THAT(missing.status(), IsOk());
+  EXPECT_THAT(missing.Instantiate(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("attribute `config_format`")));
+
+  attributes = TestAttributes();
+  attributes.config_format = "json";
+  CollectiveFfiInvocation unsupported(std::move(attributes),
+                                      /*replica_count=*/2,
+                                      /*partition_count=*/1,
+                                      /*current_device=*/0);
+  ASSERT_THAT(unsupported.status(), IsOk());
+  EXPECT_THAT(
+      unsupported.Instantiate(),
+      StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("Unsupported")));
 }
 
 TEST(CollectiveFfiTest, RequiresModuleAttribute) {
@@ -920,7 +948,7 @@ TEST(CollectiveFfiPrepareTest, ResolvesEverySupportedCollectiveGroupMode) {
                 ElementsAreArray(test_case.expected_clique));
     EXPECT_EQ(requests[0].key.communication_id(), CommunicationId(17));
     EXPECT_TRUE(requests[0].dev_comms.empty());
-    EXPECT_FALSE(requests[0].barrier_after_module_execution_requested);
+    EXPECT_FALSE(requests[0].use_cross_device_barrier_requested);
   }
 }
 
@@ -1091,7 +1119,7 @@ TEST(CollectiveFfiPrepareTest,
       invocation.clique_requests().OrderedRequestedCliques();
   ASSERT_EQ(requests.size(), 1);
   EXPECT_TRUE(requests[0].dev_comms.empty());
-  EXPECT_FALSE(requests[0].barrier_after_module_execution_requested);
+  EXPECT_FALSE(requests[0].use_cross_device_barrier_requested);
 }
 
 TEST(CollectiveFfiPrepareTest, RetainsModuleAcrossSequentialExecutions) {
@@ -1136,8 +1164,8 @@ TEST(CollectiveFfiPrepareTest, RejectsMissingFunctionBeforeRequestingClique) {
 
   ASSERT_THAT(invocation.status(), IsOk());
   ASSERT_THAT(invocation.Instantiate(), IsOk());
-  EXPECT_THAT(invocation.Prepare(), StatusIs(absl::StatusCode::kInternal,
-                                             HasSubstr("cutlass_call")));
+  EXPECT_THAT(invocation.Prepare(),
+              StatusIs(absl::StatusCode::kInternal, HasSubstr("cutlass_call")));
   EXPECT_EQ(runtime.create_count, 1);
   EXPECT_EQ(runtime.get_function_count, 1);
   EXPECT_TRUE(invocation.clique_requests().OrderedRequestedCliques().empty());
@@ -1172,8 +1200,7 @@ TEST(CollectiveFfiExecuteTest, ExecutesSingleCutlassCall) {
   EXPECT_EQ(runtime.create_count, 1);
   EXPECT_THAT(runtime.function_prefixes, ElementsAre("cutlass_call"));
   EXPECT_EQ(runtime.function_handles.size(), 1);
-  EXPECT_THAT(runtime.invoked_function_prefixes,
-              ElementsAre("cutlass_call"));
+  EXPECT_THAT(runtime.invoked_function_prefixes, ElementsAre("cutlass_call"));
   EXPECT_TRUE(runtime.peer_addresses_pointer_is_null);
   EXPECT_TRUE(runtime.peer_addresses.empty());
   EXPECT_EQ(runtime.rank, 0);
@@ -1429,9 +1456,8 @@ TEST(CollectiveFfiPeerAddressesTest,
                                      collective_memory);
 
   ASSERT_THAT(addresses, IsOk());
-  EXPECT_THAT(*addresses,
-              ElementsAre(AddressValue(multimem.bytes.data(), 48),
-                          AddressValue(multimem.bytes.data(), 48)));
+  EXPECT_THAT(*addresses, ElementsAre(AddressValue(multimem.bytes.data(), 48),
+                                      AddressValue(multimem.bytes.data(), 48)));
 }
 
 TEST(CollectiveFfiPeerAddressesTest, RejectsUnavailableMultimemAlias) {
@@ -1441,8 +1467,7 @@ TEST(CollectiveFfiPeerAddressesTest, RejectsUnavailableMultimemAlias) {
                                        /*memory_allocator=*/nullptr);
   GpuCliqueKey clique_key({kDevice0}, /*num_local_participants=*/1);
   auto symmetric = std::make_shared<FakeSymmetricMemory>(
-      local.address(),
-      std::vector<se::DeviceAddressBase>{local.address()});
+      local.address(), std::vector<se::DeviceAddressBase>{local.address()});
   absl::flat_hash_map<CollectiveMemory::Key, std::shared_ptr<SymmetricMemory>>
       symmetric_memories;
   symmetric_memories.emplace(std::make_pair(clique_key, 0), symmetric);
@@ -1454,9 +1479,9 @@ TEST(CollectiveFfiPeerAddressesTest, RejectsUnavailableMultimemAlias) {
       wire::PEER_MEMORY_KIND_PROTO_MULTIMEM)};
   std::array<se::DeviceAddressBase, 1> buffers = {local.address()};
 
-  EXPECT_THAT(internal::ResolvePeerAddresses(
-                  clique_key, RankId(0), ConfigWithRegions(regions), buffers,
-                  collective_memory),
+  EXPECT_THAT(internal::ResolvePeerAddresses(clique_key, RankId(0),
+                                             ConfigWithRegions(regions),
+                                             buffers, collective_memory),
               StatusIs(absl::StatusCode::kUnimplemented,
                        HasSubstr("injected multimem unavailability")));
 }

@@ -46,3 +46,52 @@ message CollectiveCallConfigV3 {
   repeated PeerRegionProto peer_regions = 5;
   bool barrier_before_launch = 6;
 }
+
+// Wire format emitted by the public CuTeDSL collective integration. Keep this
+// message isolated from the runtime representation so the launch ABI can
+// evolve without coupling collective execution code to serialization details.
+message CollectiveCallConfigV3Wire {
+  optional uint32 abi_clique_size = 1;
+  optional bool barrier_before_launch = 2;
+  CollectiveGroupWire group = 3;
+  repeated PeerRegionWire peer_regions = 4;
+}
+
+message CollectiveGroupWire {
+  enum Mode {
+    MODE_UNSPECIFIED = 0;
+    MODE_CROSS_REPLICA = 1;
+    MODE_CROSS_PARTITION = 2;
+    MODE_CROSS_REPLICA_AND_PARTITION = 3;
+    MODE_FLATTENED_ID = 4;
+  }
+
+  optional Mode mode = 1;
+  optional uint64 communication_id = 2;
+  repeated ReplicaGroupWire replica_groups = 3;
+}
+
+message ReplicaGroupWire {
+  repeated int64 members = 1;
+}
+
+message PeerRegionWire {
+  enum Endpoint {
+    ENDPOINT_UNSPECIFIED = 0;
+    ENDPOINT_ARGUMENT = 1;
+    ENDPOINT_RESULT = 2;
+  }
+
+  enum MemoryKind {
+    MEMORY_KIND_UNSPECIFIED = 0;
+    MEMORY_KIND_SYMMETRIC = 1;
+    MEMORY_KIND_MULTIMEM = 2;
+  }
+
+  optional Endpoint endpoint = 1;
+  optional uint64 buffer_index = 2;
+  optional uint64 byte_offset = 3;
+  optional uint64 byte_size = 4;
+  optional uint64 required_alignment = 5;
+  optional MemoryKind memory_kind = 6;
+}

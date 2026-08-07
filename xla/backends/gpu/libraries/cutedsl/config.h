@@ -22,11 +22,10 @@ limitations under the License.
 
 namespace xla::gpu::cutedsl {
 
-// Parses and validates a ProtoJSON v3 configuration. Unknown JSON fields are
-// ignored, and the returned protobuf owns all parsed data. Callers must not
-// mutate the validated configuration.
+// Parses the public CuTeDSL collective protobuf wire format and returns the
+// validated runtime representation.
 absl::StatusOr<proto::CollectiveCallConfigV3>
-ParseAndValidateCollectiveCallConfig(absl::string_view json_config);
+ParseAndValidateCollectiveCallConfig(absl::string_view serialized_config);
 
 }  // namespace xla::gpu::cutedsl
 

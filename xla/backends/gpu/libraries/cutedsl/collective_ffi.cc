@@ -96,6 +96,7 @@ namespace {
 
 constexpr absl::string_view kCollectiveCallTarget =
     "__xla_gpu_cutedsl_collective_v3";
+constexpr absl::string_view kProtobufConfigFormat = "protobuf";
 constexpr absl::string_view kFunctionPrefix = "cutlass_call";
 constexpr size_t kInlineBufferCount = 8;
 
@@ -240,8 +241,8 @@ absl::StatusOr<int64_t> LogicalGroupDomainSize(
 absl::Status ValidateReplicaGroupDomain(
     const wire::CollectiveCallConfigV3& config,
     const DeviceAssignment& device_assignment) {
-  ASSIGN_OR_RETURN(int64_t domain_size,
-                   LogicalGroupDomainSize(config, device_assignment));
+  ABSL_ASSIGN_OR_RETURN(int64_t domain_size,
+                        LogicalGroupDomainSize(config, device_assignment));
   if (static_cast<uint64_t>(domain_size) > std::numeric_limits<size_t>::max()) {
     return absl::InvalidArgumentError(
         "Collective logical-ID domain is too large for this host");
@@ -295,8 +296,8 @@ absl::StatusOr<se::DeviceAddressBase> GetPeerRegionBuffer(
             "arguments",
             region_index, buffer_index, arguments.size()));
       }
-      ASSIGN_OR_RETURN(ffi::AnyBuffer buffer,
-                       arguments.get<ffi::AnyBuffer>(buffer_index));
+      ABSL_ASSIGN_OR_RETURN(ffi::AnyBuffer buffer,
+                            arguments.get<ffi::AnyBuffer>(buffer_index));
       return buffer.device_memory();
     }
     case wire::PEER_REGION_ENDPOINT_PROTO_RESULT: {
@@ -305,14 +306,14 @@ absl::StatusOr<se::DeviceAddressBase> GetPeerRegionBuffer(
             "Peer region %d references result %d but the call has %d results",
             region_index, buffer_index, results.size()));
       }
-      ASSIGN_OR_RETURN(ffi::Result<ffi::AnyBuffer> result,
-                       results.get<ffi::AnyBuffer>(buffer_index));
+      ABSL_ASSIGN_OR_RETURN(ffi::Result<ffi::AnyBuffer> result,
+                            results.get<ffi::AnyBuffer>(buffer_index));
       return result->device_memory();
     }
     default:
-      return absl::InvalidArgumentError(absl::StrFormat(
-          "Peer region %d has unsupported endpoint %d", region_index,
-          region.endpoint()));
+      return absl::InvalidArgumentError(
+          absl::StrFormat("Peer region %d has unsupported endpoint %d",
+                          region_index, region.endpoint()));
   }
 }
 
@@ -325,18 +326,18 @@ absl::StatusOr<std::vector<se::DeviceAddressBase>> GetPeerRegionBuffers(
   for (int region_index = 0; region_index < config.peer_regions_size();
        ++region_index) {
     const wire::PeerRegionProto& region = config.peer_regions(region_index);
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         se::DeviceAddressBase buffer,
         GetPeerRegionBuffer(region, region_index, arguments, results));
 
     uint64_t byte_offset = static_cast<uint64_t>(region.byte_offset());
     uint64_t byte_size = static_cast<uint64_t>(region.byte_size());
-    RETURN_IF_ERROR(
+    ABSL_RETURN_IF_ERROR(
         ValidateByteRange(byte_offset, byte_size, buffer.size(),
                           absl::StrFormat("Peer region %d", region_index)));
 
     if (require_addresses) {
-      ASSIGN_OR_RETURN(
+      ABSL_ASSIGN_OR_RETURN(
           uint64_t address,
           AddAddressOffset(buffer.opaque(), byte_offset,
                            absl::StrFormat("peer region %d", region_index)));
@@ -397,7 +398,7 @@ absl::StatusOr<std::vector<uint64_t>> ResolvePeerAddresses(
     uint64_t region_offset = static_cast<uint64_t>(region.byte_offset());
     uint64_t region_size = static_cast<uint64_t>(region.byte_size());
     uint64_t alignment = static_cast<uint64_t>(region.required_alignment());
-    RETURN_IF_ERROR(
+    ABSL_RETURN_IF_ERROR(
         ValidateByteRange(region_offset, region_size, buffer.size(),
                           absl::StrFormat("Peer region %d", region_index)));
 
@@ -409,10 +410,10 @@ absl::StatusOr<std::vector<uint64_t>> ResolvePeerAddresses(
     }
 
     se::DeviceAddressBase local_symmetric_address = symmetric_memory->addr();
-    RETURN_IF_ERROR(ValidateByteRange(
+    ABSL_RETURN_IF_ERROR(ValidateByteRange(
         buffer_offset, buffer.size(), local_symmetric_address.size(),
         absl::StrFormat("Peer region %d containing XLA buffer", region_index)));
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         uint64_t local_symmetric_buffer_address,
         AddAddressOffset(local_symmetric_address.opaque(), buffer_offset,
                          absl::StrFormat("peer region %d XLA symmetric buffer",
@@ -432,17 +433,17 @@ absl::StatusOr<std::vector<uint64_t>> ResolvePeerAddresses(
     uint64_t offset_in_symmetric_memory = buffer_offset + region_offset;
 
     if (region.memory_kind() == wire::PEER_MEMORY_KIND_PROTO_MULTIMEM) {
-      ASSIGN_OR_RETURN(se::DeviceAddressBase multimem_base,
-                       symmetric_memory->multimem_addr());
+      ABSL_ASSIGN_OR_RETURN(se::DeviceAddressBase multimem_base,
+                            symmetric_memory->multimem_addr());
       if (multimem_base.is_null()) {
         return absl::FailedPreconditionError(absl::StrFormat(
             "Multimem address is unavailable for peer region %d",
             region_index));
       }
-      RETURN_IF_ERROR(ValidateByteRange(
+      ABSL_RETURN_IF_ERROR(ValidateByteRange(
           offset_in_symmetric_memory, region_size, multimem_base.size(),
           absl::StrFormat("Multimem region %d", region_index)));
-      ASSIGN_OR_RETURN(
+      ABSL_ASSIGN_OR_RETURN(
           uint64_t multimem_address,
           AddAddressOffset(
               multimem_base.opaque(), offset_in_symmetric_memory,
@@ -458,9 +459,9 @@ absl::StatusOr<std::vector<uint64_t>> ResolvePeerAddresses(
       continue;
     }
     if (region.memory_kind() != wire::PEER_MEMORY_KIND_PROTO_SYMMETRIC) {
-      return absl::InvalidArgumentError(absl::StrFormat(
-          "Unsupported memory kind %d for peer region %d",
-          region.memory_kind(), region_index));
+      return absl::InvalidArgumentError(
+          absl::StrFormat("Unsupported memory kind %d for peer region %d",
+                          region.memory_kind(), region_index));
     }
 
     for (size_t peer = 0; peer < clique_key.num_devices(); ++peer) {
@@ -471,12 +472,13 @@ absl::StatusOr<std::vector<uint64_t>> ResolvePeerAddresses(
         // the local slot; it is the address XLA uses for ordinary dataflow.
         peer_base = local_symmetric_address;
       } else {
-        ASSIGN_OR_RETURN(peer_base, symmetric_memory->peer_addr(RankId(peer)));
+        ABSL_ASSIGN_OR_RETURN(peer_base,
+                              symmetric_memory->peer_addr(RankId(peer)));
       }
-      RETURN_IF_ERROR(ValidateByteRange(
+      ABSL_RETURN_IF_ERROR(ValidateByteRange(
           offset_in_symmetric_memory, region_size, peer_base.size(),
           absl::StrFormat("Peer region %d rank %d", region_index, peer)));
-      ASSIGN_OR_RETURN(
+      ABSL_ASSIGN_OR_RETURN(
           uint64_t peer_address,
           AddAddressOffset(
               peer_base.opaque(), offset_in_symmetric_memory,
@@ -515,24 +517,37 @@ absl::StatusOr<std::unique_ptr<CollectiveCallState>> Instantiate(
         absl::StrFormat("Invalid CuTeDSL collective v3 attribute `key`: %s",
                         key.status().message()));
   }
-  absl::StatusOr<absl::string_view> json_config =
+  absl::StatusOr<absl::string_view> config_format =
+      attributes.get<absl::string_view>("config_format");
+  if (!config_format.ok()) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Invalid CuTeDSL collective v3 attribute `config_format`: %s",
+        config_format.status().message()));
+  }
+  if (*config_format != kProtobufConfigFormat) {
+    return absl::InvalidArgumentError(
+        absl::StrFormat("Unsupported CuTeDSL collective v3 config format `%s`",
+                        *config_format));
+  }
+  absl::StatusOr<absl::string_view> serialized_config =
       attributes.get<absl::string_view>("config");
-  if (!json_config.ok()) {
+  if (!serialized_config.ok()) {
     return absl::InvalidArgumentError(
         absl::StrFormat("Invalid CuTeDSL collective v3 attribute `config`: %s",
-                        json_config.status().message()));
+                        serialized_config.status().message()));
   }
-  ASSIGN_OR_RETURN(wire::CollectiveCallConfigV3 config,
-                   ParseAndValidateCollectiveCallConfig(*json_config));
-  ASSIGN_OR_RETURN(ModuleImage image, ModuleImage::Create(*module, *key));
-  RETURN_IF_ERROR(ValidatePeerAddressTable(config, peer_address_table));
+  ABSL_ASSIGN_OR_RETURN(
+      wire::CollectiveCallConfigV3 config,
+      ParseAndValidateCollectiveCallConfig(*serialized_config));
+  ABSL_ASSIGN_OR_RETURN(ModuleImage image, ModuleImage::Create(*module, *key));
+  ABSL_RETURN_IF_ERROR(ValidatePeerAddressTable(config, peer_address_table));
 
   // Instantiate receives prototype buffers with null data pointers but exact
   // types and shapes. Validate all configuration-to-buffer mappings here and
   // repeat address-dependent validation during Prepare.
-  RETURN_IF_ERROR(GetPeerRegionBuffers(config, arguments, results,
-                                       /*require_addresses=*/false)
-                      .status());
+  ABSL_RETURN_IF_ERROR(GetPeerRegionBuffers(config, arguments, results,
+                                            /*require_addresses=*/false)
+                           .status());
   return std::make_unique<CollectiveCallState>(std::move(config),
                                                std::move(image));
 }
@@ -558,17 +573,17 @@ absl::StatusOr<std::unique_ptr<CollectiveCallPreparedState>> Prepare(
   }
 
   const wire::CollectiveCallConfigV3& config = state->config();
-  RETURN_IF_ERROR(ValidatePeerAddressTable(config, peer_address_table));
+  ABSL_RETURN_IF_ERROR(ValidatePeerAddressTable(config, peer_address_table));
   // A partial group can cause only some ranks to request the clique and leave
   // the others deadlocked. Validate the complete logical domain before making
   // any resource request.
-  RETURN_IF_ERROR(
+  ABSL_RETURN_IF_ERROR(
       ValidateReplicaGroupDomain(config, *collective_params->device_assn));
 
   std::vector<ReplicaGroup> replica_groups(config.replica_groups().begin(),
                                            config.replica_groups().end());
 
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       GpuCliqueKey clique_key,
       GetGpuCliqueKey(
           *collective_params, replica_groups, config.group_mode(),
@@ -596,7 +611,7 @@ absl::StatusOr<std::unique_ptr<CollectiveCallPreparedState>> Prepare(
         collective_params->global_device_id.value(), clique_key.ToString()));
   }
 
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       std::vector<std::vector<GlobalDeviceId>> device_groups,
       GetParticipatingDevicesGroups(*collective_params->device_assn,
                                     replica_groups, config.group_mode()));
@@ -605,19 +620,21 @@ absl::StatusOr<std::unique_ptr<CollectiveCallPreparedState>> Prepare(
   });
   absl::c_sort(device_groups);
 
-  ASSIGN_OR_RETURN(std::vector<se::DeviceAddressBase> peer_region_buffers,
-                   GetPeerRegionBuffers(config, arguments, results,
-                                        /*require_addresses=*/true));
+  ABSL_ASSIGN_OR_RETURN(std::vector<se::DeviceAddressBase> peer_region_buffers,
+                        GetPeerRegionBuffers(config, arguments, results,
+                                             /*require_addresses=*/true));
 
-  ASSIGN_OR_RETURN(std::shared_ptr<LoadedModule> module, state->LoadModule());
-  ASSIGN_OR_RETURN(LoadedModule::FunctionHandle function,
-                   module->GetFunction(kFunctionPrefix));
+  ABSL_ASSIGN_OR_RETURN(std::shared_ptr<LoadedModule> module,
+                        state->LoadModule());
+  ABSL_ASSIGN_OR_RETURN(LoadedModule::FunctionHandle function,
+                        module->GetFunction(kFunctionPrefix));
 
   // Resource requests happen only after all configuration, topology, buffer,
   // module, and function checks that do not themselves require acquisition.
-  RETURN_IF_ERROR(clique_requests->RequestClique(clique_key, device_groups));
+  ABSL_RETURN_IF_ERROR(
+      clique_requests->RequestClique(clique_key, device_groups));
   for (const se::DeviceAddressBase& buffer : peer_region_buffers) {
-    RETURN_IF_ERROR(
+    ABSL_RETURN_IF_ERROR(
         memory_requests->RequestSymmetricAddress(clique_key, buffer));
   }
 
@@ -638,14 +655,14 @@ absl::StatusOr<std::shared_ptr<BarrierResources>> InitializeBarrier(
         prepared.clique_size, se::gpu::MultiGpuBarrierKernel::kMaxPeers));
   }
 
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       std::unique_ptr<se::MemoryAllocator> collective_allocator,
       stream->parent()->CreateMemoryAllocator(se::MemorySpace::kCollective));
   auto resources = std::make_shared<BarrierResources>();
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       resources->signal_buffer,
       collective_allocator->Allocate(GetMultiGpuBarrierSignalBufferSize()));
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       resources->signal_value,
       collective_allocator->Allocate(GetMultiGpuBarrierSignalValueSize()));
 
@@ -667,18 +684,18 @@ absl::StatusOr<std::shared_ptr<BarrierResources>> InitializeBarrier(
   se::DeviceAddressBase signal_value =
       resources->signal_value->address().GetByteSlice(
           0, GetMultiGpuBarrierSignalValueSize());
-  RETURN_IF_ERROR(stream->MemZero(&signal_buffer, signal_buffer.size()));
-  RETURN_IF_ERROR(stream->MemZero(&signal_value, signal_value.size()));
+  ABSL_RETURN_IF_ERROR(stream->MemZero(&signal_buffer, signal_buffer.size()));
+  ABSL_RETURN_IF_ERROR(stream->MemZero(&signal_value, signal_value.size()));
   // Initialization must complete before any rank registers and launches the
   // monotonic barrier state.
-  RETURN_IF_ERROR(stream->BlockHostUntilDone());
+  ABSL_RETURN_IF_ERROR(stream->BlockHostUntilDone());
 
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       GpuCommunicator * communicator,
       collective_cliques.GetComm(prepared.clique_key, prepared.rank));
-  ASSIGN_OR_RETURN(std::unique_ptr<SymmetricMemory> symmetric_memory,
-                   communicator->CreateSymmetricMemory(signal_buffer));
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(std::unique_ptr<SymmetricMemory> symmetric_memory,
+                        communicator->CreateSymmetricMemory(signal_buffer));
+  ABSL_ASSIGN_OR_RETURN(
       resources->symmetric_memory_ref,
       collective_cliques.Tie(prepared.clique_key, std::move(symmetric_memory)));
   resources->symmetric_memory = resources->symmetric_memory_ref.Lock();
@@ -705,8 +722,8 @@ absl::StatusOr<std::shared_ptr<BarrierResources>> InitializeBarrier(
     if (peer == prepared.rank.value()) {
       peer_address = signal_buffer;
     } else {
-      ASSIGN_OR_RETURN(peer_address,
-                       resources->symmetric_memory->peer_addr(RankId(peer)));
+      ABSL_ASSIGN_OR_RETURN(
+          peer_address, resources->symmetric_memory->peer_addr(RankId(peer)));
     }
     if (peer_address.is_null() || peer_address.size() < signal_buffer.size()) {
       return absl::FailedPreconditionError(absl::StrFormat(
@@ -749,22 +766,22 @@ absl::StatusOr<std::unique_ptr<CollectiveCallInitializedState>> Initialize(
   }
 
   const wire::CollectiveCallConfigV3& config = state->config();
-  RETURN_IF_ERROR(ValidatePeerAddressTable(config, peer_address_table));
-  ASSIGN_OR_RETURN(std::vector<se::DeviceAddressBase> peer_region_buffers,
-                   GetPeerRegionBuffers(config, arguments, results,
-                                        /*require_addresses=*/true));
-  ASSIGN_OR_RETURN(std::vector<uint64_t> peer_addresses,
-                   internal::ResolvePeerAddresses(
-                       prepared->clique_key, prepared->rank, config,
-                       peer_region_buffers, *collective_memory));
+  ABSL_RETURN_IF_ERROR(ValidatePeerAddressTable(config, peer_address_table));
+  ABSL_ASSIGN_OR_RETURN(std::vector<se::DeviceAddressBase> peer_region_buffers,
+                        GetPeerRegionBuffers(config, arguments, results,
+                                             /*require_addresses=*/true));
+  ABSL_ASSIGN_OR_RETURN(std::vector<uint64_t> peer_addresses,
+                        internal::ResolvePeerAddresses(
+                            prepared->clique_key, prepared->rank, config,
+                            peer_region_buffers, *collective_memory));
 
   // XLA may reuse the result allocation before this thunk executes. Keep only
   // pinned staging data in Initialize and populate the result in Execute.
   std::shared_ptr<se::MemoryAllocation> peer_addresses_host;
   if (!peer_addresses.empty()) {
-    ASSIGN_OR_RETURN(uint64_t peer_addresses_size,
-                     PeerAddressTableByteSize(peer_addresses.size()));
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(uint64_t peer_addresses_size,
+                          PeerAddressTableByteSize(peer_addresses.size()));
+    ABSL_ASSIGN_OR_RETURN(
         std::unique_ptr<se::MemoryAllocation> allocation,
         prepared->executor->HostMemoryAllocate(peer_addresses_size));
     if (allocation == nullptr || allocation->address().is_null() ||
@@ -779,8 +796,8 @@ absl::StatusOr<std::unique_ptr<CollectiveCallInitializedState>> Initialize(
 
   std::shared_ptr<BarrierResources> barrier;
   if (config.barrier_before_launch()) {
-    ASSIGN_OR_RETURN(barrier,
-                     InitializeBarrier(stream, *prepared, *collective_cliques));
+    ABSL_ASSIGN_OR_RETURN(
+        barrier, InitializeBarrier(stream, *prepared, *collective_cliques));
   }
 
   return std::make_unique<CollectiveCallInitializedState>(
@@ -800,14 +817,15 @@ absl::Status ExecuteKernel(se::Stream* stream,
   buffers.reserve(arguments.size() + results.size());
 
   for (size_t i = 0; i < arguments.size(); ++i) {
-    ASSIGN_OR_RETURN(ffi::AnyBuffer argument, arguments.get<ffi::AnyBuffer>(i));
+    ABSL_ASSIGN_OR_RETURN(ffi::AnyBuffer argument,
+                          arguments.get<ffi::AnyBuffer>(i));
     ffi::AnyBuffer::Dimensions dimensions = argument.dimensions();
     buffers.push_back({argument.untyped_data(),
                        dimensions.empty() ? nullptr : dimensions.data()});
   }
   for (size_t i = 0; i < results.size(); ++i) {
-    ASSIGN_OR_RETURN(ffi::Result<ffi::AnyBuffer> result,
-                     results.get<ffi::AnyBuffer>(i));
+    ABSL_ASSIGN_OR_RETURN(ffi::Result<ffi::AnyBuffer> result,
+                          results.get<ffi::AnyBuffer>(i));
     ffi::AnyBuffer::Dimensions dimensions = result->dimensions();
     buffers.push_back({result->untyped_data(),
                        dimensions.empty() ? nullptr : dimensions.data()});
@@ -852,7 +870,7 @@ absl::Status ExecuteKernel(se::Stream* stream,
     se::DeviceAddressBase signal_value =
         initialized.barrier->signal_value->address().GetByteSlice(
             0, GetMultiGpuBarrierSignalValueSize());
-    RETURN_IF_ERROR(LaunchMultiGpuBarrier(
+    ABSL_RETURN_IF_ERROR(LaunchMultiGpuBarrier(
         stream, prepared.clique_size, prepared.rank,
         initialized.barrier->peer_addresses, signal_value));
   }
@@ -860,9 +878,9 @@ absl::Status ExecuteKernel(se::Stream* stream,
   absl::Status run_status = prepared.module->Run(
       prepared.function, packed_arguments.data(), packed_arguments.size());
   if (!run_status.ok()) {
-    return absl::InternalError(absl::StrFormat(
-        "CuTeDSL collective launch failed: %s; CUDA error %d",
-        run_status.message(), cuda_error));
+    return absl::InternalError(
+        absl::StrFormat("CuTeDSL collective launch failed: %s; CUDA error %d",
+                        run_status.message(), cuda_error));
   }
   if (cuda_error != 0) {
     return absl::InternalError(absl::StrFormat(
@@ -954,7 +972,7 @@ absl::Status Execute(se::Stream* stream, CollectiveCallState* state,
   }
 
   const wire::CollectiveCallConfigV3& config = state->config();
-  RETURN_IF_ERROR(ValidatePeerAddressTable(config, peer_address_table));
+  ABSL_RETURN_IF_ERROR(ValidatePeerAddressTable(config, peer_address_table));
   size_t peer_region_count = static_cast<size_t>(config.peer_regions_size());
   if (peer_region_count > std::numeric_limits<size_t>::max() /
                               static_cast<size_t>(prepared->clique_size)) {
@@ -980,8 +998,8 @@ absl::Status Execute(se::Stream* stream, CollectiveCallState* state,
     if (expected_peer_addresses != 0) {
       se::DeviceAddressBase peer_addresses_device =
           peer_address_table->device_memory();
-      ASSIGN_OR_RETURN(uint64_t peer_addresses_size,
-                       PeerAddressTableByteSize(expected_peer_addresses));
+      ABSL_ASSIGN_OR_RETURN(uint64_t peer_addresses_size,
+                            PeerAddressTableByteSize(expected_peer_addresses));
       if (peer_addresses_device.is_null() ||
           peer_addresses_device.size() < peer_addresses_size) {
         return absl::FailedPreconditionError(
@@ -990,7 +1008,7 @@ absl::Status Execute(se::Stream* stream, CollectiveCallState* state,
       }
       // The generated function launches on this stream, so the table copy is
       // ordered before every kernel that dereferences the context pointer.
-      RETURN_IF_ERROR(
+      ABSL_RETURN_IF_ERROR(
           stream->Memcpy(&peer_addresses_device,
                          initialized->peer_addresses_host->address().opaque(),
                          peer_addresses_size));

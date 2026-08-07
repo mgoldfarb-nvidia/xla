@@ -27,7 +27,6 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/backends/gpu/libraries/cutedsl/config.pb.h"
-#include "tsl/platform/protobuf.h"
 
 namespace xla::gpu::cutedsl {
 
@@ -39,14 +38,140 @@ namespace {
 
 absl::Status MissingField(absl::string_view field) {
   return absl::InvalidArgumentError(absl::StrFormat(
-      "Missing CuTeDSL collective v3 ProtoJSON field `%s`", field));
+      "Missing CuTeDSL collective v3 protobuf field `%s`", field));
 }
 
 absl::Status MissingRepeatedField(absl::string_view repeated_field,
                                   size_t index, absl::string_view field) {
   return absl::InvalidArgumentError(absl::StrFormat(
-      "Missing CuTeDSL collective v3 ProtoJSON field `%s[%d].%s`",
+      "Missing CuTeDSL collective v3 protobuf field `%s[%d].%s`",
       repeated_field, index, field));
+}
+
+absl::StatusOr<CollectiveOpGroupMode> DecodeGroupMode(
+    wire::CollectiveGroupWire::Mode mode) {
+  switch (mode) {
+    case wire::CollectiveGroupWire::MODE_CROSS_REPLICA:
+      return CollectiveOpGroupMode::COLLECTIVE_OP_GROUP_MODE_CROSS_REPLICA;
+    case wire::CollectiveGroupWire::MODE_CROSS_PARTITION:
+      return CollectiveOpGroupMode::COLLECTIVE_OP_GROUP_MODE_CROSS_PARTITION;
+    case wire::CollectiveGroupWire::MODE_CROSS_REPLICA_AND_PARTITION:
+      return CollectiveOpGroupMode::
+          COLLECTIVE_OP_GROUP_MODE_CROSS_REPLICA_AND_PARTITION;
+    case wire::CollectiveGroupWire::MODE_FLATTENED_ID:
+      return CollectiveOpGroupMode::COLLECTIVE_OP_GROUP_MODE_FLATTENED_ID;
+    default:
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "Unsupported collective group mode %d", static_cast<int>(mode)));
+  }
+}
+
+absl::StatusOr<wire::PeerRegionEndpointProto> DecodeEndpoint(
+    wire::PeerRegionWire::Endpoint endpoint) {
+  switch (endpoint) {
+    case wire::PeerRegionWire::ENDPOINT_ARGUMENT:
+      return wire::PEER_REGION_ENDPOINT_PROTO_ARGUMENT;
+    case wire::PeerRegionWire::ENDPOINT_RESULT:
+      return wire::PEER_REGION_ENDPOINT_PROTO_RESULT;
+    default:
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "Unsupported peer-region endpoint %d", static_cast<int>(endpoint)));
+  }
+}
+
+absl::StatusOr<wire::PeerMemoryKindProto> DecodeMemoryKind(
+    wire::PeerRegionWire::MemoryKind memory_kind) {
+  switch (memory_kind) {
+    case wire::PeerRegionWire::MEMORY_KIND_SYMMETRIC:
+      return wire::PEER_MEMORY_KIND_PROTO_SYMMETRIC;
+    case wire::PeerRegionWire::MEMORY_KIND_MULTIMEM:
+      return wire::PEER_MEMORY_KIND_PROTO_MULTIMEM;
+    default:
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "Unsupported peer-memory kind %d", static_cast<int>(memory_kind)));
+  }
+}
+
+absl::StatusOr<int64_t> DecodeInt64(uint64_t value, absl::string_view field) {
+  if (value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+    return absl::InvalidArgumentError(
+        absl::StrFormat("`%s` exceeds the signed 64-bit range", field));
+  }
+  return static_cast<int64_t>(value);
+}
+
+absl::StatusOr<wire::CollectiveCallConfigV3> DecodeWireConfig(
+    const wire::CollectiveCallConfigV3Wire& wire_config) {
+  if (!wire_config.has_abi_clique_size())
+    return MissingField("abi_clique_size");
+  if (!wire_config.has_barrier_before_launch()) {
+    return MissingField("barrier_before_launch");
+  }
+  if (!wire_config.has_group()) return MissingField("group");
+
+  const wire::CollectiveGroupWire& wire_group = wire_config.group();
+  if (!wire_group.has_mode()) return MissingField("group.mode");
+  if (!wire_group.has_communication_id()) {
+    return MissingField("group.communication_id");
+  }
+
+  wire::CollectiveCallConfigV3 config;
+  config.set_abi_clique_size(wire_config.abi_clique_size());
+  config.set_barrier_before_launch(wire_config.barrier_before_launch());
+  ABSL_ASSIGN_OR_RETURN(CollectiveOpGroupMode group_mode,
+                        DecodeGroupMode(wire_group.mode()));
+  config.set_group_mode(group_mode);
+  ABSL_ASSIGN_OR_RETURN(
+      int64_t communication_id,
+      DecodeInt64(wire_group.communication_id(), "group.communication_id"));
+  config.set_communication_id(communication_id);
+
+  for (const wire::ReplicaGroupWire& wire_replica_group :
+       wire_group.replica_groups()) {
+    ReplicaGroup* replica_group = config.add_replica_groups();
+    for (int64_t member : wire_replica_group.members()) {
+      replica_group->add_replica_ids(member);
+    }
+  }
+
+  for (int region_index = 0; region_index < wire_config.peer_regions_size();
+       ++region_index) {
+    const wire::PeerRegionWire& wire_region =
+        wire_config.peer_regions(region_index);
+    if (!wire_region.has_endpoint() || !wire_region.has_buffer_index() ||
+        !wire_region.has_byte_offset() || !wire_region.has_byte_size() ||
+        !wire_region.has_required_alignment() ||
+        !wire_region.has_memory_kind()) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "CuTeDSL collective v3 protobuf field `peer_regions[%d]` is "
+          "missing a required field",
+          region_index));
+    }
+
+    wire::PeerRegionProto* region = config.add_peer_regions();
+    ABSL_ASSIGN_OR_RETURN(wire::PeerRegionEndpointProto endpoint,
+                          DecodeEndpoint(wire_region.endpoint()));
+    region->set_endpoint(endpoint);
+    ABSL_ASSIGN_OR_RETURN(
+        int64_t buffer_index,
+        DecodeInt64(wire_region.buffer_index(), "buffer_index"));
+    ABSL_ASSIGN_OR_RETURN(
+        int64_t byte_offset,
+        DecodeInt64(wire_region.byte_offset(), "byte_offset"));
+    ABSL_ASSIGN_OR_RETURN(int64_t byte_size,
+                          DecodeInt64(wire_region.byte_size(), "byte_size"));
+    ABSL_ASSIGN_OR_RETURN(
+        int64_t required_alignment,
+        DecodeInt64(wire_region.required_alignment(), "required_alignment"));
+    ABSL_ASSIGN_OR_RETURN(wire::PeerMemoryKindProto memory_kind,
+                          DecodeMemoryKind(wire_region.memory_kind()));
+    region->set_buffer_index(buffer_index);
+    region->set_byte_offset(byte_offset);
+    region->set_byte_size(byte_size);
+    region->set_required_alignment(required_alignment);
+    region->set_memory_kind(memory_kind);
+  }
+  return config;
 }
 
 absl::Status ValidateGroupMode(int64_t value) {
@@ -136,7 +261,7 @@ absl::Status ValidatePeerRegions(const wire::CollectiveCallConfigV3& proto) {
   for (int region_index = 0; region_index < proto.peer_regions_size();
        ++region_index) {
     const wire::PeerRegionProto& region = proto.peer_regions(region_index);
-    RETURN_IF_ERROR(ValidatePeerRegionFields(region, region_index));
+    ABSL_RETURN_IF_ERROR(ValidatePeerRegionFields(region, region_index));
 
     switch (region.endpoint()) {
       case wire::PEER_REGION_ENDPOINT_PROTO_ARGUMENT:
@@ -194,17 +319,20 @@ absl::Status ValidatePeerRegions(const wire::CollectiveCallConfigV3& proto) {
 }  // namespace
 
 absl::StatusOr<wire::CollectiveCallConfigV3>
-ParseAndValidateCollectiveCallConfig(absl::string_view json_config) {
-  wire::CollectiveCallConfigV3 proto;
-  tsl::protobuf::util::JsonParseOptions options;
-  options.ignore_unknown_fields = true;
-  absl::Status parsed =
-      tsl::protobuf::util::JsonStringToMessage(json_config, &proto, options);
-  if (!parsed.ok()) {
-    return absl::InvalidArgumentError(absl::StrFormat(
-        "Failed to parse CuTeDSL collective v3 ProtoJSON configuration: %s",
-        parsed.message()));
+ParseAndValidateCollectiveCallConfig(absl::string_view serialized_config) {
+  if (serialized_config.size() >
+      static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return absl::InvalidArgumentError(
+        "CuTeDSL collective v3 protobuf configuration is too large");
   }
+  wire::CollectiveCallConfigV3Wire wire_config;
+  if (!wire_config.ParseFromArray(serialized_config.data(),
+                                  static_cast<int>(serialized_config.size()))) {
+    return absl::InvalidArgumentError(
+        "Failed to parse CuTeDSL collective v3 protobuf configuration");
+  }
+  ABSL_ASSIGN_OR_RETURN(wire::CollectiveCallConfigV3 proto,
+                        DecodeWireConfig(wire_config));
 
   if (!proto.has_abi_clique_size()) return MissingField("abi_clique_size");
   if (proto.abi_clique_size() <= 0 ||
@@ -215,15 +343,16 @@ ParseAndValidateCollectiveCallConfig(absl::string_view json_config) {
   }
 
   if (!proto.has_group_mode()) return MissingField("group_mode");
-  RETURN_IF_ERROR(ValidateGroupMode(static_cast<int64_t>(proto.group_mode())));
+  ABSL_RETURN_IF_ERROR(
+      ValidateGroupMode(static_cast<int64_t>(proto.group_mode())));
 
   if (!proto.has_communication_id()) return MissingField("communication_id");
   if (proto.communication_id() < 0) {
     return absl::InvalidArgumentError("`communication_id` must be nonnegative");
   }
 
-  RETURN_IF_ERROR(ValidateReplicaGroups(proto));
-  RETURN_IF_ERROR(ValidatePeerRegions(proto));
+  ABSL_RETURN_IF_ERROR(ValidateReplicaGroups(proto));
+  ABSL_RETURN_IF_ERROR(ValidatePeerRegions(proto));
   return proto;
 }
 
