@@ -1,21 +1,14 @@
 # CuTeDSL FFI for OpenXLA's CUDA PJRT plugin
 
-OpenXLA's CUDA PJRT plugin registers these FFI targets:
+OpenXLA's CUDA PJRT plugin registers only the
+`__xla_gpu_cutedsl_collective_v3` FFI target. CuTeDSL owns and registers its
+non-collective FFI targets.
 
-- `__xla_gpu_cutedsl_call_v3`
-- `__xla_gpu_cutedsl_call_no_cuda_graph_v3`
-- `__xla_gpu_cutedsl_collective_v3`
-
-Version 3 is the only supported contract. The two buffer-only targets accept
-`module` bytes and their 32-byte SHA-256 `key`, then pass XLA buffers to the
-compiled `cutlass_call` entry point using CuTeDSL's `JaxArray` layout. They
-create the module during prepare and use an explicit no-op initialize stage.
-
-The collective target accepts the same top-level `module` and `key` attributes
-as the buffer-only targets, plus a `config_format="protobuf"` discriminator and
-a `config` string containing the serialized `CollectiveCallConfigV3` wire
-message. The complete collective configuration and module digest are validated
-during Instantiate. The config records the clique width used to compile the
+The collective target accepts top-level `module` bytes and their 32-byte
+SHA-256 `key`, plus a `config_format="protobuf"` discriminator and a `config`
+string containing the serialized `CollectiveCallConfigV3` wire message. The
+complete collective configuration and module digest are validated during
+Instantiate. The config records the clique width used to compile the
 region-major address table. The first FFI result is an internal
 `U64[peer_region_count, abi_clique_size]` scratch buffer allocated by XLA in
 device memory; remaining results are the generated function's ordinary
@@ -37,7 +30,7 @@ allocation layout.
 
 ## Runtime linkage
 
-XLA owns the runtime ABI used by these FFI handlers and declares its six
+XLA owns the runtime ABI used by this FFI handler and declares its six
 required C entry points in `runtime_api.h`. The function table used by the
 module loader is private to XLA; the CuTeDSL runtime does not expose or
 negotiate a separate API table.
@@ -46,7 +39,7 @@ Google builds select the combined static runtime through the
 `cutedsl_runtime_static` label flag. The module loader calls its linked
 runtime functions directly.
 
-OSS builds compile the handlers without a link-time CuTeDSL dependency. On
+OSS builds compile the handler without a link-time CuTeDSL dependency. On
 first use, XLA loads `libcute_dsl_runtime.so` with `RTLD_NOW | RTLD_LOCAL`,
 resolves the six required symbols, and retains the library for the process
 lifetime. The platform dynamic-loader search path locates the library, so a
