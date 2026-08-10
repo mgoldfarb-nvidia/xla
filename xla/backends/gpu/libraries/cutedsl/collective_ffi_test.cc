@@ -1099,7 +1099,7 @@ TEST(CollectiveFfiPrepareTest,
       invocation.clique_requests().OrderedRequestedCliques();
   ASSERT_EQ(requests.size(), 1);
   EXPECT_TRUE(requests[0].dev_comms.empty());
-  EXPECT_FALSE(requests[0].use_cross_device_barrier_requested);
+  EXPECT_TRUE(requests[0].use_cross_device_barrier_requested);
 }
 
 TEST(CollectiveFfiPrepareTest, RetainsModuleAcrossSequentialExecutions) {
@@ -1180,6 +1180,29 @@ TEST(CollectiveFfiExecuteTest, ExecutesSingleCutlassCall) {
   EXPECT_TRUE(runtime.peer_addresses.empty());
   EXPECT_EQ(runtime.rank, 0);
   EXPECT_EQ(runtime.clique_size, 2);
+}
+
+TEST(CollectiveFfiExecuteTest, RequiresAcquiredBarrierCliqueBeforeCutlassCall) {
+  FakeRuntime runtime;
+  ScopedFakeRuntime scoped_runtime(&runtime);
+
+  TestAttributes attributes;
+  attributes.barrier_before_launch = true;
+  attributes.module = "collective barrier launch test module";
+  CollectiveFfiInvocation invocation(std::move(attributes),
+                                     /*replica_count=*/2,
+                                     /*partition_count=*/1,
+                                     /*current_device=*/0);
+
+  ASSERT_THAT(invocation.status(), IsOk());
+  ASSERT_THAT(invocation.Instantiate(), IsOk());
+  ASSERT_THAT(invocation.Prepare(), IsOk());
+  ASSERT_THAT(invocation.Initialize(), IsOk());
+
+  EXPECT_THAT(invocation.Execute(),
+              StatusIs(absl::StatusCode::kNotFound,
+                       HasSubstr("No clique found for clique key")));
+  EXPECT_EQ(runtime.run_count, 0);
 }
 
 TEST(CollectiveFfiExecuteTest, DoesNotCreateCompletionEventWithoutStaging) {

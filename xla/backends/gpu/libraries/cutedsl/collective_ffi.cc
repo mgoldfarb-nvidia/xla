@@ -37,6 +37,7 @@ limitations under the License.
 #include "absl/types/span.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
+#include "xla/backends/gpu/collectives/gpu_collectives.h"
 #include "xla/backends/gpu/collectives/gpu_communicator.h"
 #include "xla/backends/gpu/ffi.h"
 #include "xla/backends/gpu/libraries/cutedsl/config.h"
@@ -45,12 +46,10 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/collective_clique_requests.h"
 #include "xla/backends/gpu/runtime/collective_cliques.h"
 #include "xla/backends/gpu/runtime/collective_execution.h"
-#include "xla/backends/gpu/runtime/collective_kernel_api.h"
 #include "xla/backends/gpu/runtime/collective_memory.h"
 #include "xla/backends/gpu/runtime/collective_memory_requests.h"
 #include "xla/backends/gpu/runtime/collective_params.h"
 #include "xla/core/collectives/rank_id.h"
-#include "xla/core/collectives/symmetric_memory.h"
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/ffi.h"
 #include "xla/service/collective_ops_utils.h"
@@ -59,12 +58,9 @@ limitations under the License.
 #include "xla/stream_executor/event.h"
 #include "xla/stream_executor/gpu/multi_gpu_barrier_kernel.h"
 #include "xla/stream_executor/memory_allocation.h"
-#include "xla/stream_executor/memory_allocator.h"
-#include "xla/stream_executor/memory_space.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/platform/env.h"
-#include "xla/tsl/util/tied_ref.h"
 #include "xla/xla_data.pb.h"
 
 namespace xla::gpu::cutedsl {
@@ -78,7 +74,6 @@ using ::xla::GetParticipatingDevicesGroups;
 using ::xla::GlobalDeviceId;
 using ::xla::RankId;
 using ::xla::ReplicaGroup;
-using ::xla::SymmetricMemory;
 using ::xla::U64;
 using ::xla::gpu::CollectiveCliqueRequests;
 using ::xla::gpu::CollectiveCliques;
@@ -87,11 +82,9 @@ using ::xla::gpu::CollectiveMemoryRequests;
 using ::xla::gpu::CollectiveParams;
 using ::xla::gpu::CommunicationId;
 using ::xla::gpu::GetGpuCliqueKey;
-using ::xla::gpu::GetMultiGpuBarrierSignalBufferSize;
-using ::xla::gpu::GetMultiGpuBarrierSignalValueSize;
 using ::xla::gpu::GpuCliqueKey;
+using ::xla::gpu::GpuCollectives;
 using ::xla::gpu::GpuCommunicator;
-using ::xla::gpu::LaunchMultiGpuBarrier;
 
 namespace {
 
@@ -111,31 +104,6 @@ struct CollectiveCallPreparedState {
   se::StreamExecutor* executor;
   std::shared_ptr<LoadedModule> module;
   LoadedModule::FunctionHandle function;
-};
-
-struct BarrierBacking {
-  std::unique_ptr<se::MemoryAllocation> signal_buffer;
-  std::unique_ptr<se::MemoryAllocation> signal_value;
-};
-
-// Fields are declared so that reverse-order destruction releases the symmetric
-// registration before its backing allocations.
-struct BarrierResources {
-  std::shared_ptr<BarrierBacking> backing;
-  tsl::TiedRef<SymmetricMemory> symmetric_memory_ref;
-  std::shared_ptr<SymmetricMemory> symmetric_memory;
-  std::vector<se::DeviceAddressBase> peer_addresses;
-};
-
-struct BarrierCacheEntry {
-  bool IsIdle() const ABSL_SHARED_LOCKS_REQUIRED(mutex) {
-    return !initializing;
-  }
-
-  absl::Mutex mutex;
-  bool initializing ABSL_GUARDED_BY(mutex) = false;
-  std::shared_ptr<BarrierBacking> backing ABSL_GUARDED_BY(mutex);
-  std::shared_ptr<BarrierResources> resources ABSL_GUARDED_BY(mutex);
 };
 
 class ExecutionResourcePool {
@@ -204,14 +172,6 @@ class CollectiveCallState {
     return module_loader_.GetOrLoad(image_);
   }
 
-  std::shared_ptr<BarrierCacheEntry> GetBarrierCacheEntry(
-      se::StreamExecutor* executor, const GpuCliqueKey& clique_key) {
-    absl::MutexLock lock(&barrier_cache_mutex_);
-    auto& entry = barrier_cache_[executor][clique_key];
-    if (entry == nullptr) entry = std::make_shared<BarrierCacheEntry>();
-    return entry;
-  }
-
   const std::shared_ptr<ExecutionResourcePool>& execution_resource_pool() {
     return execution_resource_pool_;
   }
@@ -220,11 +180,6 @@ class CollectiveCallState {
   const wire::CollectiveCallConfigV3 config_;
   ModuleImage image_;
   ModuleLoader module_loader_;
-  absl::Mutex barrier_cache_mutex_;
-  absl::flat_hash_map<
-      se::StreamExecutor*,
-      absl::flat_hash_map<GpuCliqueKey, std::shared_ptr<BarrierCacheEntry>>>
-      barrier_cache_ ABSL_GUARDED_BY(barrier_cache_mutex_);
   std::shared_ptr<ExecutionResourcePool> execution_resource_pool_ =
       std::make_shared<ExecutionResourcePool>();
 };
@@ -233,7 +188,6 @@ struct CollectiveCallInitializedState {
   se::StreamExecutor* executor;
   size_t peer_address_count;
   std::unique_ptr<se::MemoryAllocation> peer_addresses_host;
-  std::shared_ptr<BarrierResources> barrier;
 };
 
 struct RetainedExecutionResources {
@@ -721,8 +675,14 @@ absl::StatusOr<std::unique_ptr<CollectiveCallPreparedState>> Prepare(
 
   // Resource requests happen only after all configuration, topology, buffer,
   // module, and function checks that do not themselves require acquisition.
-  ABSL_RETURN_IF_ERROR(
-      clique_requests->RequestClique(clique_key, device_groups));
+  CollectiveCliqueRequests::CliqueRequirements clique_requirements;
+  if (config.barrier_before_launch()) {
+    clique_requirements.barrier_reqs =
+        CollectiveCliqueRequests::BarrierRequirements{
+            .use_cross_device_barrier = true};
+  }
+  ABSL_RETURN_IF_ERROR(clique_requests->RequestClique(clique_key, device_groups,
+                                                      clique_requirements));
   for (const se::DeviceAddressBase& buffer : peer_region_buffers) {
     ABSL_RETURN_IF_ERROR(
         memory_requests->RequestSymmetricAddress(clique_key, buffer));
@@ -735,157 +695,14 @@ absl::StatusOr<std::unique_ptr<CollectiveCallPreparedState>> Prepare(
                                   std::move(module), function});
 }
 
-absl::StatusOr<std::shared_ptr<BarrierResources>> InitializeBarrier(
-    se::Stream* stream, CollectiveCallState& state,
-    const CollectiveCallPreparedState& prepared,
-    CollectiveCliques& collective_cliques) {
-  if (prepared.clique_size > se::gpu::MultiGpuBarrierKernel::kMaxPeers) {
-    return absl::InvalidArgumentError(absl::StrFormat(
-        "CuTeDSL collective clique size %d exceeds the generic barrier limit "
-        "of %d peers",
-        prepared.clique_size, se::gpu::MultiGpuBarrierKernel::kMaxPeers));
-  }
-
-  std::shared_ptr<BarrierCacheEntry> entry =
-      state.GetBarrierCacheEntry(prepared.executor, prepared.clique_key);
-  std::shared_ptr<BarrierBacking> backing;
-  bool created_backing = false;
-  {
-    absl::MutexLock lock(&entry->mutex);
-    entry->mutex.Await(
-        absl::Condition(entry.get(), &BarrierCacheEntry::IsIdle));
-    if (entry->resources != nullptr &&
-        !entry->resources->symmetric_memory_ref.Expired()) {
-      return entry->resources;
-    }
-    entry->initializing = true;
-    backing = entry->backing;
-  }
-
-  if (backing == nullptr) {
-    created_backing = true;
-    absl::StatusOr<std::unique_ptr<se::MemoryAllocator>> allocator =
-        stream->parent()->CreateMemoryAllocator(se::MemorySpace::kCollective);
-    if (!allocator.ok()) {
-      absl::MutexLock lock(&entry->mutex);
-      entry->initializing = false;
-      return allocator.status();
-    }
-    backing = std::make_shared<BarrierBacking>();
-    absl::StatusOr<std::unique_ptr<se::MemoryAllocation>> signal_buffer =
-        (*allocator)->Allocate(GetMultiGpuBarrierSignalBufferSize());
-    if (!signal_buffer.ok()) {
-      absl::MutexLock lock(&entry->mutex);
-      entry->initializing = false;
-      return signal_buffer.status();
-    }
-    backing->signal_buffer = std::move(*signal_buffer);
-    absl::StatusOr<std::unique_ptr<se::MemoryAllocation>> signal_value =
-        (*allocator)->Allocate(GetMultiGpuBarrierSignalValueSize());
-    if (!signal_value.ok()) {
-      absl::MutexLock lock(&entry->mutex);
-      entry->initializing = false;
-      return signal_value.status();
-    }
-    backing->signal_value = std::move(*signal_value);
-  }
-
-  if (backing->signal_buffer == nullptr ||
-      backing->signal_buffer->address().is_null() ||
-      backing->signal_buffer->address().size() <
-          GetMultiGpuBarrierSignalBufferSize() ||
-      backing->signal_value == nullptr ||
-      backing->signal_value->address().is_null() ||
-      backing->signal_value->address().size() <
-          GetMultiGpuBarrierSignalValueSize()) {
-    absl::MutexLock lock(&entry->mutex);
-    entry->initializing = false;
-    return absl::ResourceExhaustedError(
-        "Failed to allocate CuTeDSL collective barrier control memory");
-  }
-
-  se::DeviceAddressBase signal_buffer =
-      backing->signal_buffer->address().GetByteSlice(
-          0, GetMultiGpuBarrierSignalBufferSize());
-  se::DeviceAddressBase signal_value =
-      backing->signal_value->address().GetByteSlice(
-          0, GetMultiGpuBarrierSignalValueSize());
-  absl::StatusOr<std::shared_ptr<BarrierResources>> initialized =
-      [&]() -> absl::StatusOr<std::shared_ptr<BarrierResources>> {
-    if (created_backing) {
-      ABSL_RETURN_IF_ERROR(
-          stream->MemZero(&signal_buffer, signal_buffer.size()));
-      ABSL_RETURN_IF_ERROR(stream->MemZero(&signal_value, signal_value.size()));
-      // Barrier state is monotonic, so zeroing is required only when the
-      // backing allocations are first created.
-      ABSL_RETURN_IF_ERROR(stream->BlockHostUntilDone());
-    }
-
-    auto resources = std::make_shared<BarrierResources>();
-    resources->backing = backing;
-    ABSL_ASSIGN_OR_RETURN(
-        GpuCommunicator * communicator,
-        collective_cliques.GetComm(prepared.clique_key, prepared.rank));
-    ABSL_ASSIGN_OR_RETURN(std::unique_ptr<SymmetricMemory> symmetric_memory,
-                          communicator->CreateSymmetricMemory(signal_buffer));
-    ABSL_ASSIGN_OR_RETURN(resources->symmetric_memory_ref,
-                          collective_cliques.Tie(prepared.clique_key,
-                                                 std::move(symmetric_memory)));
-    resources->symmetric_memory = resources->symmetric_memory_ref.Lock();
-    if (resources->symmetric_memory == nullptr) {
-      return absl::InternalError(
-          "CuTeDSL collective barrier registration expired during "
-          "Initialize");
-    }
-
-    se::DeviceAddressBase registered = resources->symmetric_memory->addr();
-    if (registered.opaque() != signal_buffer.opaque() ||
-        registered.size() < signal_buffer.size()) {
-      return absl::FailedPreconditionError(
-          "CuTeDSL collective barrier symmetric-memory backing address does "
-          "not match its XLA allocation");
-    }
-
-    resources->peer_addresses.reserve(prepared.clique_size);
-    for (int32_t peer = 0; peer < prepared.clique_size; ++peer) {
-      se::DeviceAddressBase peer_address;
-      if (peer == prepared.rank.value()) {
-        peer_address = signal_buffer;
-      } else {
-        ABSL_ASSIGN_OR_RETURN(
-            peer_address, resources->symmetric_memory->peer_addr(RankId(peer)));
-      }
-      if (peer_address.is_null() ||
-          peer_address.size() < signal_buffer.size()) {
-        return absl::FailedPreconditionError(absl::StrFormat(
-            "CuTeDSL collective barrier peer address for rank %d is "
-            "unavailable or too small",
-            peer));
-      }
-      resources->peer_addresses.push_back(
-          peer_address.GetByteSlice(0, signal_buffer.size()));
-    }
-    return resources;
-  }();
-
-  absl::MutexLock lock(&entry->mutex);
-  entry->initializing = false;
-  if (!initialized.ok()) return initialized.status();
-  entry->backing = std::move(backing);
-  entry->resources = *initialized;
-  return *initialized;
-}
-
 absl::StatusOr<std::unique_ptr<CollectiveCallInitializedState>> Initialize(
     se::Stream* stream, CollectiveCallState* state,
     CollectiveCallPreparedState* prepared, ffi::RemainingArgs arguments,
     PeerAddressTableResult peer_address_table, ffi::RemainingRets results,
     const CollectiveParams* collective_params,
-    CollectiveCliques* collective_cliques,
     const CollectiveMemory* collective_memory) {
   if (stream == nullptr || state == nullptr || prepared == nullptr ||
-      collective_params == nullptr || collective_cliques == nullptr ||
-      collective_memory == nullptr) {
+      collective_params == nullptr || collective_memory == nullptr) {
     return absl::FailedPreconditionError(
         "CuTeDSL collective v3 Initialize requires stream, state, and "
         "acquired collective contexts");
@@ -934,22 +751,15 @@ absl::StatusOr<std::unique_ptr<CollectiveCallInitializedState>> Initialize(
     peer_addresses_host = std::move(allocation);
   }
 
-  std::shared_ptr<BarrierResources> barrier;
-  if (config.barrier_before_launch()) {
-    ABSL_ASSIGN_OR_RETURN(barrier, InitializeBarrier(stream, *state, *prepared,
-                                                     *collective_cliques));
-  }
-
   return std::make_unique<CollectiveCallInitializedState>(
       CollectiveCallInitializedState{prepared->executor, peer_addresses.size(),
-                                     std::move(peer_addresses_host),
-                                     std::move(barrier)});
+                                     std::move(peer_addresses_host)});
 }
 
 absl::Status ExecuteKernel(se::Stream* stream,
                            const wire::CollectiveCallConfigV3& config,
                            const CollectiveCallPreparedState& prepared,
-                           CollectiveCallInitializedState& initialized,
+                           const CollectiveCliques& collective_cliques,
                            const uint64_t* peer_addresses,
                            ffi::RemainingArgs arguments,
                            ffi::RemainingRets results) {
@@ -1003,16 +813,11 @@ absl::Status ExecuteKernel(se::Stream* stream,
   packed_arguments.push_back(&cuda_error);
 
   if (config.barrier_before_launch()) {
-    if (initialized.barrier == nullptr) {
-      return absl::FailedPreconditionError(
-          "CuTeDSL collective barrier state is unavailable");
-    }
-    se::DeviceAddressBase signal_value =
-        initialized.barrier->backing->signal_value->address().GetByteSlice(
-            0, GetMultiGpuBarrierSignalValueSize());
-    ABSL_RETURN_IF_ERROR(LaunchMultiGpuBarrier(
-        stream, prepared.clique_size, prepared.rank,
-        initialized.barrier->peer_addresses, signal_value));
+    ABSL_ASSIGN_OR_RETURN(
+        GpuCommunicator * communicator,
+        collective_cliques.GetComm(prepared.clique_key, prepared.rank));
+    GpuCollectives::Executor executor(stream);
+    ABSL_RETURN_IF_ERROR(communicator->LaunchMultiGpuBarrier(executor));
   }
 
   absl::Status run_status = prepared.module->Run(
@@ -1107,11 +912,12 @@ absl::Status RetainResourcesUntilStreamComplete(
 absl::Status Execute(se::Stream* stream, CollectiveCallState* state,
                      CollectiveCallPreparedState* prepared,
                      CollectiveCallInitializedState* initialized,
+                     const CollectiveCliques* collective_cliques,
                      ffi::RemainingArgs arguments,
                      PeerAddressTableResult peer_address_table,
                      ffi::RemainingRets results) {
   if (stream == nullptr || state == nullptr || prepared == nullptr ||
-      initialized == nullptr) {
+      initialized == nullptr || collective_cliques == nullptr) {
     return absl::FailedPreconditionError(
         "CuTeDSL collective v3 Execute requires stream and all lifecycle "
         "state");
@@ -1170,7 +976,7 @@ absl::Status Execute(se::Stream* stream, CollectiveCallState* state,
       peer_addresses =
           static_cast<const uint64_t*>(peer_addresses_device.opaque());
     }
-    return ExecuteKernel(stream, config, *prepared, *initialized,
+    return ExecuteKernel(stream, config, *prepared, *collective_cliques,
                          peer_addresses, arguments, results);
   }();
   // A failed copy or launch can still leave work in flight, so arrange safe
@@ -1215,7 +1021,6 @@ XLA_FFI_DEFINE_HANDLER(kInitialize, Initialize,
                            .Ret<ffi::BufferR2<U64>>()
                            .RemainingRets()
                            .Ctx<ffi::CollectiveParams>()
-                           .Ctx<ffi::CollectiveCliques>()
                            .Ctx<ffi::CollectiveMemory>());
 
 XLA_FFI_DEFINE_HANDLER(
@@ -1225,6 +1030,7 @@ XLA_FFI_DEFINE_HANDLER(
         .Ctx<ffi::State<CollectiveCallState>>()
         .Ctx<ffi::Prepared<CollectiveCallPreparedState>>()
         .Ctx<ffi::Initialized<CollectiveCallInitializedState>>()
+        .Ctx<ffi::CollectiveCliques>()
         .RemainingArgs()
         .Ret<ffi::BufferR2<U64>>()
         .RemainingRets());
