@@ -38,9 +38,10 @@ static_assert(offsetof(CuteXlaFfiBuffer, shape) == 8);
 
 // A host-only POD decoded by cutlass.jax.collective's outer JIT wrapper.
 struct alignas(8) CollectiveContextAbi {
-  // Device array containing numeric peer or multimem addresses in
-  // region-major order. Multimem rows repeat the rank-local alias.
-  const uint64_t* peer_addresses;
+  // Identical host and device views of the region-major address table.
+  // Multimem rows repeat the rank-local alias in every column.
+  const uint64_t* device_peer_addresses;
+  const uint64_t* host_peer_addresses;
   int32_t rank;
   int32_t clique_size;
 };
@@ -48,10 +49,11 @@ struct alignas(8) CollectiveContextAbi {
 static_assert(std::is_standard_layout_v<CollectiveContextAbi>);
 static_assert(std::is_trivially_copyable_v<CollectiveContextAbi>);
 static_assert(alignof(CollectiveContextAbi) == 8);
-static_assert(sizeof(CollectiveContextAbi) == 16);
-static_assert(offsetof(CollectiveContextAbi, peer_addresses) == 0);
-static_assert(offsetof(CollectiveContextAbi, rank) == 8);
-static_assert(offsetof(CollectiveContextAbi, clique_size) == 12);
+static_assert(sizeof(CollectiveContextAbi) == 24);
+static_assert(offsetof(CollectiveContextAbi, device_peer_addresses) == 0);
+static_assert(offsetof(CollectiveContextAbi, host_peer_addresses) == 8);
+static_assert(offsetof(CollectiveContextAbi, rank) == 16);
+static_assert(offsetof(CollectiveContextAbi, clique_size) == 20);
 
 }  // namespace xla::gpu::cutedsl
 

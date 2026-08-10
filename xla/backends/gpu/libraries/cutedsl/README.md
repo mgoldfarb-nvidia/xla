@@ -20,11 +20,12 @@ one peer address per rank. Multimem rows contain the rank-local LSA multimem
 alias from the NCCL symmetric window, repeated across the row to preserve the
 v3 table shape.
 
-The generated-function frame carries one pointer to a fixed 16-byte host
+The generated-function frame carries one pointer to a fixed 24-byte host
 `CollectiveContextAbi` descriptor instead of one argument per peer address.
-The descriptor contains the device-table pointer, rank, and clique size.
-Generated host code loads only that descriptor and constructs a row-major CuTe
-global-memory tensor over the table. Device kernels index the tensor to load an
+The descriptor contains identical pinned-host and device views of the address
+table, plus rank and clique size. Generated host code can use the host view for
+TMA descriptor initialization and constructs a row-major CuTe global-memory
+tensor over the device view. Device kernels index the tensor to load an
 absolute peer or multimem address; independent regions do not need to share an
 allocation layout.
 

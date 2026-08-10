@@ -123,8 +123,8 @@ struct FakeRuntime {
   void* stream = nullptr;
   std::vector<CapturedBuffer> buffers;
   std::vector<uint64_t> peer_addresses;
-  const uint64_t* peer_addresses_pointer = nullptr;
-  bool peer_addresses_pointer_is_null = false;
+  const uint64_t* device_peer_addresses = nullptr;
+  const uint64_t* host_peer_addresses = nullptr;
   int32_t rank = -1;
   int32_t clique_size = -1;
   int32_t cuda_error = 0;
@@ -215,19 +215,24 @@ CuteDSLRT_Error_t FunctionRun(void* function, void** arguments,
   CollectiveContextAbi context;
   std::memcpy(&context, context_address, sizeof(context));
   if (fake_runtime->expected_peer_address_count != 0 &&
-      context.peer_addresses == nullptr) {
+      (context.device_peer_addresses == nullptr ||
+       context.host_peer_addresses == nullptr)) {
     ADD_FAILURE() << "CollectiveContext has no peer-address table";
     return CuteDSLRT_Error_CudaError;
   }
 
   fake_runtime->peer_addresses.clear();
-  fake_runtime->peer_addresses_pointer = context.peer_addresses;
-  fake_runtime->peer_addresses_pointer_is_null =
-      context.peer_addresses == nullptr;
+  fake_runtime->device_peer_addresses = context.device_peer_addresses;
+  fake_runtime->host_peer_addresses = context.host_peer_addresses;
   if (fake_runtime->expected_peer_address_count != 0) {
+    EXPECT_EQ(std::memcmp(
+                  context.device_peer_addresses, context.host_peer_addresses,
+                  fake_runtime->expected_peer_address_count * sizeof(uint64_t)),
+              0);
     fake_runtime->peer_addresses.assign(
-        context.peer_addresses,
-        context.peer_addresses + fake_runtime->expected_peer_address_count);
+        context.device_peer_addresses,
+        context.device_peer_addresses +
+            fake_runtime->expected_peer_address_count);
   }
   fake_runtime->rank = context.rank;
   fake_runtime->clique_size = context.clique_size;
@@ -1176,7 +1181,8 @@ TEST(CollectiveFfiExecuteTest, ExecutesSingleCutlassCall) {
   EXPECT_THAT(runtime.function_prefixes, ElementsAre("cutlass_call"));
   EXPECT_EQ(runtime.function_handles.size(), 1);
   EXPECT_THAT(runtime.invoked_function_prefixes, ElementsAre("cutlass_call"));
-  EXPECT_TRUE(runtime.peer_addresses_pointer_is_null);
+  EXPECT_EQ(runtime.device_peer_addresses, nullptr);
+  EXPECT_EQ(runtime.host_peer_addresses, nullptr);
   EXPECT_TRUE(runtime.peer_addresses.empty());
   EXPECT_EQ(runtime.rank, 0);
   EXPECT_EQ(runtime.clique_size, 2);
@@ -1322,9 +1328,10 @@ TEST(CollectiveFfiExecuteTest,
                           AddressValue(local0.bytes.data(), 48),
                           AddressValue(multimem1.bytes.data(), 96),
                           AddressValue(multimem1.bytes.data(), 96)));
-  EXPECT_FALSE(runtime.peer_addresses_pointer_is_null);
-  EXPECT_EQ(runtime.peer_addresses_pointer,
+  EXPECT_EQ(runtime.device_peer_addresses,
             invocation.peer_address_table_data());
+  EXPECT_NE(runtime.host_peer_addresses, nullptr);
+  EXPECT_NE(runtime.host_peer_addresses, runtime.device_peer_addresses);
   EXPECT_EQ(runtime.rank, 1);
   EXPECT_EQ(runtime.clique_size, 2);
 }

@@ -760,7 +760,8 @@ absl::Status ExecuteKernel(se::Stream* stream,
                            const wire::CollectiveCallConfigV3& config,
                            const CollectiveCallPreparedState& prepared,
                            const CollectiveCliques& collective_cliques,
-                           const uint64_t* peer_addresses,
+                           const uint64_t* device_peer_addresses,
+                           const uint64_t* host_peer_addresses,
                            ffi::RemainingArgs arguments,
                            ffi::RemainingRets results) {
   absl::InlinedVector<CuteXlaFfiBuffer, kInlineBufferCount> buffers;
@@ -782,7 +783,8 @@ absl::Status ExecuteKernel(se::Stream* stream,
   }
 
   CollectiveContextAbi collective_context = {
-      peer_addresses,
+      device_peer_addresses,
+      host_peer_addresses,
       static_cast<int32_t>(prepared.rank.value()),
       prepared.clique_size,
   };
@@ -976,8 +978,13 @@ absl::Status Execute(se::Stream* stream, CollectiveCallState* state,
       peer_addresses =
           static_cast<const uint64_t*>(peer_addresses_device.opaque());
     }
-    return ExecuteKernel(stream, config, *prepared, *collective_cliques,
-                         peer_addresses, arguments, results);
+    return ExecuteKernel(
+        stream, config, *prepared, *collective_cliques, peer_addresses,
+        expected_peer_addresses == 0
+            ? nullptr
+            : static_cast<const uint64_t*>(
+                  initialized->peer_addresses_host->address().opaque()),
+        arguments, results);
   }();
   // A failed copy or launch can still leave work in flight, so arrange safe
   // teardown for every Execute attempt that can enqueue work.
