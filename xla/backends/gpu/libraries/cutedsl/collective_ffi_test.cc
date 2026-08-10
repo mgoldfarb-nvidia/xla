@@ -1134,7 +1134,8 @@ TEST(CollectiveFfiExecuteTest, LaunchesWithoutPeerAddresses) {
   EXPECT_THAT(runtime.invoked_function_prefixes, ElementsAre("cutlass_call"));
 }
 
-TEST(CollectiveFfiExecuteTest, ResolvesRegionAddressesAndPacksLaunchFrame) {
+TEST(CollectiveFfiExecuteTest,
+     ResolvesRegionAddressesAndPacksStreamContextInputsRets) {
   FakeRuntime runtime;
   runtime.expected_buffer_ranks = {1, 1};
   runtime.expected_peer_address_count = 4;
