@@ -15,10 +15,8 @@ limitations under the License.
 
 #include "xla/backends/gpu/libraries/cutedsl/collective_ffi.h"
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -26,14 +24,11 @@ limitations under the License.
 #include <vector>
 
 #include "absl/algorithm/container.h"
-#include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
-#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
-#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
@@ -55,12 +50,9 @@ limitations under the License.
 #include "xla/service/collective_ops_utils.h"
 #include "xla/service/computation_placer.h"
 #include "xla/stream_executor/device_address.h"
-#include "xla/stream_executor/event.h"
 #include "xla/stream_executor/gpu/multi_gpu_barrier_kernel.h"
-#include "xla/stream_executor/memory_allocation.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
-#include "xla/tsl/platform/env.h"
 #include "xla/xla_data.pb.h"
 
 namespace xla::gpu::cutedsl {
@@ -74,7 +66,6 @@ using ::xla::GetParticipatingDevicesGroups;
 using ::xla::GlobalDeviceId;
 using ::xla::RankId;
 using ::xla::ReplicaGroup;
-using ::xla::U64;
 using ::xla::gpu::CollectiveCliqueRequests;
 using ::xla::gpu::CollectiveCliques;
 using ::xla::gpu::CollectiveMemory;
@@ -106,61 +97,6 @@ struct CollectiveCallPreparedState {
   LoadedModule::FunctionHandle function;
 };
 
-class ExecutionResourcePool {
- public:
-  absl::StatusOr<std::unique_ptr<se::MemoryAllocation>> AcquireHostAllocation(
-      se::StreamExecutor* executor, uint64_t size) {
-    {
-      absl::MutexLock lock(&mutex_);
-      auto& allocations = host_allocations_[executor];
-      auto allocation = std::find_if(
-          allocations.begin(), allocations.end(),
-          [size](const std::unique_ptr<se::MemoryAllocation>& candidate) {
-            return candidate->address().size() >= size;
-          });
-      if (allocation != allocations.end()) {
-        std::unique_ptr<se::MemoryAllocation> result = std::move(*allocation);
-        allocations.erase(allocation);
-        return result;
-      }
-    }
-    return executor->HostMemoryAllocate(size);
-  }
-
-  absl::StatusOr<std::unique_ptr<se::Event>> AcquireEvent(
-      se::StreamExecutor* executor) {
-    {
-      absl::MutexLock lock(&mutex_);
-      auto& events = events_[executor];
-      if (!events.empty()) {
-        std::unique_ptr<se::Event> event = std::move(events.back());
-        events.pop_back();
-        return event;
-      }
-    }
-    return executor->CreateEvent();
-  }
-
-  void Release(se::StreamExecutor* executor,
-               std::unique_ptr<se::MemoryAllocation> host_allocation,
-               std::unique_ptr<se::Event> event) {
-    absl::MutexLock lock(&mutex_);
-    if (host_allocation != nullptr) {
-      host_allocations_[executor].push_back(std::move(host_allocation));
-    }
-    if (event != nullptr) events_[executor].push_back(std::move(event));
-  }
-
- private:
-  absl::Mutex mutex_;
-  absl::flat_hash_map<se::StreamExecutor*,
-                      std::vector<std::unique_ptr<se::MemoryAllocation>>>
-      host_allocations_ ABSL_GUARDED_BY(mutex_);
-  absl::flat_hash_map<se::StreamExecutor*,
-                      std::vector<std::unique_ptr<se::Event>>>
-      events_ ABSL_GUARDED_BY(mutex_);
-};
-
 class CollectiveCallState {
  public:
   CollectiveCallState(wire::CollectiveCallConfigV3 config, ModuleImage image)
@@ -172,55 +108,16 @@ class CollectiveCallState {
     return module_loader_.GetOrLoad(image_);
   }
 
-  const std::shared_ptr<ExecutionResourcePool>& execution_resource_pool() {
-    return execution_resource_pool_;
-  }
-
  private:
   const wire::CollectiveCallConfigV3 config_;
   ModuleImage image_;
   ModuleLoader module_loader_;
-  std::shared_ptr<ExecutionResourcePool> execution_resource_pool_ =
-      std::make_shared<ExecutionResourcePool>();
 };
 
 struct CollectiveCallInitializedState {
   se::StreamExecutor* executor;
-  size_t peer_address_count;
-  std::unique_ptr<se::MemoryAllocation> peer_addresses_host;
+  internal::PeerAddresses peer_addresses;
 };
-
-struct RetainedExecutionResources {
-  se::StreamExecutor* executor;
-  std::shared_ptr<ExecutionResourcePool> pool;
-  std::unique_ptr<se::MemoryAllocation> peer_addresses_host;
-};
-
-using PeerAddressTableResult = ffi::Result<ffi::BufferR2<U64>>;
-
-absl::Status ValidatePeerAddressTable(
-    const wire::CollectiveCallConfigV3& config,
-    PeerAddressTableResult& peer_address_table) {
-  ffi::BufferR2<U64>::Dimensions dimensions = peer_address_table->dimensions();
-  if (dimensions[0] < 0 || dimensions[1] < 0 ||
-      static_cast<uint64_t>(dimensions[0]) != config.peer_regions_size() ||
-      dimensions[1] != config.abi_clique_size()) {
-    return absl::InvalidArgumentError(absl::StrFormat(
-        "CuTeDSL collective peer-address table has shape [%d, %d]; expected "
-        "[%d, %d]",
-        dimensions[0], dimensions[1], config.peer_regions_size(),
-        config.abi_clique_size()));
-  }
-  return absl::OkStatus();
-}
-
-absl::StatusOr<uint64_t> PeerAddressTableByteSize(size_t address_count) {
-  if (address_count > std::numeric_limits<uint64_t>::max() / sizeof(uint64_t)) {
-    return absl::InvalidArgumentError(
-        "CuTeDSL collective peer-address table byte size overflows");
-  }
-  return static_cast<uint64_t>(address_count) * sizeof(uint64_t);
-}
 
 absl::StatusOr<uint64_t> AddAddressOffset(void* base, uint64_t offset,
                                           absl::string_view description) {
@@ -403,7 +300,7 @@ absl::StatusOr<std::vector<se::DeviceAddressBase>> GetPeerRegionBuffers(
 
 namespace internal {
 
-absl::StatusOr<std::vector<uint64_t>> ResolvePeerAddresses(
+absl::StatusOr<PeerAddresses> ResolvePeerAddresses(
     const GpuCliqueKey& clique_key, RankId rank,
     const wire::CollectiveCallConfigV3& config,
     absl::Span<const se::DeviceAddressBase> buffers,
@@ -425,7 +322,7 @@ absl::StatusOr<std::vector<uint64_t>> ResolvePeerAddresses(
     return absl::InvalidArgumentError("Peer-address table size overflows");
   }
 
-  std::vector<uint64_t> peer_addresses;
+  PeerAddresses peer_addresses;
   peer_addresses.reserve(peer_region_count * clique_key.num_devices());
 
   for (int region_index = 0; region_index < config.peer_regions_size();
@@ -545,8 +442,8 @@ absl::StatusOr<std::vector<uint64_t>> ResolvePeerAddresses(
 namespace {
 
 absl::StatusOr<std::unique_ptr<CollectiveCallState>> Instantiate(
-    ffi::RemainingArgs arguments, PeerAddressTableResult peer_address_table,
-    ffi::RemainingRets results, ffi::Dictionary attributes) {
+    ffi::RemainingArgs arguments, ffi::RemainingRets results,
+    ffi::Dictionary attributes) {
   absl::StatusOr<absl::string_view> module =
       attributes.get<absl::string_view>("module");
   if (!module.ok()) {
@@ -584,8 +481,6 @@ absl::StatusOr<std::unique_ptr<CollectiveCallState>> Instantiate(
       wire::CollectiveCallConfigV3 config,
       ParseAndValidateCollectiveCallConfig(*serialized_config));
   ABSL_ASSIGN_OR_RETURN(ModuleImage image, ModuleImage::Create(*module, *key));
-  ABSL_RETURN_IF_ERROR(ValidatePeerAddressTable(config, peer_address_table));
-
   // Instantiate receives prototype buffers with null data pointers but exact
   // types and shapes. Validate all configuration-to-buffer mappings here and
   // repeat address-dependent validation during Prepare.
@@ -598,8 +493,7 @@ absl::StatusOr<std::unique_ptr<CollectiveCallState>> Instantiate(
 
 absl::StatusOr<std::unique_ptr<CollectiveCallPreparedState>> Prepare(
     CollectiveCallState* state, ffi::RemainingArgs arguments,
-    PeerAddressTableResult peer_address_table, ffi::RemainingRets results,
-    const CollectiveParams* collective_params,
+    ffi::RemainingRets results, const CollectiveParams* collective_params,
     CollectiveCliqueRequests* clique_requests,
     CollectiveMemoryRequests* memory_requests) {
   if (state == nullptr || collective_params == nullptr ||
@@ -617,7 +511,6 @@ absl::StatusOr<std::unique_ptr<CollectiveCallPreparedState>> Prepare(
   }
 
   const wire::CollectiveCallConfigV3& config = state->config();
-  ABSL_RETURN_IF_ERROR(ValidatePeerAddressTable(config, peer_address_table));
   // A partial group can cause only some ranks to request the clique and leave
   // the others deadlocked. Validate the complete logical domain before making
   // any resource request.
@@ -698,8 +591,7 @@ absl::StatusOr<std::unique_ptr<CollectiveCallPreparedState>> Prepare(
 absl::StatusOr<std::unique_ptr<CollectiveCallInitializedState>> Initialize(
     se::Stream* stream, CollectiveCallState* state,
     CollectiveCallPreparedState* prepared, ffi::RemainingArgs arguments,
-    PeerAddressTableResult peer_address_table, ffi::RemainingRets results,
-    const CollectiveParams* collective_params,
+    ffi::RemainingRets results, const CollectiveParams* collective_params,
     const CollectiveMemory* collective_memory) {
   if (stream == nullptr || state == nullptr || prepared == nullptr ||
       collective_params == nullptr || collective_memory == nullptr) {
@@ -722,46 +614,24 @@ absl::StatusOr<std::unique_ptr<CollectiveCallInitializedState>> Initialize(
   }
 
   const wire::CollectiveCallConfigV3& config = state->config();
-  ABSL_RETURN_IF_ERROR(ValidatePeerAddressTable(config, peer_address_table));
   ABSL_ASSIGN_OR_RETURN(std::vector<se::DeviceAddressBase> peer_region_buffers,
                         GetPeerRegionBuffers(config, arguments, results,
                                              /*require_addresses=*/true));
-  ABSL_ASSIGN_OR_RETURN(std::vector<uint64_t> peer_addresses,
+  ABSL_ASSIGN_OR_RETURN(internal::PeerAddresses peer_addresses,
                         internal::ResolvePeerAddresses(
                             prepared->clique_key, prepared->rank, config,
                             peer_region_buffers, *collective_memory));
 
-  // XLA may reuse the result allocation before this thunk executes. Keep only
-  // pinned staging data in Initialize and populate the result in Execute.
-  std::unique_ptr<se::MemoryAllocation> peer_addresses_host;
-  if (!peer_addresses.empty()) {
-    ABSL_ASSIGN_OR_RETURN(uint64_t peer_addresses_size,
-                          PeerAddressTableByteSize(peer_addresses.size()));
-    ABSL_ASSIGN_OR_RETURN(
-        std::unique_ptr<se::MemoryAllocation> allocation,
-        state->execution_resource_pool()->AcquireHostAllocation(
-            prepared->executor, peer_addresses_size));
-    if (allocation == nullptr || allocation->address().is_null() ||
-        allocation->address().size() < peer_addresses_size) {
-      return absl::ResourceExhaustedError(
-          "Failed to allocate CuTeDSL collective peer-address staging memory");
-    }
-    std::memcpy(allocation->address().opaque(), peer_addresses.data(),
-                peer_addresses_size);
-    peer_addresses_host = std::move(allocation);
-  }
-
   return std::make_unique<CollectiveCallInitializedState>(
-      CollectiveCallInitializedState{prepared->executor, peer_addresses.size(),
-                                     std::move(peer_addresses_host)});
+      CollectiveCallInitializedState{prepared->executor,
+                                     std::move(peer_addresses)});
 }
 
 absl::Status ExecuteKernel(se::Stream* stream,
                            const wire::CollectiveCallConfigV3& config,
                            const CollectiveCallPreparedState& prepared,
                            const CollectiveCliques& collective_cliques,
-                           const uint64_t* device_peer_addresses,
-                           const uint64_t* host_peer_addresses,
+                           const uint64_t* peer_addresses,
                            ffi::RemainingArgs arguments,
                            ffi::RemainingRets results) {
   absl::InlinedVector<CuteXlaFfiBuffer, kInlineBufferCount> buffers;
@@ -783,8 +653,7 @@ absl::Status ExecuteKernel(se::Stream* stream,
   }
 
   CollectiveContextAbi collective_context = {
-      device_peer_addresses,
-      host_peer_addresses,
+      peer_addresses,
       static_cast<int32_t>(prepared.rank.value()),
       prepared.clique_size,
   };
@@ -836,88 +705,11 @@ absl::Status ExecuteKernel(se::Stream* stream,
   return absl::OkStatus();
 }
 
-absl::Status RetainResourcesUntilStreamComplete(
-    se::Stream* stream, std::shared_ptr<ExecutionResourcePool> pool,
-    std::unique_ptr<se::MemoryAllocation> peer_addresses_host) {
-  if (peer_addresses_host == nullptr) return absl::OkStatus();
-
-  auto retained =
-      std::make_unique<RetainedExecutionResources>(RetainedExecutionResources{
-          stream->parent(), std::move(pool), std::move(peer_addresses_host)});
-
-  absl::StatusOr<std::unique_ptr<se::Event>> created_event =
-      retained->pool->AcquireEvent(retained->executor);
-  if (!created_event.ok()) {
-    LOG(WARNING) << "Could not create a completion event for CuTeDSL "
-                    "collective resources; synchronizing the stream: "
-                 << created_event.status();
-    absl::Status synchronized = stream->BlockHostUntilDone();
-    if (synchronized.ok()) {
-      retained->pool->Release(retained->executor,
-                              std::move(retained->peer_addresses_host),
-                              /*event=*/nullptr);
-      return absl::OkStatus();
-    }
-
-    // Work may still reference these objects. Keeping them alive is safer
-    // than releasing module or registered barrier resources after a failed
-    // synchronization.
-    retained.release();
-    return absl::InternalError(absl::StrFormat(
-        "Could not retain CuTeDSL collective resources: event creation "
-        "failed (%s) and stream synchronization failed (%s)",
-        created_event.status().ToString(), synchronized.ToString()));
-  }
-
-  std::unique_ptr<se::Event> event = std::move(*created_event);
-  absl::Status recorded = stream->RecordEvent(event.get());
-  if (!recorded.ok()) {
-    LOG(WARNING) << "Could not record a completion event for CuTeDSL "
-                    "collective resources; synchronizing the stream: "
-                 << recorded;
-    absl::Status synchronized = stream->BlockHostUntilDone();
-    if (synchronized.ok()) {
-      retained->pool->Release(retained->executor,
-                              std::move(retained->peer_addresses_host),
-                              /*event=*/nullptr);
-      return absl::OkStatus();
-    }
-
-    event.release();
-    retained.release();
-    return absl::InternalError(absl::StrFormat(
-        "Could not retain CuTeDSL collective resources: event recording "
-        "failed (%s) and stream synchronization failed (%s)",
-        recorded.ToString(), synchronized.ToString()));
-  }
-
-  // Waiting on a host worker avoids destroying CUDA/NCCL-backed objects from
-  // a stream host callback. If synchronization reports an error, preserve the
-  // resources because the device may still reference them.
-  tsl::Env::Default()->SchedClosure(
-      [event = std::move(event), retained = std::move(retained)]() mutable {
-        absl::Status synchronized = event->Synchronize();
-        if (!synchronized.ok()) {
-          LOG(ERROR) << "CuTeDSL collective completion event failed: "
-                     << synchronized << "; retaining execution resources";
-          event.release();
-          retained.release();
-          return;
-        }
-        retained->pool->Release(retained->executor,
-                                std::move(retained->peer_addresses_host),
-                                std::move(event));
-      });
-  return absl::OkStatus();
-}
-
 absl::Status Execute(se::Stream* stream, CollectiveCallState* state,
                      CollectiveCallPreparedState* prepared,
                      CollectiveCallInitializedState* initialized,
                      const CollectiveCliques* collective_cliques,
-                     ffi::RemainingArgs arguments,
-                     PeerAddressTableResult peer_address_table,
-                     ffi::RemainingRets results) {
+                     ffi::RemainingArgs arguments, ffi::RemainingRets results) {
   if (stream == nullptr || state == nullptr || prepared == nullptr ||
       initialized == nullptr || collective_cliques == nullptr) {
     return absl::FailedPreconditionError(
@@ -935,7 +727,6 @@ absl::Status Execute(se::Stream* stream, CollectiveCallState* state,
   }
 
   const wire::CollectiveCallConfigV3& config = state->config();
-  ABSL_RETURN_IF_ERROR(ValidatePeerAddressTable(config, peer_address_table));
   size_t peer_region_count = static_cast<size_t>(config.peer_regions_size());
   if (peer_region_count > std::numeric_limits<size_t>::max() /
                               static_cast<size_t>(prepared->clique_size)) {
@@ -944,68 +735,25 @@ absl::Status Execute(se::Stream* stream, CollectiveCallState* state,
   }
   size_t expected_peer_addresses =
       peer_region_count * static_cast<size_t>(prepared->clique_size);
-  if (initialized->peer_address_count != expected_peer_addresses) {
+  if (initialized->peer_addresses.size() != expected_peer_addresses) {
     return absl::FailedPreconditionError(absl::StrFormat(
         "CuTeDSL collective peer-address table has %d entries; expected %d",
-        initialized->peer_address_count, expected_peer_addresses));
-  }
-  if ((expected_peer_addresses == 0) !=
-      (initialized->peer_addresses_host == nullptr)) {
-    return absl::FailedPreconditionError(
-        "CuTeDSL collective peer-address staging memory is inconsistent with "
-        "the configured table shape");
+        initialized->peer_addresses.size(), expected_peer_addresses));
   }
 
-  const uint64_t* peer_addresses = nullptr;
-  absl::Status execution = [&]() -> absl::Status {
-    if (expected_peer_addresses != 0) {
-      se::DeviceAddressBase peer_addresses_device =
-          peer_address_table->device_memory();
-      ABSL_ASSIGN_OR_RETURN(uint64_t peer_addresses_size,
-                            PeerAddressTableByteSize(expected_peer_addresses));
-      if (peer_addresses_device.is_null() ||
-          peer_addresses_device.size() < peer_addresses_size) {
-        return absl::FailedPreconditionError(
-            "CuTeDSL collective peer-address device table is unavailable or "
-            "too small");
-      }
-      // The generated function launches on this stream, so the table copy is
-      // ordered before every kernel that dereferences the context pointer.
-      ABSL_RETURN_IF_ERROR(
-          stream->Memcpy(&peer_addresses_device,
-                         initialized->peer_addresses_host->address().opaque(),
-                         peer_addresses_size));
-      peer_addresses =
-          static_cast<const uint64_t*>(peer_addresses_device.opaque());
-    }
-    return ExecuteKernel(
-        stream, config, *prepared, *collective_cliques, peer_addresses,
-        expected_peer_addresses == 0
-            ? nullptr
-            : static_cast<const uint64_t*>(
-                  initialized->peer_addresses_host->address().opaque()),
-        arguments, results);
-  }();
-  // A failed copy or launch can still leave work in flight, so arrange safe
-  // teardown for every Execute attempt that can enqueue work.
-  absl::Status retention = RetainResourcesUntilStreamComplete(
-      stream, state->execution_resource_pool(),
-      std::move(initialized->peer_addresses_host));
-  if (!execution.ok()) {
-    if (!retention.ok()) {
-      LOG(ERROR) << "CuTeDSL collective execution failed and resource "
-                    "retention also failed: "
-                 << retention;
-    }
-    return execution;
-  }
-  return retention;
+  // The generated host launcher resolves the table before returning. CUDA
+  // copies scalar kernel arguments and TMA descriptors during each launch, so
+  // device work does not retain this host storage.
+  return ExecuteKernel(stream, config, *prepared, *collective_cliques,
+                       initialized->peer_addresses.empty()
+                           ? nullptr
+                           : initialized->peer_addresses.data(),
+                       arguments, results);
 }
 
 XLA_FFI_DEFINE_HANDLER(kInstantiate, Instantiate,
                        ffi::Ffi::BindInstantiate()
                            .RemainingArgs()
-                           .Ret<ffi::BufferR2<U64>>()
                            .RemainingRets()
                            .Attrs<ffi::Dictionary>());
 
@@ -1013,7 +761,6 @@ XLA_FFI_DEFINE_HANDLER(kPrepare, Prepare,
                        ffi::Ffi::BindPrepare()
                            .Ctx<ffi::State<CollectiveCallState>>()
                            .RemainingArgs()
-                           .Ret<ffi::BufferR2<U64>>()
                            .RemainingRets()
                            .Ctx<ffi::CollectiveParams>()
                            .Ctx<ffi::CollectiveCliqueRequests>()
@@ -1025,7 +772,6 @@ XLA_FFI_DEFINE_HANDLER(kInitialize, Initialize,
                            .Ctx<ffi::State<CollectiveCallState>>()
                            .Ctx<ffi::Prepared<CollectiveCallPreparedState>>()
                            .RemainingArgs()
-                           .Ret<ffi::BufferR2<U64>>()
                            .RemainingRets()
                            .Ctx<ffi::CollectiveParams>()
                            .Ctx<ffi::CollectiveMemory>());
@@ -1039,7 +785,6 @@ XLA_FFI_DEFINE_HANDLER(
         .Ctx<ffi::Initialized<CollectiveCallInitializedState>>()
         .Ctx<ffi::CollectiveCliques>()
         .RemainingArgs()
-        .Ret<ffi::BufferR2<U64>>()
         .RemainingRets());
 
 XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), kCollectiveCallTarget.data(),

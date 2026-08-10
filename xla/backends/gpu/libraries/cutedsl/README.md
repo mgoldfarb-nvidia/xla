@@ -9,25 +9,21 @@ SHA-256 `key`, plus a `config_format="protobuf"` discriminator and a `config`
 string containing the serialized `CollectiveCallConfigV3` wire message. The
 complete collective configuration and module digest are validated during
 Instantiate. The config records the clique width used to compile the
-region-major address table. The first FFI result is an internal
-`U64[peer_region_count, abi_clique_size]` scratch buffer allocated by XLA in
-device memory; remaining results are the generated function's ordinary
-results. Prepare rejects a different runtime clique width before loading the
-module or requesting collective resources. Initialize resolves the absolute
-addresses, and Execute copies them into the scratch result immediately before
-launching the generated function on the same stream. Symmetric rows contain
-one peer address per rank. Multimem rows contain the rank-local LSA multimem
-alias from the NCCL symmetric window, repeated across the row to preserve the
-v3 table shape.
+region-major address table. Prepare rejects a different runtime clique width
+before loading the module or requesting collective resources. Initialize
+resolves the absolute addresses into host metadata. Symmetric rows contain one
+peer address per rank. Multimem rows contain the rank-local LSA multimem alias
+from the NCCL symmetric window, repeated across the row to preserve the v3
+table shape.
 
-The generated-function frame carries one pointer to a fixed 24-byte host
+The generated-function frame carries one pointer to a fixed 16-byte host
 `CollectiveContextAbi` descriptor instead of one argument per peer address.
-The descriptor contains identical pinned-host and device views of the address
-table, plus rank and clique size. Generated host code can use the host view for
-TMA descriptor initialization and constructs a row-major CuTe global-memory
-tensor over the device view. Device kernels index the tensor to load an
-absolute peer or multimem address; independent regions do not need to share an
-allocation layout.
+The descriptor contains a host address-table view plus rank and clique size.
+Generated host code resolves peer or multimem pointers while constructing TMA
+descriptors or kernel arguments. Device kernels never access the metadata
+table, so collective execution requires no device scratch result, host-to-device
+metadata copy, or completion event. Independent regions do not need to share
+an allocation layout.
 
 ## Runtime linkage
 

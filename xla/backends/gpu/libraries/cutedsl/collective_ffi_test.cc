@@ -59,7 +59,6 @@ limitations under the License.
 #include "xla/service/gpu/gpu_executable_run_options.h"
 #include "xla/service/service_executable_run_options.h"
 #include "xla/stream_executor/device_address.h"
-#include "xla/stream_executor/event.h"
 #include "xla/stream_executor/mock_platform.h"
 #include "xla/stream_executor/mock_stream.h"
 #include "xla/stream_executor/mock_stream_executor.h"
@@ -78,7 +77,6 @@ using ::xla::LocalDeviceId;
 using ::xla::RankId;
 using ::xla::ServiceExecutableRunOptions;
 using ::xla::SymmetricMemory;
-using ::xla::U64;
 using ::xla::gpu::CollectiveCliqueRequests;
 using ::xla::gpu::CollectiveCliques;
 using ::xla::gpu::CollectiveMemory;
@@ -123,8 +121,7 @@ struct FakeRuntime {
   void* stream = nullptr;
   std::vector<CapturedBuffer> buffers;
   std::vector<uint64_t> peer_addresses;
-  const uint64_t* device_peer_addresses = nullptr;
-  const uint64_t* host_peer_addresses = nullptr;
+  const uint64_t* peer_address_table = nullptr;
   int32_t rank = -1;
   int32_t clique_size = -1;
   int32_t cuda_error = 0;
@@ -215,24 +212,17 @@ CuteDSLRT_Error_t FunctionRun(void* function, void** arguments,
   CollectiveContextAbi context;
   std::memcpy(&context, context_address, sizeof(context));
   if (fake_runtime->expected_peer_address_count != 0 &&
-      (context.device_peer_addresses == nullptr ||
-       context.host_peer_addresses == nullptr)) {
+      context.peer_addresses == nullptr) {
     ADD_FAILURE() << "CollectiveContext has no peer-address table";
     return CuteDSLRT_Error_CudaError;
   }
 
   fake_runtime->peer_addresses.clear();
-  fake_runtime->device_peer_addresses = context.device_peer_addresses;
-  fake_runtime->host_peer_addresses = context.host_peer_addresses;
+  fake_runtime->peer_address_table = context.peer_addresses;
   if (fake_runtime->expected_peer_address_count != 0) {
-    EXPECT_EQ(std::memcmp(
-                  context.device_peer_addresses, context.host_peer_addresses,
-                  fake_runtime->expected_peer_address_count * sizeof(uint64_t)),
-              0);
     fake_runtime->peer_addresses.assign(
-        context.device_peer_addresses,
-        context.device_peer_addresses +
-            fake_runtime->expected_peer_address_count);
+        context.peer_addresses,
+        context.peer_addresses + fake_runtime->expected_peer_address_count);
   }
   fake_runtime->rank = context.rank;
   fake_runtime->clique_size = context.clique_size;
@@ -477,20 +467,6 @@ uint64_t AddressValue(void* address, uint64_t offset = 0) {
   return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(address)) + offset;
 }
 
-class TestHostMemoryAllocation final : public se::MemoryAllocation {
- public:
-  explicit TestHostMemoryAllocation(uint64_t size)
-      : storage_(std::make_unique<std::byte[]>(size)), size_(size) {}
-
-  se::DeviceAddressBase address() const override {
-    return se::DeviceAddressBase(storage_.get(), size_);
-  }
-
- private:
-  std::unique_ptr<std::byte[]> storage_;
-  uint64_t size_;
-};
-
 class CollectiveFfiInvocation {
  public:
   CollectiveFfiInvocation(TestAttributes attributes, int64_t replica_count,
@@ -502,40 +478,12 @@ class CollectiveFfiInvocation {
         arguments_(std::move(arguments)),
         results_(std::move(results)),
         registration_(ffi::FindHandler(kCollectiveTarget, "CUDA")) {
-    peer_address_table_dimensions_ = {
-        static_cast<int64_t>(attributes_.peer_regions.size() / 6),
-        attributes_.abi_clique_size};
-    peer_address_table_.resize(peer_address_table_dimensions_[0] *
-                               peer_address_table_dimensions_[1]);
-
     ON_CALL(stream_, parent()).WillByDefault(Return(&executor_));
     ON_CALL(stream_, platform_specific_handle())
         .WillByDefault(
             Return(se::Stream::PlatformSpecificHandle{&fake_stream_handle_}));
     ON_CALL(executor_, GetPlatform()).WillByDefault(Return(&platform_));
     ON_CALL(platform_, Name()).WillByDefault(ReturnRef(platform_name_));
-    ON_CALL(executor_, HostMemoryAllocate(testing::_))
-        .WillByDefault(
-            [this](uint64_t size)
-                -> absl::StatusOr<std::unique_ptr<se::MemoryAllocation>> {
-              ++host_allocation_count_;
-              return std::make_unique<TestHostMemoryAllocation>(size);
-            });
-    ON_CALL(stream_, Memcpy(testing::A<se::DeviceAddressBase*>(),
-                            testing::A<const void*>(), testing::_))
-        .WillByDefault([this](se::DeviceAddressBase* destination,
-                              const void* source, uint64_t size) {
-          ++h2d_copy_count_;
-          if (destination == nullptr || destination->size() < size ||
-              (size != 0 && (destination->is_null() || source == nullptr))) {
-            return absl::InvalidArgumentError("invalid test H2D copy");
-          }
-          if (size != 0) {
-            std::memcpy(destination->opaque(), source, size);
-          }
-          return absl::OkStatus();
-        });
-
     device_assignment_.emplace(replica_count, partition_count);
     int64_t device = 0;
     for (int64_t replica = 0; replica < replica_count; ++replica) {
@@ -649,21 +597,6 @@ class CollectiveFfiInvocation {
   se::MockStream& stream() { return stream_; }
   se::MockStreamExecutor& executor() { return executor_; }
   void* platform_stream() { return &fake_stream_handle_; }
-  int h2d_copy_count() const { return h2d_copy_count_; }
-  int host_allocation_count() const { return host_allocation_count_; }
-
-  void SetPeerAddressTableDimensions(std::array<int64_t, 2> dimensions) {
-    peer_address_table_dimensions_ = dimensions;
-  }
-
-  const uint64_t* peer_address_table_data() const {
-    return peer_address_table_.data();
-  }
-
-  void RelocatePeerAddressTable() {
-    std::vector<uint64_t> relocated(peer_address_table_.size());
-    peer_address_table_.swap(relocated);
-  }
 
  private:
   void UpdateGpuContext() {
@@ -678,18 +611,12 @@ class CollectiveFfiInvocation {
   }
 
   ffi::CallFrame BuildCallFrame() const {
-    ffi::CallFrameBuilder builder(arguments_.size(), results_.size() + 1);
+    ffi::CallFrameBuilder builder(arguments_.size(), results_.size());
     for (const se::DeviceAddressBase& argument : arguments_) {
       std::array<int64_t, 1> dimensions = {
           static_cast<int64_t>(argument.size())};
       builder.AddBufferArg(argument, U8, dimensions);
     }
-    void* peer_address_table =
-        peer_address_table_.empty() ? nullptr : peer_address_table_.data();
-    builder.AddBufferRet(
-        se::DeviceAddressBase(peer_address_table,
-                              peer_address_table_.size() * sizeof(uint64_t)),
-        U64, peer_address_table_dimensions_);
     for (const se::DeviceAddressBase& result : results_) {
       std::array<int64_t, 1> dimensions = {static_cast<int64_t>(result.size())};
       builder.AddBufferRet(result, U8, dimensions);
@@ -701,10 +628,6 @@ class CollectiveFfiInvocation {
   TestAttributes attributes_;
   std::vector<se::DeviceAddressBase> arguments_;
   std::vector<se::DeviceAddressBase> results_;
-  mutable std::vector<uint64_t> peer_address_table_;
-  std::array<int64_t, 2> peer_address_table_dimensions_ = {};
-  int h2d_copy_count_ = 0;
-  int host_allocation_count_ = 0;
   int fake_stream_handle_ = 0;
   std::string platform_name_ = "CUDA";
   NiceMock<se::MockPlatform> platform_;
@@ -855,23 +778,6 @@ TEST(CollectiveFfiTest, IgnoresUnknownOuterAttributes) {
 
   ASSERT_THAT(invocation.status(), IsOk());
   EXPECT_THAT(invocation.Instantiate(), IsOk());
-}
-
-TEST(CollectiveFfiTest, RejectsPeerAddressTableWithWrongShape) {
-  TestAttributes attributes;
-  attributes.peer_regions = {
-      wire::PEER_REGION_ENDPOINT_PROTO_ARGUMENT, 0, 0, 16, 16,
-      wire::PEER_MEMORY_KIND_PROTO_SYMMETRIC,
-  };
-  CollectiveFfiInvocation invocation(std::move(attributes), /*replica_count=*/2,
-                                     /*partition_count=*/1,
-                                     /*current_device=*/0);
-  invocation.SetPeerAddressTableDimensions({2, 1});
-
-  ASSERT_THAT(invocation.status(), IsOk());
-  EXPECT_THAT(invocation.Instantiate(),
-              StatusIs(absl::StatusCode::kInvalidArgument,
-                       HasSubstr("has shape [2, 1]; expected [1, 2]")));
 }
 
 TEST(CollectiveFfiPrepareTest, ResolvesEverySupportedCollectiveGroupMode) {
@@ -1171,18 +1077,14 @@ TEST(CollectiveFfiExecuteTest, ExecutesSingleCutlassCall) {
   ASSERT_THAT(invocation.Instantiate(), IsOk());
   ASSERT_THAT(invocation.Prepare(), IsOk());
   ASSERT_THAT(invocation.Initialize(), IsOk());
-  EXPECT_EQ(invocation.h2d_copy_count(), 0);
 
-  EXPECT_CALL(invocation.executor(), CreateEvent()).Times(0);
   ASSERT_THAT(invocation.Execute(), IsOk());
-  EXPECT_EQ(invocation.h2d_copy_count(), 0);
 
   EXPECT_EQ(runtime.create_count, 1);
   EXPECT_THAT(runtime.function_prefixes, ElementsAre("cutlass_call"));
   EXPECT_EQ(runtime.function_handles.size(), 1);
   EXPECT_THAT(runtime.invoked_function_prefixes, ElementsAre("cutlass_call"));
-  EXPECT_EQ(runtime.device_peer_addresses, nullptr);
-  EXPECT_EQ(runtime.host_peer_addresses, nullptr);
+  EXPECT_EQ(runtime.peer_address_table, nullptr);
   EXPECT_TRUE(runtime.peer_addresses.empty());
   EXPECT_EQ(runtime.rank, 0);
   EXPECT_EQ(runtime.clique_size, 2);
@@ -1211,12 +1113,12 @@ TEST(CollectiveFfiExecuteTest, RequiresAcquiredBarrierCliqueBeforeCutlassCall) {
   EXPECT_EQ(runtime.run_count, 0);
 }
 
-TEST(CollectiveFfiExecuteTest, DoesNotCreateCompletionEventWithoutStaging) {
+TEST(CollectiveFfiExecuteTest, LaunchesWithoutPeerAddresses) {
   FakeRuntime runtime;
   ScopedFakeRuntime scoped_runtime(&runtime);
 
   TestAttributes attributes;
-  attributes.module = "collective completion-event test module";
+  attributes.module = "collective empty-address-table test module";
   CollectiveFfiInvocation invocation(std::move(attributes),
                                      /*replica_count=*/2,
                                      /*partition_count=*/1,
@@ -1227,16 +1129,12 @@ TEST(CollectiveFfiExecuteTest, DoesNotCreateCompletionEventWithoutStaging) {
   ASSERT_THAT(invocation.Prepare(), IsOk());
   ASSERT_THAT(invocation.Initialize(), IsOk());
 
-  EXPECT_CALL(invocation.executor(), CreateEvent()).Times(0);
-  EXPECT_CALL(invocation.stream(), RecordEvent(testing::_)).Times(0);
-  EXPECT_CALL(invocation.stream(), BlockHostUntilDone()).Times(0);
   ASSERT_THAT(invocation.Execute(), IsOk());
 
   EXPECT_THAT(runtime.invoked_function_prefixes, ElementsAre("cutlass_call"));
 }
 
-TEST(CollectiveFfiExecuteTest,
-     CopiesRegionAddressesPacksLaunchFrameAndReusesStagingMemory) {
+TEST(CollectiveFfiExecuteTest, ResolvesRegionAddressesAndPacksLaunchFrame) {
   FakeRuntime runtime;
   runtime.expected_buffer_ranks = {1, 1};
   runtime.expected_peer_address_count = 4;
@@ -1296,25 +1194,13 @@ TEST(CollectiveFfiExecuteTest,
   symmetric_memories.emplace(std::make_pair(clique_key, 1), symmetric1);
   invocation.SetSymmetricMemories(std::move(symmetric_memories));
 
+  EXPECT_CALL(invocation.executor(), HostMemoryAllocate(testing::_)).Times(0);
+  EXPECT_CALL(invocation.stream(),
+              Memcpy(testing::A<se::DeviceAddressBase*>(),
+                     testing::A<const void*>(), testing::_))
+      .Times(0);
   ASSERT_THAT(invocation.Initialize(), IsOk());
-  EXPECT_EQ(invocation.h2d_copy_count(), 0);
-  const uint64_t* initialized_table = invocation.peer_address_table_data();
-  invocation.RelocatePeerAddressTable();
-  ASSERT_NE(invocation.peer_address_table_data(), initialized_table);
-  EXPECT_CALL(invocation.executor(), CreateEvent())
-      .WillOnce([]() -> absl::StatusOr<std::unique_ptr<se::Event>> {
-        return absl::UnavailableError("injected completion-event failure");
-      });
-  EXPECT_CALL(invocation.stream(), BlockHostUntilDone())
-      .WillOnce(Return(absl::OkStatus()));
   ASSERT_THAT(invocation.Execute(), IsOk());
-  EXPECT_EQ(invocation.h2d_copy_count(), 1);
-  EXPECT_EQ(invocation.host_allocation_count(), 1);
-
-  invocation.ResetPerExecutionState();
-  ASSERT_THAT(invocation.Prepare(), IsOk());
-  ASSERT_THAT(invocation.Initialize(), IsOk());
-  EXPECT_EQ(invocation.host_allocation_count(), 1);
 
   EXPECT_EQ(runtime.run_count, 1);
   EXPECT_EQ(runtime.stream, invocation.platform_stream());
@@ -1328,10 +1214,7 @@ TEST(CollectiveFfiExecuteTest,
                           AddressValue(local0.bytes.data(), 48),
                           AddressValue(multimem1.bytes.data(), 96),
                           AddressValue(multimem1.bytes.data(), 96)));
-  EXPECT_EQ(runtime.device_peer_addresses,
-            invocation.peer_address_table_data());
-  EXPECT_NE(runtime.host_peer_addresses, nullptr);
-  EXPECT_NE(runtime.host_peer_addresses, runtime.device_peer_addresses);
+  EXPECT_NE(runtime.peer_address_table, nullptr);
   EXPECT_EQ(runtime.rank, 1);
   EXPECT_EQ(runtime.clique_size, 2);
 }
@@ -1353,7 +1236,6 @@ TEST(CollectiveFfiExecuteTest, PropagatesCudaErrorWrittenByGeneratedFunction) {
   ASSERT_THAT(invocation.Prepare(), IsOk());
   ASSERT_THAT(invocation.Initialize(), IsOk());
 
-  EXPECT_CALL(invocation.executor(), CreateEvent()).Times(0);
   EXPECT_THAT(invocation.Execute(),
               StatusIs(absl::StatusCode::kInternal,
                        HasSubstr("returned CUDA error 719")));
