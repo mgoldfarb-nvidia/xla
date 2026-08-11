@@ -658,7 +658,8 @@ absl::Status ExecuteKernel(se::Stream* stream,
       prepared.clique_size,
   };
 
-  // Must match collective_jit_wrapper: stream, context, inputs, rets.
+  // Must match collective_jit_wrapper: stream, context, then a flat buffer
+  // list containing all inputs followed by all rets.
   // Pointer-valued parameters use the MLIR packed C interface's extra level
   // of indirection. The CUDA error parameter points directly at scalar storage.
   absl::InlinedVector<void*, kInlineBufferCount + 2> pointer_values;

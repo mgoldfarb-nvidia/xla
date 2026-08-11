@@ -1135,7 +1135,7 @@ TEST(CollectiveFfiExecuteTest, LaunchesWithoutPeerAddresses) {
 }
 
 TEST(CollectiveFfiExecuteTest,
-     ResolvesRegionAddressesAndPacksStreamContextInputsRets) {
+     ResolvesRegionAddressesAndPacksStreamContextFlatBuffers) {
   FakeRuntime runtime;
   runtime.expected_buffer_ranks = {1, 1};
   runtime.expected_peer_address_count = 4;
