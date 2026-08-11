@@ -267,21 +267,6 @@ xla_cc_test(
 )
 
 xla_cc_test(
-    name = "ffi_registration_test",
-    srcs = ["ffi_registration_test.cc"],
-    deps = [
-        ":ffi",
-        "//xla/ffi:ffi_api",
-        "//xla/ffi:ffi_registry",
-        "//xla/ffi:type_registry",
-        "//xla/ffi/api:c_api",
-        "//xla/ffi/api:ffi",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_googletest//:gtest_main",
-    ],
-)
-
-xla_cc_test(
     name = "collective_ffi_test",
     srcs = ["collective_ffi_test.cc"],
     linkopts = _RUNTIME_TEST_LINKOPTS,
