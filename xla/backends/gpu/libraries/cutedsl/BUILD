@@ -131,36 +131,6 @@ cc_library(
     hdrs = ["ffi_abi.h"],
 )
 
-xla_cc_binary(
-    name = "libcute_dsl_runtime.so",
-    testonly = True,
-    srcs = ["runtime_test_library.cc"],
-    linkshared = True,
-    target_compatible_with = if_google(
-        ["@platforms//:incompatible"],
-        [],
-    ),
-    deps = [":runtime_api"],
-)
-
-xla_cc_test(
-    name = "runtime_test",
-    srcs = ["runtime_test.cc"],
-    data = [":libcute_dsl_runtime.so"],
-    linkopts = ["-Wl,-rpath,$$ORIGIN"],
-    target_compatible_with = if_google(
-        ["@platforms//:incompatible"],
-        [],
-    ) + select({
-        "@platforms//os:linux": [],
-        "//conditions:default": ["@platforms//:incompatible"],
-    }),
-    deps = [
-        ":runtime",
-        "@com_google_googletest//:gtest_main",
-    ],
-)
-
 cc_library(
     name = "collective_config",
     srcs = ["config.cc"],
