@@ -221,6 +221,15 @@ cc_library(
 )
 
 cc_library(
+    name = "ffi",
+    testonly = True,
+    srcs = ["ffi.cc"],
+    visibility = ["//visibility:public"],
+    deps = ["//xla/ffi/api:ffi"],
+    alwayslink = True,
+)
+
+cc_library(
     name = "handlers",
     visibility = ["//xla/service:__pkg__"],
     deps = select({
@@ -253,6 +262,21 @@ xla_cc_test(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+xla_cc_test(
+    name = "ffi_registration_test",
+    srcs = ["ffi_registration_test.cc"],
+    deps = [
+        ":ffi",
+        "//xla/ffi:ffi_api",
+        "//xla/ffi:ffi_registry",
+        "//xla/ffi:type_registry",
+        "//xla/ffi/api:c_api",
+        "//xla/ffi/api:ffi",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -313,11 +337,11 @@ xla_test(
         ["@platforms//:incompatible"],
     ),
     deps = [
-        ":runtime",
+        ":cutedsl_runtime_static",
+        ":ffi",
         "//xla:literal",
         "//xla:shape_util",
         "//xla:xla_data_proto_cc",
-        "//xla/ffi",
         "//xla/hlo/builder:xla_computation",
         "//xla/hlo/parser:hlo_parser",
         "//xla/pjrt:pjrt_client",

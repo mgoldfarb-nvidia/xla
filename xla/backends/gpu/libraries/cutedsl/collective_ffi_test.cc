@@ -1280,7 +1280,7 @@ TEST(CollectiveFfiPeerAddressesTest,
       local1.address().GetByteSlice(/*offset_bytes=*/64, /*size_bytes=*/128),
   };
 
-  absl::StatusOr<std::vector<uint64_t>> addresses =
+  absl::StatusOr<internal::PeerAddresses> addresses =
       internal::ResolvePeerAddresses(clique_key, RankId(0),
                                      ConfigWithRegions(regions), buffers,
                                      collective_memory);
@@ -1321,7 +1321,7 @@ TEST(CollectiveFfiPeerAddressesTest,
   std::array<se::DeviceAddressBase, 1> buffers = {
       local.address().GetByteSlice(/*offset_bytes=*/32, /*size_bytes=*/96)};
 
-  absl::StatusOr<std::vector<uint64_t>> addresses =
+  absl::StatusOr<internal::PeerAddresses> addresses =
       internal::ResolvePeerAddresses(clique_key, RankId(0),
                                      ConfigWithRegions(regions), buffers,
                                      collective_memory);
@@ -1380,7 +1380,7 @@ TEST(CollectiveFfiPeerAddressesTest, UsesFfiAddressForLocalPeerAlias) {
   std::array<se::DeviceAddressBase, 1> buffers = {
       local.address().GetByteSlice(/*offset_bytes=*/32, /*size_bytes=*/96)};
 
-  absl::StatusOr<std::vector<uint64_t>> addresses =
+  absl::StatusOr<internal::PeerAddresses> addresses =
       internal::ResolvePeerAddresses(clique_key, RankId(0),
                                      ConfigWithRegions(regions), buffers,
                                      collective_memory);

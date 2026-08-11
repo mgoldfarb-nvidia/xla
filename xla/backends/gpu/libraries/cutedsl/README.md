@@ -1,8 +1,18 @@
 # CuTeDSL FFI for OpenXLA's CUDA PJRT plugin
 
-OpenXLA's CUDA PJRT plugin registers only the
-`__xla_gpu_cutedsl_collective_v3` FFI target. CuTeDSL owns and registers its
-non-collective FFI targets.
+The test-only `ffi` library statically registers CuTeDSL 4.6.1's current v2
+non-collective handlers and state type. It lets external tests link a runtime
+archive and exercise the built-in targets without Python. The CuTeDSL runtime
+owns those symbols, their call ABI, and their lifecycle state; XLA contains
+registration only.
+
+The CUDA PJRT plugin does not link the non-collective registration library.
+Production CuTeDSL users load and register the runtime dynamically through the
+CuTeDSL Python package.
+
+The `collective_ffi` library implements and statically registers
+`__xla_gpu_cutedsl_collective_v3`. The collective handler remains in XLA
+because it acquires XLA-owned communicator and symmetric-memory resources.
 
 The collective target accepts top-level `module` bytes and their 32-byte
 SHA-256 `key`, plus a `config_format="protobuf"` discriminator and a `config`

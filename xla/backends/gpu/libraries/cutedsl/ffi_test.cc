@@ -13,8 +13,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "xla/ffi/ffi.h"
-
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -35,26 +33,8 @@ limitations under the License.
 #include "xla/tsl/platform/status_matchers.h"
 #include "xla/xla_data.pb.h"
 
-XLA_FFI_DECLARE_HANDLER_SYMBOL(CuteDSLRT_NvJaxCutlassCallInstantiate_v2);
-XLA_FFI_DECLARE_HANDLER_SYMBOL(CuteDSLRT_NvJaxCutlassCallPrepare_v2);
-XLA_FFI_DECLARE_HANDLER_SYMBOL(CuteDSLRT_NvJaxCutlassCallExecute_v2);
-
 namespace xla::gpu::cutedsl {
 namespace {
-
-namespace ffi = ::xla::ffi;
-
-// The CuTeDSL runtime owns these handlers. Register its exported lifecycle
-// bundle only in this test process to exercise the runtime-owned call target.
-XLA_FFI_REGISTER_HANDLER(
-    ffi::GetXlaFfiApi(), "__xla_gpu_cutedsl_call_v3", "CUDA",
-    (XLA_FFI_Handler_Bundle{
-        /*instantiate=*/CuteDSLRT_NvJaxCutlassCallInstantiate_v2,
-        /*prepare=*/CuteDSLRT_NvJaxCutlassCallPrepare_v2,
-        /*initialize=*/nullptr,
-        /*execute=*/CuteDSLRT_NvJaxCutlassCallExecute_v2,
-        /*record=*/nullptr}),
-    XLA_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE);
 
 TEST(CuteDslCustomCallTest, RunVectorAdd) {
   std::string hlo_text;
