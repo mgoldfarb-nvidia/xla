@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <optional>
+#include <string>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -35,6 +36,23 @@ namespace gpu {
 
 inline constexpr absl::string_view kFingerprintBeforeLHS =
     "fingerprint_before_lhs";
+inline constexpr absl::string_view kLhsScopeBeginMarker =
+    "XSCHED_LHS_SCOPE_BEGIN";
+inline constexpr absl::string_view kLhsScopeEndMarker = "XSCHED_LHS_SCOPE_END";
+inline constexpr absl::string_view kCollectiveHintsBindingMarker =
+    "XSCHED_COLLECTIVE_HINTS_BINDING";
+
+std::string FormatLhsScopeBeginLog(absl::string_view module_name,
+                                   int64_t module_id,
+                                   absl::string_view fingerprint);
+std::string FormatLhsScopeEndLog(absl::string_view module_name,
+                                 int64_t module_id,
+                                 absl::string_view fingerprint,
+                                 const absl::Status& status);
+std::string FormatCollectiveHintsBindingLog(
+    absl::string_view module_name, int64_t module_id,
+    absl::string_view fingerprint, absl::string_view target_fingerprint,
+    bool selected);
 
 // Converts sync collective instructions to a pair of async start and done
 // instructions.

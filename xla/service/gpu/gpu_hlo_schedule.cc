@@ -33,6 +33,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/escaping.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
@@ -61,6 +62,7 @@ limitations under the License.
 #include "xla/service/buffer_value.h"
 #include "xla/service/gpu/alias_info.h"
 #include "xla/service/gpu/backend_configs.pb.h"
+#include "xla/service/gpu/collective_hints_annotator.h"
 #include "xla/service/gpu/flag_utils.h"
 #include "xla/service/gpu/gpu_latency_hiding_scheduler.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
@@ -91,6 +93,36 @@ namespace gpu {
 
 using tensorflow::profiler::ProfiledInstructionsProto;
 
+std::string FormatLhsScopeBeginLog(absl::string_view module_name,
+                                   int64_t module_id,
+                                   absl::string_view fingerprint) {
+  return absl::StrCat(kLhsScopeBeginMarker, " module_name=\"",
+                      absl::CEscape(module_name), "\" module_id=", module_id,
+                      " fingerprint_before_lhs=", fingerprint);
+}
+
+std::string FormatLhsScopeEndLog(absl::string_view module_name,
+                                 int64_t module_id,
+                                 absl::string_view fingerprint,
+                                 const absl::Status& status) {
+  return absl::StrCat(
+      kLhsScopeEndMarker, " module_name=\"", absl::CEscape(module_name),
+      "\" module_id=", module_id, " fingerprint_before_lhs=", fingerprint,
+      " status_code=", absl::StatusCodeToString(status.code()),
+      " status_message=\"", absl::CEscape(status.message()), "\"");
+}
+
+std::string FormatCollectiveHintsBindingLog(
+    absl::string_view module_name, int64_t module_id,
+    absl::string_view fingerprint, absl::string_view target_fingerprint,
+    bool selected) {
+  return absl::StrCat(kCollectiveHintsBindingMarker, " module_name=\"",
+                      absl::CEscape(module_name), "\" module_id=", module_id,
+                      " fingerprint_before_lhs=", fingerprint,
+                      " target_fingerprint=", target_fingerprint,
+                      " selected=", selected ? "true" : "false");
+}
+
 namespace {
 
 absl::StatusOr<bool> UsesMultipleCollectiveDomains(const HloModule& module) {
@@ -101,7 +133,7 @@ absl::StatusOr<bool> UsesMultipleCollectiveDomains(const HloModule& module) {
         continue;
       }
       ABSL_ASSIGN_OR_RETURN(CollectiveCommunicationDomain domain,
-                       GetCollectiveCommunicationDomain(*instruction));
+                            GetCollectiveCommunicationDomain(*instruction));
       if (first_domain.has_value() && *first_domain != domain) {
         return true;
       }
@@ -580,6 +612,7 @@ std::unique_ptr<LatencyEstimator> GetLatencyEstimator(
             << sol_latency_estimator.status();
     return std::make_unique<GpuLatencyEstimator>(pointer_size);
   }
+  VLOG(1) << "Using GPU latency estimator (T-shirt sizes)";
   return gpu_latency_estimator;
 }
 
@@ -672,13 +705,18 @@ DelayMoveToHostAsyncStartCandidateCondition(
 absl::Status RunLatencyHidingSchedulerPasses(
     HloModule* module, int pointer_size, absl::string_view fingerprint,
     uint64_t memory_limit, const se::DeviceDescription& gpu_device_info,
-    mlir::MLIRContext* mlir_context, const GpuAliasInfo* alias_info) {
+    mlir::MLIRContext* mlir_context, const GpuAliasInfo* alias_info,
+    std::optional<CollectiveHintsConfig> collective_hints) {
   tsl::profiler::TraceMe traceme("RunLatencyHidingSchedulerPasses");
   HloPassPipeline pipeline("latency-hiding-scheduler");
   const DebugOptions& options = module->config().debug_options();
   ABSL_ASSIGN_OR_RETURN(bool uses_multiple_collective_domains,
-                   UsesMultipleCollectiveDomains(*module));
+                        UsesMultipleCollectiveDomains(*module));
 
+  if (collective_hints.has_value()) {
+    pipeline.AddPass<CollectiveHintsAnnotatorPass>(std::move(*collective_hints),
+                                                   std::string(fingerprint));
+  }
   pipeline.AddPass<LegalizeSchedulingAnnotations>(
       SchedulingAnnotationsConfig());
 
@@ -807,7 +845,13 @@ absl::Status RunLatencyHidingSchedulerPasses(
 }
 
 bool IsLHSEnabled(const HloModule& module, absl::string_view fingerprint,
-                  const se::DeviceDescription& gpu_device_info) {
+                  const se::DeviceDescription& gpu_device_info,
+                  bool has_collective_hints_for_module) {
+  if (has_collective_hints_for_module) {
+    VLOG(1) << "Collective hints selected this module; enabling the "
+               "latency-hiding scheduler.";
+    return true;
+  }
   if (IsPassEnabledAtOptimizationEffort<LatencyHidingScheduler>(module)) {
     // User specified opt level, we turn on the LHS.
     return true;
@@ -929,11 +973,29 @@ absl::StatusOr<ScheduleMetadata> ScheduleGpuModule(
   // Tag the module with its 128 bit fingerprint. The fingerprint should include
   // instruction name with ids.
   std::string fingerprint = TagWithFingerprint(module);
+  std::optional<CollectiveHintsConfig> collective_hints;
+  const std::string& hints_path =
+      module->config().debug_options().xla_gpu_collective_hints_file();
+  if (!hints_path.empty()) {
+    ABSL_ASSIGN_OR_RETURN(CollectiveHintsConfig config,
+                          LoadCollectiveHintsConfig(hints_path));
+    const bool selected = config.module_fingerprint() == fingerprint;
+    VLOG(1) << FormatCollectiveHintsBindingLog(
+        module->name(), module->unique_id(), fingerprint,
+        config.module_fingerprint(), selected);
+    if (selected) {
+      collective_hints.emplace(std::move(config));
+    }
+  }
   uint64_t memory_limit =
       GetSchedulerMemoryLimit(*module, gpu_device_info, pointer_size);
 
   // Module already has a schedule, do nothing.
   if (module->has_schedule()) {
+    if (collective_hints.has_value()) {
+      return absl::FailedPreconditionError(
+          "collective hints selected a module that was already scheduled");
+    }
     VLOG(1) << "Module already has a schedule, do nothing.";
     return ScheduleMetadata{memory_limit};
   }
@@ -943,20 +1005,26 @@ absl::StatusOr<ScheduleMetadata> ScheduleGpuModule(
   // See `xla::LatencyHidingScheduler::Run`.
   ABSL_RETURN_IF_ERROR(RunP2PSchedulePreparation(module));
   int64_t peak_memory_bytes;
-  ABSL_ASSIGN_OR_RETURN(HloSchedule schedule,
-                   ScheduleGpuModuleWithMemoryScheduler(
-                       module, alias_info, pointer_size, &peak_memory_bytes));
+  ABSL_ASSIGN_OR_RETURN(
+      HloSchedule schedule,
+      ScheduleGpuModuleWithMemoryScheduler(module, alias_info, pointer_size,
+                                           &peak_memory_bytes));
   ABSL_RETURN_IF_ERROR(module->set_schedule(std::move(schedule)));
 
-  bool enable_latency_hiding_scheduler =
-      IsLHSEnabled(*module, fingerprint, gpu_device_info);
+  bool enable_latency_hiding_scheduler = IsLHSEnabled(
+      *module, fingerprint, gpu_device_info, collective_hints.has_value());
 
   // Run Latency Hiding Scheduler (LHS). It maximizes the compute-communication
   // overlap, potentially at the cost of memory usage.
   if (enable_latency_hiding_scheduler) {
-    ABSL_RETURN_IF_ERROR(RunLatencyHidingSchedulerPasses(
+    VLOG(1) << FormatLhsScopeBeginLog(module->name(), module->unique_id(),
+                                      fingerprint);
+    absl::Status lhs_status = RunLatencyHidingSchedulerPasses(
         module, pointer_size, fingerprint, memory_limit, gpu_device_info,
-        mlir_context, alias_info));
+        mlir_context, alias_info, std::move(collective_hints));
+    VLOG(1) << FormatLhsScopeEndLog(module->name(), module->unique_id(),
+                                    fingerprint, lhs_status);
+    ABSL_RETURN_IF_ERROR(lhs_status);
   }
 
   return ScheduleMetadata{memory_limit, peak_memory_bytes};

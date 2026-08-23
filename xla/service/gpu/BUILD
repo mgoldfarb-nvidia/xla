@@ -2836,6 +2836,86 @@ cc_library(
     ],
 )
 
+tf_proto_library(
+    name = "collective_hints_proto",
+    srcs = ["collective_hints.proto"],
+)
+
+cc_library(
+    name = "collective_hints_annotator",
+    srcs = ["collective_hints_annotator.cc"],
+    hdrs = ["collective_hints_annotator.h"],
+    deps = [
+        ":backend_configs_cc",
+        ":collective_hints_proto_cc",
+        ":hlo_fusion_analysis",
+        ":ir_emission_utils",
+        "//xla:shape_util",
+        "//xla:side_effect_util",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass",
+        "//xla/hlo/utils:hlo_query",
+        "//xla/tsl/platform:env",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@tsl//tsl/platform:protobuf",
+    ],
+)
+
+xla_cc_test(
+    name = "collective_hints_annotator_test",
+    srcs = ["collective_hints_annotator_test.cc"],
+    deps = [
+        ":backend_configs_cc",
+        ":collective_hints_annotator",
+        ":collective_hints_proto_cc",
+        "//xla:shape_util",
+        "//xla:side_effect_util",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/tsl/platform:env",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+xla_cc_test(
+    name = "collective_hints_schedule_test",
+    srcs = ["collective_hints_schedule_test.cc"],
+    deps = [
+        ":alias_info",
+        ":backend_configs_cc",
+        ":collective_hints_annotator",
+        ":gpu_device_info_for_tests",
+        ":gpu_hlo_schedule",
+        "//xla:side_effect_util",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/service:hlo_module_config",
+        "//xla/stream_executor:device_description",
+        "//xla/tests:xla_internal_test_main",
+        "//xla/tsl/lib/core:status_test_util",
+        "//xla/tsl/platform:env",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest",
+        "@llvm-project//mlir:IR",
+    ],
+)
+
 cc_library(
     name = "gpu_hlo_schedule",
     srcs = ["gpu_hlo_schedule.cc"],
@@ -2843,6 +2923,7 @@ cc_library(
     deps = [
         ":alias_info",
         ":backend_configs_cc",
+        ":collective_hints_annotator",
         ":flag_utils",
         ":gpu_latency_hiding_scheduler",
         ":hlo_fusion_analysis",

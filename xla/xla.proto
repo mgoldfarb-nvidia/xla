@@ -1235,6 +1235,10 @@ message DebugOptions {
 
   optional string xla_gpu_pgle_profile_file_or_directory_path = 210;
 
+  // Strict textproto containing fingerprint-bound, exact-match scheduling
+  // annotations applied immediately before the GPU latency-hiding scheduler.
+  optional string xla_gpu_collective_hints_file = 534;
+
   // Controls all-gather pipelining.
   optional CollectivePipeliningMode xla_gpu_pipeline_all_gather = 517;
 

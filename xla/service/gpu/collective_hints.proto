@@ -1,0 +1,60 @@
+// Copyright 2026 The OpenXLA Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package xla.gpu;
+
+// An exact selector for one compile-scoped scheduling override.
+//
+// Select either an exact compiler instruction name or a complete exact
+// (op_name, opcode, shape) tuple from the same fingerprinted compile. Partial
+// tuples and fuzzy matching are intentionally unsupported. This is not a
+// cross-compile stable identifier.
+message CollectiveHintMatch {
+  string instruction_name = 1;
+  string op_name = 2;
+  string opcode = 3;
+  string shape = 4;
+
+  // Empty means any pass. The only nonempty values are "forward", "backward",
+  // and "remat".
+  string pass_filter = 5;
+}
+
+message CollectiveHint {
+  // Rule identifier included in deterministic application receipts.
+  string rule_id = 1;
+  CollectiveHintMatch match = 2;
+
+  // Required and strictly enforced. A changed graph must fail compilation
+  // instead of silently applying a rule to too few or too many instructions.
+  optional uint32 expected_match_count = 3;
+
+  // Supported actions. False/absent force_earliest has no effect.
+  bool force_earliest = 4;
+  optional int64 scheduling_group_id = 5;
+
+  // Exact compiler instruction name of one async collective start in the
+  // matched compute instruction's computation. Adds start -> compute -> done
+  // control dependencies after cycle validation.
+  string window_target = 6;
+}
+
+message CollectiveHintsConfig {
+  // The 128-bit lowercase hexadecimal fingerprint emitted as
+  // fingerprint_before_lhs in HLO dumps.
+  string module_fingerprint = 1;
+  repeated CollectiveHint hints = 2;
+}
