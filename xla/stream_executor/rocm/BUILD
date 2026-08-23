@@ -143,6 +143,7 @@ cc_library(
         ":rocm_context",
         ":rocm_event",
         ":rocm_kernel",
+        ":rocm_memory_bandwidth",
         ":rocm_pcie_bandwidth",
         ":rocm_platform_id",
         ":rocm_status",
@@ -404,6 +405,19 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@local_config_rocm//rocm:rocm_headers",
         "@local_config_rocm//rocm:rocm_smi",
+    ],
+)
+
+cc_library(
+    name = "rocm_memory_bandwidth",
+    srcs = ["rocm_memory_bandwidth.cc"],
+    hdrs = ["rocm_memory_bandwidth.h"],
+    tags = [
+        "gpu",
+        "rocm-only",
+    ],
+    deps = [
+        ":rocm_compute_capability",
     ],
 )
 
@@ -968,6 +982,59 @@ xla_test(
     ],
 )
 
+rocm_library(
+    name = "delay_kernel_rocm",
+    srcs = ["delay_kernel_rocm.cu.cc"],
+    hdrs = ["delay_kernel.h"],
+    # copybara:uncomment compatible_with = ["//buildenv/target:non_prod"],
+    tags = [
+        "gpu",
+        "rocm-only",
+    ],
+    visibility = internal_visibility([
+        "//xla/stream_executor:__subpackages__",
+    ]),
+    deps = [
+        ":rocm_status",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:generic_memory_allocation",
+        "//xla/stream_executor:launch_dim",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor:typed_kernel_factory",
+        "//xla/stream_executor/gpu:gpu_semaphore",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@local_config_rocm//rocm:hip",  # buildcleaner: keep
+        "@local_config_rocm//rocm:rocm_headers",
+    ],
+)
+
+xla_test(
+    name = "delay_kernel_test",
+    srcs = ["delay_kernel_test.cc"],
+    backends = ["gpu"],
+    tags = ["rocm-only"],
+    deps = [
+        ":delay_kernel_rocm",
+        ":rocm_event",
+        ":rocm_executor",
+        ":rocm_platform_id",
+        "//xla/stream_executor:event",
+        "//xla/stream_executor:platform",
+        "//xla/stream_executor:platform_manager",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/gpu:gpu_semaphore",
+        "//xla/tsl/platform:statusor",
+        "//xla/tsl/platform:test",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "rocm_timer",
     srcs = ["rocm_timer.cc"],
@@ -977,12 +1044,14 @@ cc_library(
         "rocm-only",
     ],
     deps = [
+        ":delay_kernel_rocm",
         ":rocm_event",
         ":rocm_status",
         "//xla/stream_executor:activate_context",
         "//xla/stream_executor:event_based_timer",
         "//xla/stream_executor:stream",
         "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/gpu:gpu_semaphore",
         "//xla/tsl/platform:errors",
         "//xla/tsl/platform:statusor",
         "@com_google_absl//absl/log",

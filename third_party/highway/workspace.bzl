@@ -20,12 +20,15 @@ load("//third_party:repo.bzl", "tf_http_archive", "tf_mirror_urls")
 def repo():
     """Imports highway."""
 
-    HIGHWAY_VERSION = "1.3.0"
-    HIGHWAY_SHA256 = "07b3c1ba2c1096878a85a31a5b9b3757427af963b1141ca904db2f9f4afe0bc2"
+    HIGHWAY_VERSION = "1.4.0"
+    HIGHWAY_SHA256 = "e72241ac9524bb653ae52ced768b508045d4438726a303f10181a38f764a453c"
 
     tf_http_archive(
-        name = "com_google_highway",
+        name = "highway",
         strip_prefix = "highway-{version}".format(version = HIGHWAY_VERSION),
         sha256 = HIGHWAY_SHA256,
+        repo_mapping = {
+            "@com_google_highway": "@highway",
+        },
         urls = tf_mirror_urls("https://github.com/google/highway/archive/refs/tags/{version}.tar.gz".format(version = HIGHWAY_VERSION)),
     )

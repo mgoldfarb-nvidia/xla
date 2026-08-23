@@ -44,6 +44,7 @@ tf_proto_library(
     srcs = ["human_readable_aot_executable.proto"],
     deps = [
         "//xla/pjrt/proto:compile_options_proto",
+        "//xla/service/cpu:executable_proto",
         "//xla/service/gpu:gpu_executable_proto",
     ],
 )
@@ -139,9 +140,9 @@ cc_library(
         "//xla/service:hlo_proto_util",
         "//xla/service/gpu:gpu_executable_proto_cc",
         "//xla/tsl/platform:errors",
-        "//xla/tsl/platform:status_macros",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_protobuf//:protobuf",

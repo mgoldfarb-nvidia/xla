@@ -27,6 +27,7 @@ limitations under the License.
 #include "absl/container/btree_map.h"
 #include "absl/container/btree_set.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
@@ -34,7 +35,6 @@ limitations under the License.
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/layout.h"
 #include "xla/pjrt/distributed/key_value_store_interface.h"
 #include "xla/pjrt/pjrt_client.h"
@@ -69,11 +69,9 @@ namespace {
 absl::StatusOr<xla::PjRtMemorySpace*> GetMemorySpace(
     std::optional<MemoryKind> memory_kind, xla::ifrt::Device* device) {
   if (memory_kind.has_value()) {
-    xla::ifrt::MemoryKind canonical_memory_kind =
-        CanonicalizeMemoryKind(*memory_kind, device);
     xla::ifrt::Memory* memory = nullptr;
     for (xla::ifrt::Memory* ms : device->Memories()) {
-      if (ms->Kind() == canonical_memory_kind) {
+      if (ms->Kind() == *memory_kind) {
         memory = ms;
         break;
       }
@@ -81,10 +79,10 @@ absl::StatusOr<xla::PjRtMemorySpace*> GetMemorySpace(
     if (memory == nullptr) {
       return absl::InvalidArgumentError(absl::StrFormat(
           "Invalid memory kind: %s; available memory kinds: %s",
-          *canonical_memory_kind.memory_kind(),
+          memory_kind->value(),
           absl::StrJoin(device->Memories(), ", ",
                         [](std::string* out, xla::ifrt::Memory* ms) {
-                          absl::StrAppend(out, *ms->Kind().memory_kind());
+                          absl::StrAppend(out, ms->Kind().value());
                         })));
     }
     return absl::down_cast<PjRtMemory*>(memory)->pjrt_memory();

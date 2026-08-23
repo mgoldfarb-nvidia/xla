@@ -18,10 +18,10 @@ limitations under the License.
 #include <string>
 
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/string_view.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/utils/hlo_query.h"
@@ -85,13 +85,15 @@ JoinCollectiveCommunicationDomains(CollectiveCommunicationDomain lhs,
 }
 
 bool SupportsCollectiveCommunicationDomain(const HloInstruction& instruction) {
-  if (hlo_query::IsCollectiveCommunicationOp(instruction.opcode()) ||
-      hlo_query::IsAsyncCollectiveDoneOp(&instruction)) {
+  const HloInstruction& canonical = CanonicalAsyncStart(instruction);
+  if (&canonical != &instruction) {
+    return SupportsCollectiveCommunicationDomain(canonical);
+  }
+
+  if (hlo_query::IsCollectiveCommunicationOp(instruction.opcode())) {
     return true;
   }
-  if (instruction.opcode() == HloOpcode::kAsyncStart ||
-      instruction.opcode() == HloOpcode::kAsyncUpdate ||
-      instruction.opcode() == HloOpcode::kAsyncDone) {
+  if (HloPredicateIsOp<HloOpcode::kAsyncStart>(&instruction)) {
     return hlo_query::IsCollectiveCommunicationOp(
                instruction.async_wrapped_opcode()) ||
            instruction.frontend_attributes().map().contains(

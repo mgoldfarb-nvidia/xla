@@ -55,5 +55,7 @@ common_patch_list = [
     "//third_party/triton:common/tmem_scale_padding_second_half.patch",
     "//third_party/triton:common/llvm_cl959585509.patch",
     "//third_party/triton:common/old_ptxas.patch",
+    "//third_party/triton:common/blackwell_nvfp4_mn_major_fallback.patch",
+    "//third_party/triton:common/llvm_cl966791199.patch",
     # Add new patches just above this line
 ]

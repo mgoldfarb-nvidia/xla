@@ -34,6 +34,7 @@
 #include "absl/log/log.h"
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/cord.h"
 #include "absl/strings/str_cat.h"
@@ -42,7 +43,6 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/future.h"
 #include "xla/layout.h"
 #include "xla/pjrt/pjrt_layout.h"
@@ -820,7 +820,7 @@ absl::StatusOr<BackendInterface::Response> IfrtBackend::HandleInit(
   for (const auto& [id, memory] : memories) {
     auto* m = init_resp->add_memories();
     m->set_id(id);
-    m->set_memory_space_kind(AsProtoStringData(*memory->Kind().memory_kind()));
+    m->set_memory_space_kind(AsProtoStringData(memory->Kind().value()));
     for (const auto* device : memory->Devices()) {
       m->add_device_ids(device->Id().value());
     }

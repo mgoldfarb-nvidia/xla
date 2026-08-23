@@ -19,6 +19,7 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -60,6 +61,7 @@ limitations under the License.
 #include "xla/hlo/utils/hlo_query.h"
 #include "xla/layout.h"
 #include "xla/service/buffer_value.h"
+#include "xla/service/device_assignment.h"
 #include "xla/service/gpu/alias_info.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/collective_hints_annotator.h"
@@ -148,10 +150,8 @@ bool ShouldScheduleAsEarlyAsPossible(const HloInstruction& instr) {
     case HloOpcode::kAllGatherStart:
     case HloOpcode::kAllReduceStart:
     case HloOpcode::kCollectivePermuteStart:
-      return !IsGPUSyncCollective(instr);
     case HloOpcode::kAsyncStart:
-      // Start async ops as early as possible to allow more concurrency.
-      return true;
+      return !IsGPUSyncCollective(instr);
     case HloOpcode::kCustomCall:
       return static_cast<const HloCustomCallInstruction&>(instr)
                  .custom_call_schedule() ==
@@ -173,11 +173,8 @@ bool ShouldScheduleAsLateAsPossible(const HloInstruction& instr) {
     case HloOpcode::kAllGatherDone:
     case HloOpcode::kAllReduceDone:
     case HloOpcode::kCollectivePermuteDone:
-      return ShouldScheduleAsEarlyAsPossible(*instr.operand(0));
     case HloOpcode::kAsyncDone:
-      // Schedule as many other ops as possible before blocking on the
-      // completion of async ops.
-      return true;
+      return ShouldScheduleAsEarlyAsPossible(*instr.operand(0));
     case HloOpcode::kCustomCall:
       return static_cast<const HloCustomCallInstruction&>(instr)
                  .custom_call_schedule() == CustomCallSchedule::SCHEDULE_LATEST;
@@ -649,6 +646,17 @@ LegalizeSchedulingAnnotations::Config SchedulingAnnotationsConfig() {
   return annotation_config;
 }
 
+bool IsHostShape(const Shape& shape) {
+  return shape.IsArray() && shape.has_layout() &&
+         shape.layout().memory_space() == Layout::kHostMemorySpace;
+}
+
+bool IsDUSWithHost(const HloInstruction* instr) {
+  return instr->opcode() == HloOpcode::kDynamicUpdateSlice &&
+         (IsHostShape(instr->operand(0)->shape()) ||
+          IsHostShape(instr->shape()));
+}
+
 // Delays MoveToHostAsyncStart as late as possible
 // to achieve better overlapping with computation.
 // The only pattern we are seeing is async start of a fusion with a dynamic
@@ -682,7 +690,7 @@ DelayMoveToHostAsyncStartCandidateCondition(
                                 .async_wrapped_instruction()
                                 ->fused_instructions();
         for (auto instr : fused_instrs) {
-          if (instr->opcode() == HloOpcode::kDynamicUpdateSlice) {
+          if (IsDUSWithHost(instr)) {
             is_send_host_dus = true;
             break;
           }
@@ -723,6 +731,7 @@ absl::Status RunLatencyHidingSchedulerPasses(
   SchedulerConfig config = MakeGPUSchedulerConfig(
       memory_limit,
       options.xla_gpu_experimental_parallel_collective_overlap_limit(),
+      options.xla_gpu_experimental_parallel_scale_up_collective_overlap_limit(),
       options.xla_gpu_experimental_parallel_async_compute_limit());
   const bool enable_selective_memcpy_overlap =
       options.xla_gpu_experimental_enable_selective_memcpy_overlap();
@@ -744,7 +753,8 @@ absl::Status RunLatencyHidingSchedulerPasses(
   // It's more beneficial to prioritize compute over async start when we have
   // more async ops in parallel.
   bool prioritize_compute_over_async_start =
-      config.parallel_collective_overlap_limit > 1 &&
+      (config.parallel_collective_overlap_limit > 1 ||
+       config.parallel_scale_up_collective_overlap_limit > 1) &&
       options.xla_gpu_experimental_collective_start_as_early_as_possible();
   auto async_tracker = std::make_unique<GpuAsyncTracker>(config);
 
@@ -812,16 +822,37 @@ absl::Status RunLatencyHidingSchedulerPasses(
     return std::nullopt;
   };
 
+  DefaultSchedulerCore::OverlapLimitRule overlap_limit_rule;
+  if (options.xla_gpu_experimental_enable_collective_multi_streaming() ||
+      uses_multiple_collective_domains) {
+    // XLA:GPU uses an all-zero static device assignment as a sentinel for
+    // compilation-only code paths when an HLO requires more logical devices
+    // than are available. This is distinct from an uninitialized
+    // DeviceAssignment, whose entries are -1. Treat the sentinel as the
+    // zero-based IOTA assignment supported by XLA:GPU.
+    auto device_assignment = std::make_shared<DeviceAssignment>(
+        module->config().replica_count(), module->config().num_partitions());
+    device_assignment->FillIota(0);
+    if (module->config().has_static_device_assignment() &&
+        !module->config().static_device_assignment().IsAll(0)) {
+      *device_assignment = module->config().static_device_assignment();
+    }
+    overlap_limit_rule =
+        [device_assignment](
+            const DefaultSchedulerCore::SchedulingState& sched_state,
+            const HloGraphNode* node) {
+          return GpuScheduleCrossesOverlapLimit(sched_state, node,
+                                                *device_assignment);
+        };
+  }
+
   auto scheduler_core = std::make_unique<DefaultSchedulerCore>(
       scheduling_context, config,
       /*target_scheduling_rule=*/nullptr,
       /*early_target_scheduling_rule=*/gpu_early_scheduling_rule,
       /*post_processing_fn=*/nullptr,
       /*scheduling_instruction_crosses_overlap_limit=*/
-      (options.xla_gpu_experimental_enable_collective_multi_streaming() ||
-       uses_multiple_collective_domains)
-          ? GpuScheduleCrossesOverlapLimit
-          : nullptr);
+      std::move(overlap_limit_rule));
 
   const int64_t configured_fencing_threshold_bytes =
       // NOLINTNEXTLINE
@@ -915,6 +946,19 @@ absl::Status RunAsyncCollectivesConversionPasses(HloModule* module) {
   config.convert_collective_permute = HloPredicateTrue;
   config.convert_ragged_all_to_all = HloPredicateTrue;
   config.convert_reduce_scatter = HloPredicateTrue;
+  config.convert_collective_fusion = [](const HloInstruction* instr) {
+    if (!instr->IsCustomFusion()) {
+      return false;
+    }
+    absl::StatusOr<GpuBackendConfig> gpu_config =
+        instr->backend_config<GpuBackendConfig>();
+    if (!gpu_config.ok()) {
+      return false;
+    }
+    return gpu_config->fusion_backend_config().kind() ==
+           xla::gpu::kTritonCollectiveFusionKind;
+  };
+  config.use_generic_async_start_done = true;
   pipeline.AddPass<AsyncCollectiveCreator>(std::move(config));
 
   absl::flat_hash_set<DebugOptions::CollectiveOpType> disabled_async_ops;
@@ -951,6 +995,13 @@ absl::Status RunAsyncCollectivesConversionPasses(HloModule* module) {
             return !disabled_async_ops.contains(DebugOptions::ALLTOALL);
           case HloOpcode::kRaggedAllToAll:
             return !disabled_async_ops.contains(DebugOptions::RAGGEDALLTOALL);
+          case HloOpcode::kAllReduce:
+            return !disabled_async_ops.contains(DebugOptions::ALLREDUCE);
+          case HloOpcode::kAllGather:
+            return !disabled_async_ops.contains(DebugOptions::ALLGATHER);
+          case HloOpcode::kCollectivePermute:
+            return !disabled_async_ops.contains(
+                DebugOptions::COLLECTIVEPERMUTE);
           default:
             return false;
         }
@@ -1096,6 +1147,7 @@ uint64_t GetSchedulerMemoryLimit(const HloModule& module,
 
 SchedulerConfig MakeGPUSchedulerConfig(uint64_t memory_limit,
                                        int64_t overlap_limit,
+                                       int64_t scale_up_overlap_limit,
                                        int64_t async_compute_limit) {
   SchedulerConfig config;
   config.all_reduce_overlap_limit = 1;
@@ -1106,6 +1158,9 @@ SchedulerConfig MakeGPUSchedulerConfig(uint64_t memory_limit,
   config.schedule_send_recvs = true;
   config.memory_limit = memory_limit;
   config.parallel_collective_overlap_limit = overlap_limit;
+  config.parallel_scale_up_collective_overlap_limit =
+      scale_up_overlap_limit == 0 ? std::numeric_limits<int64_t>::max()
+                                  : scale_up_overlap_limit;
   config.parallel_async_compute_limit = async_compute_limit;
 
   CHECK(config.collective_broadcast_overlap_limit <=
