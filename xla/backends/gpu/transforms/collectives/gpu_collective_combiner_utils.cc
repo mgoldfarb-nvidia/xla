@@ -143,17 +143,16 @@ void AppendFrontendAttributesToCombinerKey(const HloInstruction* instruction,
                     value.size(), ":", value);
   };
 
-  auto combiner_key = attributes.find(kCombinerKeyAttr);
-  if (combiner_key != attributes.end()) {
-    append_attribute(combiner_key->first, combiner_key->second);
-  }
+  auto append_if_present = [&](absl::string_view name) {
+    auto attribute = attributes.find(name);
+    if (attribute != attributes.end() && !attribute->second.empty()) {
+      append_attribute(attribute->first, attribute->second);
+    }
+  };
 
-  auto collective_group_key = attributes.find(kCollectiveGroupKeyAttr);
-  if (collective_group_key == attributes.end() ||
-      collective_group_key->second.empty()) {
-    return;
-  }
-  append_attribute(collective_group_key->first, collective_group_key->second);
+  append_if_present(kCombinerKeyAttr);
+  append_if_present(kCollectiveGroupKeyAttr);
+  append_if_present(kXlaSchedulingGroupIdAttr);
 }
 
 }  // namespace xla::gpu

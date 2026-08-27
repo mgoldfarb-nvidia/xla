@@ -33,6 +33,7 @@ limitations under the License.
 #include "xla/hlo/utils/hlo_matchers.h"
 #include "xla/service/collective_utils.h"
 #include "xla/service/gpu/backend_configs.pb.h"
+#include "xla/side_effect_util.h"
 #include "xla/tsl/platform/statusor.h"
 
 namespace xla::gpu {
@@ -147,6 +148,51 @@ ENTRY entry {
                                          .set_print_operand_shape(false)
                                          .set_print_result_shape(false)),
                     kExpected));
+}
+
+TEST_F(GpuAllGatherCombinerTest, DoesNotCombineDifferentSchedulingGroups) {
+  constexpr absl::string_view kHloString = R"(
+HloModule module
+
+ENTRY entry {
+  p0 = bf16[8] parameter(0)
+  p1 = bf16[8] parameter(1)
+  p2 = bf16[8] parameter(2)
+  p3 = bf16[8] parameter(3)
+  ag0 = bf16[16] all-gather(p0), dimensions={0},
+    frontend_attributes={_scheduling_group_id="60"}
+  ag1 = bf16[16] all-gather(p1), dimensions={0},
+    frontend_attributes={_scheduling_group_id="60"}
+  ag2 = bf16[16] all-gather(p2), dimensions={0},
+    frontend_attributes={_scheduling_group_id="61"}
+  ag3 = bf16[16] all-gather(p3), dimensions={0},
+    frontend_attributes={_scheduling_group_id="61"}
+  ROOT tuple = (bf16[16], bf16[16], bf16[16], bf16[16]) tuple(ag0, ag1, ag2, ag3)
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(auto module,
+                          ParseAndReturnVerifiedModule(kHloString));
+
+  EXPECT_THAT(RunCombiner(module.get(), /*combine_threshold_bytes=*/1024),
+              absl_testing::IsOkAndHolds(true));
+
+  int all_gather_count = 0;
+  bool found_group_60 = false;
+  bool found_group_61 = false;
+  for (const HloInstruction* instruction :
+       module->entry_computation()->instructions()) {
+    if (instruction->opcode() != HloOpcode::kAllGather) {
+      continue;
+    }
+    ++all_gather_count;
+    const auto& attributes = instruction->frontend_attributes().map();
+    ASSERT_TRUE(attributes.contains(kXlaSchedulingGroupIdAttr));
+    found_group_60 |= attributes.at(kXlaSchedulingGroupIdAttr) == "60";
+    found_group_61 |= attributes.at(kXlaSchedulingGroupIdAttr) == "61";
+  }
+  EXPECT_EQ(all_gather_count, 2);
+  EXPECT_TRUE(found_group_60);
+  EXPECT_TRUE(found_group_61);
 }
 
 TEST_F(GpuAllGatherCombinerTest,
