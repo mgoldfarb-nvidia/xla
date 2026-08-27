@@ -598,6 +598,7 @@ bool NeedAccuracyChecker(const DebugOptions& options,
 // overlapped as compute ops in annotated scheduling groups.
 LegalizeSchedulingAnnotations::Config SchedulingAnnotationsConfig() {
   LegalizeSchedulingAnnotations::Config annotation_config;
+  annotation_config.propagate_annotation = true;
   annotation_config.keep_sync_annotation = [](const HloInstruction* hlo) {
     if (hlo == nullptr) {
       return false;

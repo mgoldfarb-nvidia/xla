@@ -1619,6 +1619,43 @@ ENTRY main {
             "0");
 }
 
+TEST_F(GpuHloScheduleTest, PropagatesSchedulingGroupAcrossCublasLtGap) {
+  constexpr absl::string_view kHloText = R"(
+HloModule m
+
+ENTRY main {
+  p0 = f32[32] parameter(0)
+  lhs = f32[32,32] parameter(1)
+  rhs = f32[32,32] parameter(2)
+  ag-start = (f32[32], f32[64]) all-gather-start(p0), dimensions={0}, replica_groups={{0,1}}, frontend_attributes={_scheduling_group_id="0", keep_original_sequence_order_in_group="true"}
+  gemm0 = (f32[32,32], s8[33554432]) custom-call(lhs, rhs), custom_call_target="__cublas$lt$matmul", frontend_attributes={_scheduling_group_id="0", keep_original_sequence_order_in_group="true"}, backend_config={"gemm_backend_config":{"alpha_real":1,"beta":0,"dot_dimension_numbers":{"lhs_contracting_dimensions":["1"],"rhs_contracting_dimensions":["0"],"lhs_batch_dimensions":[],"rhs_batch_dimensions":[]},"alpha_imag":0,"precision_config":{"operand_precision":["DEFAULT","DEFAULT"]}}}
+  gemm0-result = f32[32,32] get-tuple-element(gemm0), index=0, frontend_attributes={_scheduling_group_id="0", keep_original_sequence_order_in_group="true"}
+  bitcast = f32[32,32] bitcast(gemm0-result), frontend_attributes={_scheduling_group_id="0", keep_original_sequence_order_in_group="true"}
+  gemm1 = (f32[32,32], s8[33554432]) custom-call(bitcast, rhs), custom_call_target="__cublas$lt$matmul", frontend_attributes={_scheduling_group_id="0", keep_original_sequence_order_in_group="true"}, backend_config={"gemm_backend_config":{"alpha_real":1,"beta":0,"dot_dimension_numbers":{"lhs_contracting_dimensions":["1"],"rhs_contracting_dimensions":["0"],"lhs_batch_dimensions":[],"rhs_batch_dimensions":[]},"alpha_imag":0,"precision_config":{"operand_precision":["DEFAULT","DEFAULT"]}}}
+  gemm1-result = f32[32,32] get-tuple-element(gemm1), index=0
+  ag-done = f32[64] all-gather-done(ag-start), frontend_attributes={_scheduling_group_id="0", keep_original_sequence_order_in_group="true"}
+  ROOT result = (f32[64], f32[32,32]) tuple(ag-done, gemm1-result)
+})";
+
+  TestConfig test_config;
+  test_config.enable_latency_hiding_scheduler = true;
+  HloModuleConfig config = GetModuleConfig(test_config);
+  config.set_replica_count(2);
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnVerifiedModule(kHloText, config));
+
+  ASSERT_OK(ScheduleGpuModule(module.get()).status());
+
+  for (absl::string_view instruction_name : {"gemm0-result", "bitcast"}) {
+    const HloInstruction* instruction =
+        module->entry_computation()->GetInstructionWithName(instruction_name);
+    ASSERT_NE(instruction, nullptr);
+    EXPECT_EQ(instruction->frontend_attributes().map().at(
+                  "_scheduling_group_id"),
+              "0");
+  }
+}
+
 TEST_F(GpuHloScheduleTest, PreservesNestedTritonGemmSchedulingGroupAnnotation) {
   constexpr absl::string_view kHloText = R"(
 HloModule m
