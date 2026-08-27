@@ -51,6 +51,9 @@ namespace xla {
 
 namespace {
 
+constexpr absl::string_view kKeepOriginalSequenceOrderInGroupAttr =
+    "keep_original_sequence_order_in_group";
+
 // Given a group of annotated instructions (sources), find all reachable
 // instructions from them in the same computation.
 absl::flat_hash_set<HloInstruction*> PropagateAnnotationFromSources(
@@ -444,6 +447,23 @@ absl::StatusOr<bool> LegalizeSchedulingAnnotations::PropagateAnnotations(
     auto status = AttachAnnotation(annotation, to_annotate, dry_run);
     if (!status.ok()) {
       return status;
+    }
+    const bool keep_original_sequence_order =
+        absl::c_any_of(sources, [](const HloInstruction* instruction) {
+          return instruction
+                     ->get_frontend_attribute(
+                         kKeepOriginalSequenceOrderInGroupAttr)
+                     .value_or("") == "true";
+        });
+    if (keep_original_sequence_order && !dry_run) {
+      for (HloInstruction* instruction : sources) {
+        instruction->set_frontend_attribute(
+            kKeepOriginalSequenceOrderInGroupAttr, "true");
+      }
+      for (HloInstruction* instruction : to_annotate) {
+        instruction->set_frontend_attribute(
+            kKeepOriginalSequenceOrderInGroupAttr, "true");
+      }
     }
   }
   return changed;
