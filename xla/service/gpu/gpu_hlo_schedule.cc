@@ -594,19 +594,21 @@ bool NeedAccuracyChecker(const DebugOptions& options,
          level == DebugOptions::PGLE_STRICTNESS_LEVEL_ERROR;
 }
 
-// For now, only allow cublas gemm custom calls and triton gemm fusions to
-// be overlapped as the compute ops in the annotated scheduling groups.
+// Only allow GEMM library calls and GEMM-specific Triton fusions to be
+// overlapped as compute ops in annotated scheduling groups.
 LegalizeSchedulingAnnotations::Config SchedulingAnnotationsConfig() {
   LegalizeSchedulingAnnotations::Config annotation_config;
   annotation_config.keep_sync_annotation = [](const HloInstruction* hlo) {
     if (hlo == nullptr) {
       return false;
     }
-    if (hlo->IsCustomCall("__cublas$gemm")) {
+    if (hlo->IsCustomCall("__cublas$gemm") ||
+        hlo->IsCustomCall("__cublas$lt$matmul")) {
       return true;
     }
     if (hlo->opcode() == HloOpcode::kFusion) {
-      return IsGpuFusionKind(*hlo, kTritonGemmFusionKind);
+      return IsGpuFusionKind(*hlo, kTritonGemmFusionKind) ||
+             IsGpuFusionKind(*hlo, kTritonNestedGemmFusionKind);
     }
     return false;
   };
