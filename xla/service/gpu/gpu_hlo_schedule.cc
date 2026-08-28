@@ -65,6 +65,7 @@ limitations under the License.
 #include "xla/service/gpu/alias_info.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/collective_hints_annotator.h"
+#include "xla/service/gpu/cublas_cudnn.h"
 #include "xla/service/gpu/flag_utils.h"
 #include "xla/service/gpu/gpu_latency_hiding_scheduler.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
@@ -120,9 +121,22 @@ std::string FormatCollectiveHintsBindingLog(
     bool selected) {
   return absl::StrCat(kCollectiveHintsBindingMarker, " module_name=\"",
                       absl::CEscape(module_name), "\" module_id=", module_id,
-                      " fingerprint_before_lhs=", fingerprint,
+                      " collective_hints_fingerprint=", fingerprint,
                       " target_fingerprint=", target_fingerprint,
                       " selected=", selected ? "true" : "false");
+}
+
+std::string CollectiveHintsFingerprint(const HloModule& module) {
+  std::unique_ptr<HloModule> fingerprint_module = module.Clone("");
+  for (HloComputation* computation : fingerprint_module->computations()) {
+    for (HloInstruction* instruction : computation->instructions()) {
+      if (instruction->opcode() == HloOpcode::kFusion) {
+        instruction->set_fusion_kind(HloInstruction::FusionKind::kLoop);
+      }
+    }
+  }
+  return fingerprint_module->GetFingerprint128(
+      HloPrintOptions::Canonical().set_print_backend_config(false));
 }
 
 namespace {
@@ -627,7 +641,7 @@ bool NeedAccuracyChecker(const DebugOptions& options,
          level == DebugOptions::PGLE_STRICTNESS_LEVEL_ERROR;
 }
 
-// For now, only allow cublas gemm custom calls and triton gemm fusions to
+// For now, only allow cuBLAS GEMM custom calls and Triton GEMM fusions to
 // be overlapped as the compute ops in the annotated scheduling groups.
 LegalizeSchedulingAnnotations::Config SchedulingAnnotationsConfig() {
   LegalizeSchedulingAnnotations::Config annotation_config;
@@ -636,6 +650,10 @@ LegalizeSchedulingAnnotations::Config SchedulingAnnotationsConfig() {
       return false;
     }
     if (hlo->IsCustomCall("__cublas$gemm")) {
+      return true;
+    }
+    if (IsCublasGemm(*hlo) && hlo->frontend_attributes().map().contains(
+                                  std::string(kCollectiveHintRuleIdsAttr))) {
       return true;
     }
     if (hlo->opcode() == HloOpcode::kFusion) {
@@ -712,6 +730,7 @@ DelayMoveToHostAsyncStartCandidateCondition(
 // `pipeline`.
 absl::Status RunLatencyHidingSchedulerPasses(
     HloModule* module, int pointer_size, absl::string_view fingerprint,
+    absl::string_view collective_hints_fingerprint,
     uint64_t memory_limit, const se::DeviceDescription& gpu_device_info,
     mlir::MLIRContext* mlir_context, const GpuAliasInfo* alias_info,
     std::optional<CollectiveHintsConfig> collective_hints) {
@@ -722,8 +741,9 @@ absl::Status RunLatencyHidingSchedulerPasses(
                         UsesMultipleCollectiveDomains(*module));
 
   if (collective_hints.has_value()) {
-    pipeline.AddPass<CollectiveHintsAnnotatorPass>(std::move(*collective_hints),
-                                                   std::string(fingerprint));
+    pipeline.AddPass<CollectiveHintsAnnotatorPass>(
+        std::move(*collective_hints),
+        std::string(collective_hints_fingerprint));
   }
   pipeline.AddPass<LegalizeSchedulingAnnotations>(
       SchedulingAnnotationsConfig());
@@ -1023,16 +1043,22 @@ absl::StatusOr<ScheduleMetadata> ScheduleGpuModule(
 
   // Tag the module with its 128 bit fingerprint. The fingerprint should include
   // instruction name with ids.
+  const std::string collective_hints_fingerprint =
+      CollectiveHintsFingerprint(*module);
   std::string fingerprint = TagWithFingerprint(module);
+  module->add_frontend_attribute(
+      std::string(kCollectiveHintsFingerprintAttr),
+      collective_hints_fingerprint);
   std::optional<CollectiveHintsConfig> collective_hints;
   const std::string& hints_path =
       module->config().debug_options().xla_gpu_collective_hints_file();
   if (!hints_path.empty()) {
     ABSL_ASSIGN_OR_RETURN(CollectiveHintsConfig config,
                           LoadCollectiveHintsConfig(hints_path));
-    const bool selected = config.module_fingerprint() == fingerprint;
+    const bool selected =
+        config.module_fingerprint() == collective_hints_fingerprint;
     VLOG(1) << FormatCollectiveHintsBindingLog(
-        module->name(), module->unique_id(), fingerprint,
+        module->name(), module->unique_id(), collective_hints_fingerprint,
         config.module_fingerprint(), selected);
     if (selected) {
       collective_hints.emplace(std::move(config));
@@ -1071,8 +1097,9 @@ absl::StatusOr<ScheduleMetadata> ScheduleGpuModule(
     VLOG(1) << FormatLhsScopeBeginLog(module->name(), module->unique_id(),
                                       fingerprint);
     absl::Status lhs_status = RunLatencyHidingSchedulerPasses(
-        module, pointer_size, fingerprint, memory_limit, gpu_device_info,
-        mlir_context, alias_info, std::move(collective_hints));
+        module, pointer_size, fingerprint, collective_hints_fingerprint,
+        memory_limit, gpu_device_info, mlir_context, alias_info,
+        std::move(collective_hints));
     VLOG(1) << FormatLhsScopeEndLog(module->name(), module->unique_id(),
                                     fingerprint, lhs_status);
     ABSL_RETURN_IF_ERROR(lhs_status);

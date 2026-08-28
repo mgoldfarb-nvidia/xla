@@ -54,6 +54,8 @@ std::string FormatCollectiveHintsBindingLog(
     absl::string_view fingerprint, absl::string_view target_fingerprint,
     bool selected);
 
+std::string CollectiveHintsFingerprint(const HloModule& module);
+
 // Converts sync collective instructions to a pair of async start and done
 // instructions.
 absl::Status RunAsyncCollectivesConversionPasses(HloModule* module);

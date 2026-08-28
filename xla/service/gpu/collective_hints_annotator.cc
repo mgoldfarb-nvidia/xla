@@ -16,7 +16,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <deque>
 #include <string>
 #include <utility>
 #include <vector>
@@ -32,11 +31,13 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
+#include "xla/hlo/analysis/hlo_reachability.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/utils/hlo_query.h"
 #include "xla/service/gpu/backend_configs.pb.h"
+#include "xla/service/gpu/cublas_cudnn.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/shape_util.h"
@@ -47,15 +48,19 @@
 namespace xla::gpu {
 namespace {
 
-constexpr absl::string_view kFingerprintBeforeLhsAttr =
-    "fingerprint_before_lhs";
-
 struct ResolvedRule {
   const CollectiveHint* hint;
   std::vector<HloInstruction*> instructions;
 };
 
-using ControlEdge = std::pair<HloInstruction*, HloInstruction*>;
+struct ResolvedWindow {
+  HloInstruction* start;
+  HloInstruction* done;
+  int64_t scheduling_group_id;
+};
+
+constexpr absl::string_view kSchedulingGroupOrderAttr =
+    "scheduling_group_order";
 
 bool IsLowerHexFingerprint(absl::string_view value) {
   if (value.size() != 32) {
@@ -148,6 +153,11 @@ absl::Status ValidateConfigSchema(const CollectiveHintsConfig& config) {
           absl::StrCat("collective hint '", hint.rule_id(),
                        "' scheduling_group_id must be nonnegative"));
     }
+    if (!hint.window_target().empty() && !hint.has_scheduling_group_id()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "collective hint '", hint.rule_id(),
+          "' window_target requires scheduling_group_id"));
+    }
     if (!hint.force_earliest() && !hint.has_scheduling_group_id() &&
         hint.window_target().empty()) {
       return absl::InvalidArgumentError(
@@ -201,7 +211,7 @@ std::string QualifiedName(const HloInstruction& instruction) {
 }
 
 bool IsSupportedComputeTarget(const HloInstruction& instruction) {
-  if (instruction.IsCustomCall("__cublas$gemm")) {
+  if (IsCublasGemm(instruction)) {
     return true;
   }
   return instruction.opcode() == HloOpcode::kFusion &&
@@ -241,71 +251,18 @@ HloInstruction* FindInstruction(HloComputation* computation,
   return nullptr;
 }
 
-absl::Status ValidateAcyclicControlEdges(
-    const HloModule& module, const std::vector<ControlEdge>& planned_edges) {
-  for (const HloComputation* computation : module.computations()) {
-    std::vector<const HloInstruction*> instructions;
-    instructions.reserve(computation->instruction_count());
-    for (const HloInstruction* instruction : computation->instructions()) {
-      instructions.push_back(instruction);
-    }
-    absl::flat_hash_map<const HloInstruction*, size_t> index;
-    for (size_t i = 0; i < instructions.size(); ++i) {
-      index.emplace(instructions[i], i);
-    }
-    std::vector<absl::flat_hash_set<size_t>> successors(instructions.size());
-    auto add_edge = [&](const HloInstruction* from,
-                        const HloInstruction* to) -> absl::Status {
-      if (from->parent() != computation || to->parent() != computation) {
-        return absl::InvalidArgumentError(
-            "window_target control dependencies must stay in one computation");
-      }
-      successors[index.at(from)].insert(index.at(to));
-      return absl::OkStatus();
-    };
-    for (const HloInstruction* instruction : instructions) {
-      for (const HloInstruction* user : instruction->users()) {
-        ABSL_RETURN_IF_ERROR(add_edge(instruction, user));
-      }
-      for (const HloInstruction* successor :
-           instruction->control_successors()) {
-        ABSL_RETURN_IF_ERROR(add_edge(instruction, successor));
-      }
-    }
-    for (const auto& [from, to] : planned_edges) {
-      if (from->parent() == computation) {
-        ABSL_RETURN_IF_ERROR(add_edge(from, to));
-      }
-    }
-
-    std::vector<int64_t> indegree(instructions.size(), 0);
-    for (const auto& instruction_successors : successors) {
-      for (size_t successor : instruction_successors) {
-        ++indegree[successor];
-      }
-    }
-    std::deque<size_t> ready;
-    for (size_t i = 0; i < indegree.size(); ++i) {
-      if (indegree[i] == 0) {
-        ready.push_back(i);
-      }
-    }
-    size_t visited = 0;
-    while (!ready.empty()) {
-      const size_t current = ready.front();
-      ready.pop_front();
-      ++visited;
-      for (size_t successor : successors[current]) {
-        if (--indegree[successor] == 0) {
-          ready.push_back(successor);
-        }
-      }
-    }
-    if (visited != instructions.size()) {
-      return absl::FailedPreconditionError(absl::StrCat(
-          "collective hint window_target dependencies introduce a cycle in '",
-          computation->name(), "'"));
-    }
+absl::Status ValidateWindowIndependence(const HloInstruction& start,
+                                        const HloInstruction& compute) {
+  if (start.parent() != compute.parent()) {
+    return absl::InvalidArgumentError(
+        "window_target and compute must be in one computation");
+  }
+  auto reachability = HloReachabilityMap::Build(start.parent());
+  if (reachability->IsReachable(&start, &compute) ||
+      reachability->IsReachable(&compute, &start)) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "window_target '", QualifiedName(start), "' and compute '",
+        QualifiedName(compute), "' must be data/control independent"));
   }
   return absl::OkStatus();
 }
@@ -362,13 +319,14 @@ absl::StatusOr<bool> CollectiveHintsAnnotatorPass::RunImpl(
     const absl::flat_hash_set<absl::string_view>& execution_threads) {
   ABSL_RETURN_IF_ERROR(ValidateConfig(config_, module_fingerprint_));
   const auto& module_attributes = module->frontend_attributes().map();
-  auto fingerprint =
-      module_attributes.find(std::string(kFingerprintBeforeLhsAttr));
+  auto fingerprint = module_attributes.find(
+      std::string(kCollectiveHintsFingerprintAttr));
   if (fingerprint == module_attributes.end() ||
       fingerprint->second != module_fingerprint_) {
     return absl::FailedPreconditionError(absl::StrCat(
-        "module frontend attribute ", kFingerprintBeforeLhsAttr, " must be '",
-        module_fingerprint_, "' before applying collective hints"));
+        "module frontend attribute ", kCollectiveHintsFingerprintAttr,
+        " must be '", module_fingerprint_,
+        "' before applying collective hints"));
   }
   if (module_attributes.contains(std::string(kCollectiveHintsReceiptAttr))) {
     return absl::FailedPreconditionError(
@@ -420,9 +378,8 @@ absl::StatusOr<bool> CollectiveHintsAnnotatorPass::RunImpl(
   }
 
   absl::flat_hash_map<HloInstruction*, int64_t> scheduling_groups;
-  absl::flat_hash_map<HloInstruction*, HloInstruction*> window_targets;
+  absl::flat_hash_map<HloInstruction*, ResolvedWindow> window_targets;
   absl::flat_hash_map<HloInstruction*, std::vector<std::string>> rule_ids;
-  std::vector<ControlEdge> control_edges;
   for (const ResolvedRule& rule : resolved) {
     for (HloInstruction* instruction : rule.instructions) {
       rule_ids[instruction].push_back(rule.hint->rule_id());
@@ -480,14 +437,28 @@ absl::StatusOr<bool> CollectiveHintsAnnotatorPass::RunImpl(
               "' is not an async collective start in computation '",
               instruction->parent()->name(), "'"));
         }
-        if (!window_targets.emplace(instruction, start).second) {
+        ABSL_ASSIGN_OR_RETURN(HloInstruction* done, FindAsyncDone(start));
+        const ResolvedWindow window{
+            start, done, rule.hint->scheduling_group_id()};
+        if (!window_targets.emplace(instruction, window).second) {
           return absl::FailedPreconditionError(
               absl::StrCat("multiple window_target actions matched '",
                            QualifiedName(*instruction), "'"));
         }
-        ABSL_ASSIGN_OR_RETURN(HloInstruction* done, FindAsyncDone(start));
-        control_edges.emplace_back(start, instruction);
-        control_edges.emplace_back(instruction, done);
+        ABSL_RETURN_IF_ERROR(
+            ValidateWindowIndependence(*start, *instruction));
+        const std::string group =
+            absl::StrCat(rule.hint->scheduling_group_id());
+        ABSL_RETURN_IF_ERROR(CheckFrontendAttribute(
+            *start, kXlaSchedulingGroupIdAttr, group));
+        ABSL_RETURN_IF_ERROR(CheckFrontendAttribute(
+            *done, kXlaSchedulingGroupIdAttr, group));
+        ABSL_RETURN_IF_ERROR(CheckFrontendAttribute(
+            *instruction, kSchedulingGroupOrderAttr, "1"));
+        ABSL_RETURN_IF_ERROR(
+            CheckFrontendAttribute(*start, kSchedulingGroupOrderAttr, "0"));
+        ABSL_RETURN_IF_ERROR(
+            CheckFrontendAttribute(*done, kSchedulingGroupOrderAttr, "2"));
         ABSL_RETURN_IF_ERROR(CheckFrontendAttribute(
             *instruction, kCollectiveHintWindowTargetAttr, start->name()));
       }
@@ -500,17 +471,6 @@ absl::StatusOr<bool> CollectiveHintsAnnotatorPass::RunImpl(
         CheckFrontendAttribute(*instruction, kCollectiveHintRuleIdsAttr,
                                absl::StrJoin(sorted_ids, ",")));
   }
-  ABSL_RETURN_IF_ERROR(ValidateAcyclicControlEdges(*module, control_edges));
-
-  absl::c_sort(control_edges, [](const ControlEdge& lhs,
-                                 const ControlEdge& rhs) {
-    return std::pair(QualifiedName(*lhs.first), QualifiedName(*lhs.second)) <
-           std::pair(QualifiedName(*rhs.first), QualifiedName(*rhs.second));
-  });
-  for (const auto& [from, to] : control_edges) {
-    ABSL_RETURN_IF_ERROR(from->AddControlDependencyTo(to));
-  }
-
   for (HloInstruction* instruction : candidates) {
     if (auto group = scheduling_groups.find(instruction);
         group != scheduling_groups.end()) {
@@ -521,7 +481,19 @@ absl::StatusOr<bool> CollectiveHintsAnnotatorPass::RunImpl(
         window != window_targets.end()) {
       instruction->add_frontend_attribute(
           std::string(kCollectiveHintWindowTargetAttr),
-          std::string(window->second->name()));
+          std::string(window->second.start->name()));
+      for (HloInstruction* window_instruction :
+           {instruction, window->second.start, window->second.done}) {
+        window_instruction->add_frontend_attribute(
+            std::string(kXlaSchedulingGroupIdAttr),
+            absl::StrCat(window->second.scheduling_group_id));
+      }
+      instruction->add_frontend_attribute(std::string(kSchedulingGroupOrderAttr),
+                                          "1");
+      window->second.start->add_frontend_attribute(
+          std::string(kSchedulingGroupOrderAttr), "0");
+      window->second.done->add_frontend_attribute(
+          std::string(kSchedulingGroupOrderAttr), "2");
     }
   }
   for (const ResolvedRule& rule : resolved) {

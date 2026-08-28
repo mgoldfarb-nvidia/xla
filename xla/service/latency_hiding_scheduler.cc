@@ -196,6 +196,19 @@ bool HasKeepOriginalSequenceOrderInGroupAttribute(const HloInstruction* instr) {
   return attr.has_value() && attr.value() == "true";
 }
 
+std::optional<int64_t> GetSchedulingGroupOrder(
+    const HloInstruction* instruction) {
+  auto attribute =
+      instruction->get_frontend_attribute("scheduling_group_order");
+  if (!attribute.has_value()) {
+    return std::nullopt;
+  }
+  int64_t order;
+  CHECK(absl::SimpleAtoi(*attribute, &order))
+      << "Failed to parse scheduling_group_order attribute: " << *attribute;
+  return order;
+}
+
 bool IsCustomCallWithForceEarlyAttribute(const HloInstruction* instr) {
   auto attr = instr->get_frontend_attribute("scheduler_hint");
   return instr->opcode() == HloOpcode::kCustomCall && attr.has_value() &&
@@ -2341,6 +2354,14 @@ class AnnotationReadySetLt {
   DefaultSchedulerCore::CandidateResult operator()(
       DefaultSchedulerCore::ScheduleCandidate& a,
       DefaultSchedulerCore::ScheduleCandidate& b) const {
+    const std::optional<int64_t> a_order =
+        GetSchedulingGroupOrder(&a.node->GetInstr());
+    const std::optional<int64_t> b_order =
+        GetSchedulingGroupOrder(&b.node->GetInstr());
+    if (a_order.has_value() && b_order.has_value() && a_order != b_order) {
+      return {*a_order > *b_order ? a : b, "kSchedulingGroupOrder"};
+    }
+
     // Schedule based on the original sequence order if requested.
     auto a_attr = a.node->GetInstr().get_frontend_attribute(
         "keep_original_sequence_order_in_group");

@@ -28,7 +28,6 @@ limitations under the License.
 #include "mlir/IR/MLIRContext.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
-#include "xla/hlo/ir/hlo_print_options.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/service/gpu/alias_info.h"
 #include "xla/service/gpu/backend_configs.pb.h"
@@ -55,12 +54,43 @@ constexpr absl::string_view kHlo = R"hlo(
     p0 = f32[4] parameter(0)
     lhs = f32[4,4] parameter(1)
     rhs = f32[4,4] parameter(2)
+    gemm = f32[4,4] custom-call(lhs, rhs),
+        custom_call_target="__cublas$lt$matmul"
     ag-start = (f32[4], f32[8]) all-gather-start(p0), dimensions={0},
         replica_groups={}
-    gemm = f32[4,4] custom-call(lhs, rhs),
-        custom_call_target="__cublas$gemm"
     ag-done = f32[8] all-gather-done(ag-start)
     ROOT result = (f32[8], f32[4,4]) tuple(ag-done, gemm)
+  }
+)hlo";
+
+constexpr absl::string_view kLegacyGroupedCublasLtHlo = R"hlo(
+  HloModule m
+
+  ENTRY main {
+    lhs = f32[4,4] parameter(0)
+    rhs = f32[4,4] parameter(1)
+    ag-start = (f32[4,4], f32[8,4]) all-gather-start(lhs), dimensions={0},
+        replica_groups={}, frontend_attributes={_scheduling_group_id="7"}
+    ag-done = f32[8,4] all-gather-done(ag-start)
+    gathered-lhs = f32[4,4] slice(ag-done), slice={[0:4], [0:4]}
+    gemm = f32[4,4] custom-call(gathered-lhs, rhs),
+        custom_call_target="__cublas$lt$matmul",
+        frontend_attributes={_scheduling_group_id="7"}
+    ROOT result = (f32[8,4], f32[4,4]) tuple(ag-done, gemm)
+  }
+)hlo";
+
+constexpr absl::string_view kFusionHlo = R"hlo(
+  HloModule m
+
+  fused_computation {
+    p0 = f32[4] parameter(0)
+    ROOT negate = f32[4] negate(p0)
+  }
+
+  ENTRY main {
+    p0 = f32[4] parameter(0)
+    ROOT fusion = f32[4] fusion(p0), kind=kInput, calls=fused_computation
   }
 )hlo";
 
@@ -103,9 +133,7 @@ class CollectiveHintsScheduleTest : public HloHardwareIndependentTestBase {
   }
 
   static std::string Fingerprint(const HloModule& module) {
-    return module.GetFingerprint128(HloPrintOptions::Canonical()
-                                        .set_print_backend_config(true)
-                                        .set_sort_backend_config(true));
+    return CollectiveHintsFingerprint(module);
   }
 
   static std::vector<std::string> ScheduledNames(const HloModule& module) {
@@ -154,6 +182,41 @@ TEST_F(CollectiveHintsScheduleTest, EmptyPathIsBehaviorNeutral) {
   }
 }
 
+TEST_F(CollectiveHintsScheduleTest,
+       FingerprintIgnoresAutotuningBackendConfiguration) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kHlo, ModuleConfig()));
+  const std::string fingerprint = Fingerprint(*module);
+  HloInstruction* gemm =
+      module->entry_computation()->GetInstructionWithName("gemm");
+  ASSERT_NE(gemm, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(GpuBackendConfig config,
+                          gemm->backend_config<GpuBackendConfig>());
+  config.mutable_gemm_backend_config()->set_selected_algorithm(7);
+  TF_ASSERT_OK(gemm->set_backend_config(config));
+
+  EXPECT_EQ(Fingerprint(*module), fingerprint);
+}
+
+TEST_F(CollectiveHintsScheduleTest, FingerprintIgnoresFusionKind) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kFusionHlo));
+  const std::string fingerprint = Fingerprint(*module);
+  module->entry_computation()->root_instruction()->set_fusion_kind(
+      HloInstruction::FusionKind::kCustom);
+
+  EXPECT_EQ(Fingerprint(*module), fingerprint);
+}
+
+TEST_F(CollectiveHintsScheduleTest,
+       UnhintedCublasLtPreservesLegacyAnnotationBehavior) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<HloModule> module,
+      ParseAndReturnVerifiedModule(kLegacyGroupedCublasLtHlo, ModuleConfig()));
+
+  TF_ASSERT_OK(Schedule(module.get()));
+}
+
 TEST_F(CollectiveHintsScheduleTest, NonTargetConfigIsBehaviorNeutral) {
   TF_ASSERT_OK_AND_ASSIGN(std::string path, WriteTempFile(absl::StrCat(
                                                 "module_fingerprint: \"",
@@ -197,7 +260,8 @@ TEST_F(CollectiveHintsScheduleTest, LhsScopeLogFormatIsMachineParseable) {
       FormatCollectiveHintsBindingLog("module\"\n", 17, "current", "target",
                                       /*selected=*/false),
       "XSCHED_COLLECTIVE_HINTS_BINDING module_name=\"module\\\"\\n\" "
-      "module_id=17 fingerprint_before_lhs=current target_fingerprint=target "
+      "module_id=17 collective_hints_fingerprint=current "
+      "target_fingerprint=target "
       "selected=false");
 }
 
@@ -235,6 +299,12 @@ TEST_F(CollectiveHintsScheduleTest, HintsSurviveLegalizerAndConstrainSchedule) {
   EXPECT_EQ(gemm->frontend_attributes().map().at(
                 std::string(kCollectiveHintWindowTargetAttr)),
             "ag-start");
+  EXPECT_EQ(gemm->frontend_attributes().map().at("scheduling_group_order"),
+            "1");
+  EXPECT_EQ(start->frontend_attributes().map().at("scheduling_group_order"),
+            "0");
+  EXPECT_EQ(done->frontend_attributes().map().at("scheduling_group_order"),
+            "2");
   TF_ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
                           start->backend_config<GpuBackendConfig>());
   EXPECT_TRUE(backend_config.force_earliest_schedule());

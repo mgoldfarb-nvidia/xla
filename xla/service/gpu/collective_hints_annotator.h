@@ -28,6 +28,8 @@ namespace xla::gpu {
 
 inline constexpr absl::string_view kCollectiveHintsReceiptAttr =
     "_xla_collective_hints_receipt";
+inline constexpr absl::string_view kCollectiveHintsFingerprintAttr =
+    "_xla_collective_hints_fingerprint";
 inline constexpr absl::string_view kCollectiveHintRuleIdsAttr =
     "_xla_collective_hint_rule_ids";
 inline constexpr absl::string_view kCollectiveHintWindowTargetAttr =

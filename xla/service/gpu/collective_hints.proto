@@ -46,15 +46,17 @@ message CollectiveHint {
   bool force_earliest = 4;
   optional int64 scheduling_group_id = 5;
 
-  // Exact compiler instruction name of one async collective start in the
-  // matched compute instruction's computation. Adds start -> compute -> done
-  // control dependencies after cycle validation.
+  // Exact compiler instruction name of one independent async collective start
+  // in the matched compute instruction's computation. The scheduler orders the
+  // start, compute, and done within one scheduling group without adding runtime
+  // control dependencies.
   string window_target = 6;
 }
 
 message CollectiveHintsConfig {
-  // The 128-bit lowercase hexadecimal fingerprint emitted as
-  // fingerprint_before_lhs in HLO dumps.
+  // The 128-bit lowercase hexadecimal structural fingerprint emitted as
+  // _xla_collective_hints_fingerprint in HLO dumps. Backend configuration is
+  // excluded so autotuning choices do not invalidate hints.
   string module_fingerprint = 1;
   repeated CollectiveHint hints = 2;
 }

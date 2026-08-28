@@ -15,7 +15,6 @@ limitations under the License.
 
 #include "xla/service/gpu/collective_hints_annotator.h"
 
-#include <algorithm>
 #include <memory>
 #include <string>
 
@@ -50,7 +49,7 @@ constexpr absl::string_view kCollectiveAndGemmHlo = R"hlo(
     ag-start = (f32[4], f32[8]) all-gather-start(p0), dimensions={0},
         replica_groups={}
     gemm = f32[4,4] custom-call(lhs, rhs),
-        custom_call_target="__cublas$gemm",
+        custom_call_target="__cublas$lt$matmul",
         metadata={op_name="layer/transpose(gemm)"}
     ag-done = f32[8] all-gather-done(ag-start)
     ROOT result = (f32[8], f32[4,4]) tuple(ag-done, gemm)
@@ -80,13 +79,6 @@ std::string FrontendAttribute(const HloInstruction& instruction,
   return it == attributes.end() ? "" : it->second;
 }
 
-bool HasControlPredecessor(const HloInstruction& instruction,
-                           const HloInstruction* predecessor) {
-  return std::find(instruction.control_predecessors().begin(),
-                   instruction.control_predecessors().end(),
-                   predecessor) != instruction.control_predecessors().end();
-}
-
 CollectiveHintsConfig Config() {
   CollectiveHintsConfig config;
   config.set_module_fingerprint(kFingerprint);
@@ -104,7 +96,7 @@ CollectiveHint* AddInstructionHint(CollectiveHintsConfig* config,
 }
 
 void TagModule(HloModule* module) {
-  module->add_frontend_attribute("fingerprint_before_lhs",
+  module->add_frontend_attribute(std::string(kCollectiveHintsFingerprintAttr),
                                  std::string(kFingerprint));
 }
 
@@ -152,22 +144,27 @@ TEST_F(CollectiveHintsAnnotatorTest, AppliesExactHintsAndWritesReceipt) {
   EXPECT_TRUE(backend_config.force_earliest_schedule());
   EXPECT_EQ(FrontendAttribute(*start, kXlaSchedulingGroupIdAttr), "7");
   EXPECT_EQ(FrontendAttribute(*gemm, kXlaSchedulingGroupIdAttr), "7");
+  EXPECT_EQ(FrontendAttribute(*done, kXlaSchedulingGroupIdAttr), "7");
   EXPECT_EQ(FrontendAttribute(*gemm, kCollectiveHintWindowTargetAttr),
             "ag-start");
   EXPECT_EQ(FrontendAttribute(*start, kCollectiveHintRuleIdsAttr),
             "a-collective");
   EXPECT_EQ(FrontendAttribute(*gemm, kCollectiveHintRuleIdsAttr),
             "b-gemm-window");
-  EXPECT_TRUE(HasControlPredecessor(*gemm, start));
-  EXPECT_TRUE(HasControlPredecessor(*done, gemm));
+  EXPECT_TRUE(gemm->control_predecessors().empty());
+  EXPECT_TRUE(done->control_predecessors().empty());
+  EXPECT_EQ(FrontendAttribute(*gemm, "scheduling_group_order"), "1");
+  EXPECT_EQ(FrontendAttribute(*start, "scheduling_group_order"), "0");
+  EXPECT_EQ(FrontendAttribute(*done, "scheduling_group_order"), "2");
 
   const auto& module_attributes = module->frontend_attributes().map();
-  EXPECT_EQ(module_attributes.at("fingerprint_before_lhs"), kFingerprint);
+  EXPECT_EQ(module_attributes.at(std::string(kCollectiveHintsFingerprintAttr)),
+            kFingerprint);
   EXPECT_EQ(module_attributes.at(std::string(kCollectiveHintsReceiptAttr)),
             "fingerprint=0123456789abcdef0123456789abcdef;"
             "a-collective=[main/ag-start];b-gemm-window=[main/gemm]");
   const std::string module_dump = module->ToString();
-  EXPECT_THAT(module_dump, HasSubstr("fingerprint_before_lhs"));
+  EXPECT_THAT(module_dump, HasSubstr(kCollectiveHintsFingerprintAttr));
   EXPECT_THAT(module_dump, HasSubstr("_xla_collective_hints_receipt"));
   EXPECT_THAT(module_dump, HasSubstr("a-collective=[main/ag-start]"));
 }
@@ -267,13 +264,16 @@ TEST_F(CollectiveHintsAnnotatorTest, RejectsFingerprintMismatch) {
   EXPECT_THAT(status.message(), HasSubstr("does not match compiled module"));
 }
 
-TEST_F(CollectiveHintsAnnotatorTest, RejectsWindowCycleWithoutMutation) {
+TEST_F(CollectiveHintsAnnotatorTest,
+       RejectsDataDependentWindowWithoutMutation) {
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                           ParseAndReturnVerifiedModule(kCyclicWindowHlo,
                                                        /*replica_count=*/2));
   TagModule(module.get());
   CollectiveHintsConfig config = Config();
-  AddInstructionHint(&config, "cycle", "gemm")->set_window_target("ag-start");
+  CollectiveHint* hint = AddInstructionHint(&config, "cycle", "gemm");
+  hint->set_scheduling_group_id(7);
+  hint->set_window_target("ag-start");
 
   HloInstruction* gemm =
       module->entry_computation()->GetInstructionWithName("gemm");
@@ -282,7 +282,7 @@ TEST_F(CollectiveHintsAnnotatorTest, RejectsWindowCycleWithoutMutation) {
                                     std::string(kFingerprint));
   absl::Status status = pass.Run(module.get()).status();
   EXPECT_EQ(status.code(), absl::StatusCode::kFailedPrecondition);
-  EXPECT_THAT(status.message(), HasSubstr("introduce a cycle"));
+  EXPECT_THAT(status.message(), HasSubstr("must be data/control independent"));
   EXPECT_TRUE(gemm->control_predecessors().empty());
   EXPECT_TRUE(gemm->control_successors().empty());
   EXPECT_FALSE(module->frontend_attributes().map().contains(
