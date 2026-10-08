@@ -15,13 +15,13 @@ limitations under the License.
 
 #include "xla/ffi/collectives_ffi.h"
 
-#include <gmock/gmock.h>
-#include <gtest/gtest.h>
-
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
 
+#include <gmock/gmock.h>
+#include <gtest/gtest.h>
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "xla/ffi/api/c_api.h"
@@ -43,6 +43,10 @@ static XLA_FFI_Communicator* const kFakeCommunicator =
 static XLA_FFI_Window* const kFakeWindow =
     reinterpret_cast<XLA_FFI_Window*>(0xDEC0DE);
 static constexpr size_t kFakeWindowOffset = 42;
+static const XLA_FFI_DeviceCommunicator* const kFakeDeviceCommunicator =
+    reinterpret_cast<const XLA_FFI_DeviceCommunicator*>(0xD3C0DE);
+static constexpr size_t kFakeDeviceCommunicatorSize = 256;
+static constexpr int32_t kFakeDeviceCommunicatorVersion = 23203;
 
 // Fake backend: implements the extension callbacks and records what the handler
 // requested so the test can check the C++ wrapper builds the C args correctly.
@@ -53,6 +57,9 @@ struct FakeBackend {
   size_t requested_num_groups = 0;
   int64_t requested_communication_id = -1;
   std::vector<int64_t> requested_ids;
+
+  int32_t requested_lsa_barrier_count = -1;
+  int32_t retrieved_lsa_barrier_count = -1;
 
   bool request_window_called = false;
   XLA_FFI_CollectiveGroupMode requested_window_group_mode =
@@ -118,6 +125,50 @@ static XLA_FFI_Error* FakeGetWindow(const XLA_FFI_Collectives_Extension* self,
   return nullptr;
 }
 
+static XLA_FFI_Error* FakeRequestDeviceCommunicator(
+    const XLA_FFI_Collectives_Extension* self,
+    XLA_FFI_DeviceCommunicator_Request_Args* args) {
+  auto* backend = reinterpret_cast<FakeBackend*>(self->state);
+  EXPECT_EQ(args->struct_size,
+            XLA_FFI_DeviceCommunicator_Request_Args_STRUCT_SIZE);
+  EXPECT_EQ(args->extension_start, nullptr);
+  EXPECT_EQ(args->requirements->struct_size,
+            XLA_FFI_DeviceCommunicator_Requirements_STRUCT_SIZE);
+  EXPECT_EQ(args->requirements->extension_start, nullptr);
+  EXPECT_EQ(args->group_mode, XLA_FFI_GROUP_FLATTENED_ID);
+  EXPECT_EQ(args->communication_id, 11);
+  EXPECT_EQ(args->num_groups, 2);
+  EXPECT_EQ(args->groups[0].size, 2);
+  EXPECT_EQ(args->groups[0].ids[0], 0);
+  EXPECT_EQ(args->groups[0].ids[1], 2);
+  EXPECT_EQ(args->groups[1].size, 2);
+  EXPECT_EQ(args->groups[1].ids[0], 1);
+  EXPECT_EQ(args->groups[1].ids[1], 3);
+  backend->requested_lsa_barrier_count = args->requirements->lsa_barrier_count;
+  return nullptr;
+}
+
+static XLA_FFI_Error* FakeGetDeviceCommunicator(
+    const XLA_FFI_Collectives_Extension* self,
+    XLA_FFI_DeviceCommunicator_Get_Args* args) {
+  auto* backend = reinterpret_cast<FakeBackend*>(self->state);
+  EXPECT_EQ(args->struct_size, XLA_FFI_DeviceCommunicator_Get_Args_STRUCT_SIZE);
+  EXPECT_EQ(args->extension_start, nullptr);
+  EXPECT_EQ(args->requirements->struct_size,
+            XLA_FFI_DeviceCommunicator_Requirements_STRUCT_SIZE);
+  EXPECT_EQ(args->requirements->extension_start, nullptr);
+  EXPECT_EQ(args->group_mode, XLA_FFI_GROUP_FLATTENED_ID);
+  EXPECT_EQ(args->communication_id, 11);
+  EXPECT_EQ(args->num_groups, 2);
+  EXPECT_EQ(args->groups[0].ids[1], 2);
+  EXPECT_EQ(args->groups[1].ids[1], 3);
+  backend->retrieved_lsa_barrier_count = args->requirements->lsa_barrier_count;
+  args->device_communicator = kFakeDeviceCommunicator;
+  args->byte_size = kFakeDeviceCommunicatorSize;
+  args->version = kFakeDeviceCommunicatorVersion;
+  return nullptr;
+}
+
 // Builds a collectives extension for the fake backend. Mirrors the small
 // builder each backend uses to publish the extension (see the GPU backend).
 static XLA_FFI_Collectives_Extension MakeFakeCollectivesExtension(
@@ -165,6 +216,9 @@ TEST(CollectivesFfiTest, RequestAndGetCommunicator) {
   XLA_FFI_Collectives_Extension ext = MakeFakeCollectivesExtension(
       reinterpret_cast<XLA_FFI_CollectivesState*>(&backend),
       FakeRequestCommunicator, FakeGetCommunicator);
+  ext.extension_base.id.minor_version = 2;
+  ext.extension_base.struct_size =
+      XLA_FFI_STRUCT_SIZE(XLA_FFI_Collectives_Extension, get_window);
 
   InvokeContext context;
   context.extension_start = &ext.extension_base;
@@ -242,6 +296,55 @@ TEST(CollectivesFfiTest, RequestAndGetWindow) {
   EXPECT_EQ(backend.get_window_buffer, &fake_buffer0);
   EXPECT_EQ(got_lookup.window, kFakeWindow);
   EXPECT_EQ(got_lookup.offset, kFakeWindowOffset);
+}
+
+TEST(CollectivesFfiTest, RequestAndGetDeviceCommunicator) {
+  FakeBackend backend;
+  XLA_FFI_Collectives_Extension ext = MakeFakeCollectivesExtension(
+      reinterpret_cast<XLA_FFI_CollectivesState*>(&backend),
+      FakeRequestCommunicator, FakeGetCommunicator);
+  ext.request_device_communicator = FakeRequestDeviceCommunicator;
+  ext.get_device_communicator = FakeGetDeviceCommunicator;
+  Communicator comm(Api(), &ext);
+  const std::vector<std::vector<int64_t>> groups = {{0, 2}, {1, 3}};
+  EXPECT_OK(comm.RequestDeviceCommunicator(GroupMode::kFlattenedId, groups,
+                                           /*communication_id=*/11, {8}));
+  ASSERT_OK_AND_ASSIGN(
+      DeviceCommunicatorLookup result,
+      comm.GetDeviceCommunicator(GroupMode::kFlattenedId, groups,
+                                 /*communication_id=*/11, {8}));
+  EXPECT_EQ(result.device_communicator, kFakeDeviceCommunicator);
+  EXPECT_EQ(result.byte_size, kFakeDeviceCommunicatorSize);
+  EXPECT_EQ(result.version, kFakeDeviceCommunicatorVersion);
+  EXPECT_EQ(backend.requested_lsa_barrier_count, 8);
+  EXPECT_EQ(backend.retrieved_lsa_barrier_count, 8);
+}
+
+TEST(CollectivesFfiTest, DeviceCommunicatorsUnavailable) {
+  XLA_FFI_Collectives_Extension ext = MakeFakeCollectivesExtension(
+      nullptr, FakeRequestCommunicator, FakeGetCommunicator);
+  ext.request_device_communicator = FakeRequestDeviceCommunicator;
+  ext.get_device_communicator = FakeGetDeviceCommunicator;
+  std::array<XLA_FFI_Collectives_Extension, 3> unsupported = {ext, ext, ext};
+  unsupported[0].extension_base.id.minor_version = 2;
+  unsupported[1].extension_base.struct_size =
+      XLA_FFI_STRUCT_SIZE(XLA_FFI_Collectives_Extension, get_window);
+  unsupported[2].request_device_communicator = nullptr;
+  unsupported[2].get_device_communicator = nullptr;
+  for (const XLA_FFI_Collectives_Extension& extension : unsupported) {
+    SCOPED_TRACE(extension.extension_base.id.minor_version);
+    SCOPED_TRACE(extension.extension_base.struct_size);
+    Communicator comm(Api(), &extension);
+    EXPECT_EQ(comm.RequestDeviceCommunicator(GroupMode::kFlattenedId, {{0, 1}},
+                                             /*communication_id=*/0, {})
+                  .code(),
+              absl::StatusCode::kUnimplemented);
+    EXPECT_EQ(comm.GetDeviceCommunicator(GroupMode::kFlattenedId, {{0, 1}},
+                                         /*communication_id=*/0, {})
+                  .status()
+                  .code(),
+              absl::StatusCode::kUnimplemented);
+  }
 }
 
 }  // namespace

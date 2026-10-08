@@ -45,6 +45,16 @@ struct WindowLookup {
   size_t offset;
 };
 
+struct DeviceCommunicatorRequirements {
+  int32_t lsa_barrier_count = 0;
+};
+
+struct DeviceCommunicatorLookup {
+  const XLA_FFI_DeviceCommunicator* device_communicator;
+  size_t byte_size;
+  int32_t version;
+};
+
 namespace internal {
 
 // C++ wrapper for the XLA FFI Collectives extension API.
@@ -99,6 +109,81 @@ class CommunicatorContextBase {
     return args.communicator;
   }
 
+  // Requests both the clique and its device communicator in Prepare. Identical
+  // requests share synchronization resources and must execute in order on the
+  // device. All ranks must request identical requirements.
+  Status RequestDeviceCommunicator(
+      GroupMode group_mode, const std::vector<std::vector<int64_t>>& groups,
+      int64_t communication_id, DeviceCommunicatorRequirements requirements) {
+    if (ext_->extension_base.id.minor_version <
+            kDeviceCommunicatorMinorVersion ||
+        ext_->extension_base.struct_size <
+            XLA_FFI_STRUCT_SIZE(XLA_FFI_Collectives_Extension,
+                                request_device_communicator) ||
+        ext_->request_device_communicator == nullptr) {
+      return ErrorPolicy::FromErrorCode(
+          XLA_FFI_Error_Code_UNIMPLEMENTED,
+          "Device communicators are not supported by this collectives "
+          "extension");
+    }
+    std::vector<XLA_FFI_ReplicaGroup> raw_groups = ToRawGroups(groups);
+    XLA_FFI_DeviceCommunicator_Requirements raw_requirements = {
+        XLA_FFI_DeviceCommunicator_Requirements_STRUCT_SIZE, nullptr,
+        requirements.lsa_barrier_count};
+    XLA_FFI_DeviceCommunicator_Request_Args args;
+    args.struct_size = XLA_FFI_DeviceCommunicator_Request_Args_STRUCT_SIZE;
+    args.extension_start = nullptr;
+    args.group_mode = static_cast<XLA_FFI_CollectiveGroupMode>(group_mode);
+    args.groups = raw_groups.data();
+    args.num_groups = raw_groups.size();
+    args.communication_id = communication_id;
+    args.requirements = &raw_requirements;
+    if (XLA_FFI_Error* err = ext_->request_device_communicator(ext_, &args)) {
+      return ErrorPolicy::TakeError(api_, err);
+    }
+    return ErrorPolicy::Ok();
+  }
+
+  // Returns a borrowed host-resident descriptor for the exact requirements
+  // requested in Prepare. Read or copy it during this invocation, and verify
+  // byte_size and the backend-defined version before using it with device code.
+  StatusOr<DeviceCommunicatorLookup> GetDeviceCommunicator(
+      GroupMode group_mode, const std::vector<std::vector<int64_t>>& groups,
+      int64_t communication_id, DeviceCommunicatorRequirements requirements) {
+    if (ext_->extension_base.id.minor_version <
+            kDeviceCommunicatorMinorVersion ||
+        ext_->extension_base.struct_size <
+            XLA_FFI_STRUCT_SIZE(XLA_FFI_Collectives_Extension,
+                                get_device_communicator) ||
+        ext_->get_device_communicator == nullptr) {
+      return StatusOr<DeviceCommunicatorLookup>(
+          ErrorPolicy::FromErrorCode(XLA_FFI_Error_Code_UNIMPLEMENTED,
+                                     "Device communicators are not supported "
+                                     "by this collectives extension"));
+    }
+    std::vector<XLA_FFI_ReplicaGroup> raw_groups = ToRawGroups(groups);
+    XLA_FFI_DeviceCommunicator_Requirements raw_requirements = {
+        XLA_FFI_DeviceCommunicator_Requirements_STRUCT_SIZE, nullptr,
+        requirements.lsa_barrier_count};
+    XLA_FFI_DeviceCommunicator_Get_Args args;
+    args.struct_size = XLA_FFI_DeviceCommunicator_Get_Args_STRUCT_SIZE;
+    args.extension_start = nullptr;
+    args.group_mode = static_cast<XLA_FFI_CollectiveGroupMode>(group_mode);
+    args.groups = raw_groups.data();
+    args.num_groups = raw_groups.size();
+    args.communication_id = communication_id;
+    args.requirements = &raw_requirements;
+    args.device_communicator = nullptr;
+    args.byte_size = 0;
+    args.version = 0;
+    if (XLA_FFI_Error* err = ext_->get_device_communicator(ext_, &args)) {
+      return StatusOr<DeviceCommunicatorLookup>(
+          ErrorPolicy::TakeError(api_, err));
+    }
+    return DeviceCommunicatorLookup{args.device_communicator, args.byte_size,
+                                    args.version};
+  }
+
   //===--------------------------------------------------------------------===//
   // Collective memory window
   //===--------------------------------------------------------------------===//
@@ -110,8 +195,9 @@ class CommunicatorContextBase {
   // pointers. Allocation stays on the JAX-side.
   //
   // RequestWindow requires the corresponding communicator/clique to have been
-  // requested first via RequestCommunicator with the same (group_mode, groups,
-  // communication_id); backends may return FailedPrecondition otherwise.
+  // requested first via RequestCommunicator or RequestDeviceCommunicator with
+  // the same (group_mode, groups, communication_id); backends may return
+  // FailedPrecondition otherwise.
 
   Status RequestWindow(GroupMode group_mode,
                        const std::vector<std::vector<int64_t>>& groups,
@@ -160,6 +246,8 @@ class CommunicatorContextBase {
   }
 
  private:
+  static constexpr int32_t kDeviceCommunicatorMinorVersion = 3;
+
   // Converts a vector of replica groups to a vector of `XLA_FFI_ReplicaGroup`.
   // The results reference the id storage in `groups`, which must outlive them.
   static std::vector<XLA_FFI_ReplicaGroup> ToRawGroups(
@@ -189,6 +277,12 @@ struct CollectivesExtensionBase {
       XLA_FFI_Extension_Collectives_MajorVersion;
   static constexpr int32_t kMinorVersion =
       XLA_FFI_Extension_Collectives_MinorVersion;
+
+  // Device communicator methods check availability independently so existing
+  // communicator and window operations remain usable with older runtimes.
+  static bool Support(int32_t major_version, int32_t minor_version) {
+    return major_version == kMajorVersion && minor_version >= 2;
+  }
 
   // Builds a context from the extension.
   static CommunicatorContextT Create(const XLA_FFI_Api* api,

@@ -29,8 +29,8 @@ extern "C" {
 // XLA FFI Collectives API
 //===----------------------------------------------------------------------===//
 
-// Exposes the XLA-owned host collective communicator and collective memory
-// window to FFI handlers.
+// Exposes XLA-owned host and device collective communicators and collective
+// memory windows to FFI handlers.
 // `request_communicator` requests a clique in the Prepare stage;
 // `get_communicator` returns the handle once cliques are acquired.
 // `request_window` requests window registration for a batch of already-
@@ -44,7 +44,7 @@ extern "C" {
 
 #define XLA_FFI_Extension_Collectives 129
 #define XLA_FFI_Extension_Collectives_MajorVersion 0
-#define XLA_FFI_Extension_Collectives_MinorVersion 2
+#define XLA_FFI_Extension_Collectives_MinorVersion 3
 
 // Mirrors `xla::CollectiveOpGroupMode`.
 typedef enum XLA_FFI_CollectiveGroupMode {
@@ -177,6 +177,78 @@ typedef XLA_FFI_Error* XLA_FFI_Window_Get(
     const XLA_FFI_Collectives_Extension* self, XLA_FFI_Window_Get_Args* args);
 
 //===----------------------------------------------------------------------===//
+// Device communicator: request in Prepare, get in Initialize/Execute
+//===----------------------------------------------------------------------===//
+
+// Opaque, borrowed host-resident device communicator descriptor. For NCCL this
+// is a pointer to ncclDevComm, whose value can be copied into a kernel
+// argument. It is not a device pointer. The handler must not modify or destroy
+// it, and must read or copy it during the invocation that retrieves it.
+typedef struct XLA_FFI_DeviceCommunicator XLA_FFI_DeviceCommunicator;
+
+typedef struct XLA_FFI_DeviceCommunicator_Requirements {
+  size_t struct_size;
+  XLA_FFI_InternalExtension* extension_start;
+
+  // Number of barriers for load/store-accessible communication. Must be >= 0.
+  int32_t lsa_barrier_count;
+} XLA_FFI_DeviceCommunicator_Requirements;
+
+XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_DeviceCommunicator_Requirements,
+                             lsa_barrier_count);
+
+typedef struct XLA_FFI_DeviceCommunicator_Request_Args {
+  size_t struct_size;
+  XLA_FFI_InternalExtension* extension_start;
+
+  XLA_FFI_CollectiveGroupMode group_mode;
+  const XLA_FFI_ReplicaGroup* groups;
+  size_t num_groups;
+  int64_t communication_id;
+  const XLA_FFI_DeviceCommunicator_Requirements* requirements;
+} XLA_FFI_DeviceCommunicator_Request_Args;
+
+XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_DeviceCommunicator_Request_Args,
+                             requirements);
+
+// Requests both the collective clique and its device communicator. Prepare
+// stage only. All ranks must request identical requirements. Requests with the
+// same clique and requirements share synchronization resources; their device
+// operations must execute in order. Independent concurrent operations must use
+// distinct communication IDs. Windows must use the same clique as the device
+// communicator that accesses them.
+typedef XLA_FFI_Error* XLA_FFI_DeviceCommunicator_Request(
+    const XLA_FFI_Collectives_Extension* self,
+    XLA_FFI_DeviceCommunicator_Request_Args* args);
+
+typedef struct XLA_FFI_DeviceCommunicator_Get_Args {
+  size_t struct_size;
+  XLA_FFI_InternalExtension* extension_start;
+
+  XLA_FFI_CollectiveGroupMode group_mode;
+  const XLA_FFI_ReplicaGroup* groups;
+  size_t num_groups;
+  int64_t communication_id;
+  const XLA_FFI_DeviceCommunicator_Requirements* requirements;
+
+  const XLA_FFI_DeviceCommunicator* device_communicator;  // out
+  size_t byte_size;                                       // out
+  // Backend-defined descriptor version (out). For NCCL this is the compile-time
+  // NCCL_VERSION_CODE used to create the descriptor, not the library's runtime
+  // version. Consumers must verify size and version compatibility before
+  // interpreting the descriptor or using it with their device code.
+  int32_t version;
+} XLA_FFI_DeviceCommunicator_Get_Args;
+
+XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_DeviceCommunicator_Get_Args, version);
+
+// Returns the descriptor matching a previous request, including its exact
+// requirements. Valid after cliques are acquired (Initialize/Execute stages).
+typedef XLA_FFI_Error* XLA_FFI_DeviceCommunicator_Get(
+    const XLA_FFI_Collectives_Extension* self,
+    XLA_FFI_DeviceCommunicator_Get_Args* args);
+
+//===----------------------------------------------------------------------===//
 // Extension struct
 //===----------------------------------------------------------------------===//
 
@@ -190,9 +262,14 @@ struct XLA_FFI_Collectives_Extension {
 
   XLA_FFI_Window_Request* request_window;
   XLA_FFI_Window_Get* get_window;
+
+  // Added in extension version 0.3.
+  XLA_FFI_DeviceCommunicator_Request* request_device_communicator;
+  XLA_FFI_DeviceCommunicator_Get* get_device_communicator;
 };
 
-XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_Collectives_Extension, get_window);
+XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_Collectives_Extension,
+                             get_device_communicator);
 
 #ifdef __cplusplus
 }  // extern "C"

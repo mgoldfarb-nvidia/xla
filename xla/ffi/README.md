@@ -115,3 +115,35 @@ The dictionary and its borrowed views are valid only during the handler call,
 including for handlers that return a future. Copy string and array contents into
 owned storage before returning if asynchronous work needs them. Copying a
 `Dictionary`, string view, or span does not extend the lifetime of its contents.
+
+## Device communicators
+
+The collectives extension in `xla/ffi/api/collectives_ffi.h` lets GPU handlers
+borrow device communicators owned by XLA. Bind
+`.Ctx<ffi::Extension<ffi::Collectives>>()` and call
+`RequestDeviceCommunicator(group_mode, groups, communication_id, requirements)`
+in Prepare, then `GetDeviceCommunicator` with the same arguments in Initialize
+or Execute. `ffi::DeviceCommunicatorRequirements::lsa_barrier_count` selects the
+number of load/store-accessible barriers. All participating ranks must request
+the same requirements. The device request also requests the host communicator;
+window registration can then use `RequestWindow` with the same groups and ID.
+
+XLA creates missing device communicators before Initialize and caches them by
+clique, rank, and requirements. Repeated calls reuse the communicator and its
+barrier resources. Uses of a shared communicator must have a total GPU execution
+order; independent concurrent operations require distinct communication IDs.
+The FFI handler must not mutate or destroy the descriptor or its resources.
+
+`GetDeviceCommunicator` returns a borrowed **host** descriptor address, its byte
+size, and its backend-defined version. On CUDA these describe an `ncclDevComm`
+compiled with the reported `NCCL_VERSION_CODE`. Before interpreting the
+descriptor, consumers must check its size and version against their kernel's
+NCCL device ABI. The version of the loaded NCCL library alone is insufficient.
+The host launcher can copy the descriptor into a kernel argument by value; its
+address must not be treated as a device pointer. This does not require a separate
+host-to-device descriptor allocation or copy.
+
+Device communicator methods require a runtime with collectives extension 0.3
+or later. They return an unsupported-feature error on older runtimes. Borrowing
+these resources does not by itself make a handler safe for command-buffer
+capture or extend the lifetime of resources referenced by a captured graph.
