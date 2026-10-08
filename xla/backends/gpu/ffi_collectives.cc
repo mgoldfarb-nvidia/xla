@@ -227,6 +227,117 @@ XLA_FFI_Error* CommunicatorGet(const XLA_FFI_Collectives_Extension* self,
   return ffi::CreateError(CommunicatorGetImpl(self, args));
 }
 
+absl::StatusOr<GpuDeviceCommunicator::Requirements> ToDeviceCommRequirements(
+    const XLA_FFI_DeviceCommunicator_Requirements* requirements) {
+  if (requirements == nullptr) {
+    return InvalidArgument("Device communicator requirements must be set");
+  }
+  ABSL_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
+      "XLA_FFI_DeviceCommunicator_Requirements",
+      XLA_FFI_DeviceCommunicator_Requirements_STRUCT_SIZE,
+      requirements->struct_size));
+  if (requirements->lsa_barrier_count < 0) {
+    return InvalidArgument("lsa_barrier_count must be non-negative");
+  }
+  return GpuDeviceCommunicator::Requirements{
+      .lsa_barrier_count = requirements->lsa_barrier_count};
+}
+
+absl::Status DeviceCommunicatorRequestImpl(
+    const XLA_FFI_Collectives_Extension* self,
+    XLA_FFI_DeviceCommunicator_Request_Args* args) {
+  if (self == nullptr || args == nullptr) {
+    return InvalidArgument(
+        "Device communicator extension and args must be set");
+  }
+  ABSL_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
+      "XLA_FFI_DeviceCommunicator_Request_Args",
+      XLA_FFI_DeviceCommunicator_Request_Args_STRUCT_SIZE, args->struct_size));
+  ABSL_ASSIGN_OR_RETURN(GpuDeviceCommunicator::Requirements requirements,
+                        ToDeviceCommRequirements(args->requirements));
+
+  GpuCollectivesState* state = AsState(self);
+  if (state == nullptr || state->collective_params == nullptr) {
+    return InvalidArgument("Collective params are not available");
+  }
+  if (state->collective_clique_requests == nullptr) {
+    return FailedPrecondition(
+        "GPU device communicator request is only available during the prepare "
+        "stage");
+  }
+
+  ABSL_ASSIGN_OR_RETURN(std::vector<ReplicaGroup> replica_groups,
+                        ToReplicaGroups(args->groups, args->num_groups));
+  ABSL_ASSIGN_OR_RETURN(
+      GpuCliqueKey clique_key,
+      GetCliqueKey(*state->collective_params, args->group_mode, replica_groups,
+                   args->communication_id));
+  ABSL_ASSIGN_OR_RETURN(std::vector<std::vector<GlobalDeviceId>> device_groups,
+                        GetDeviceGroups(*state->collective_params,
+                                        args->group_mode, replica_groups));
+  return state->collective_clique_requests->RequestClique(
+      clique_key, device_groups,
+      CollectiveCliqueRequests::CliqueRequirements(requirements));
+}
+
+absl::Status DeviceCommunicatorGetImpl(
+    const XLA_FFI_Collectives_Extension* self,
+    XLA_FFI_DeviceCommunicator_Get_Args* args) {
+  if (self == nullptr || args == nullptr) {
+    return InvalidArgument(
+        "Device communicator extension and args must be set");
+  }
+  ABSL_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
+      "XLA_FFI_DeviceCommunicator_Get_Args",
+      XLA_FFI_DeviceCommunicator_Get_Args_STRUCT_SIZE, args->struct_size));
+  ABSL_ASSIGN_OR_RETURN(GpuDeviceCommunicator::Requirements requirements,
+                        ToDeviceCommRequirements(args->requirements));
+
+  GpuCollectivesState* state = AsState(self);
+  if (state == nullptr || state->collective_params == nullptr) {
+    return InvalidArgument("Collective params are not available");
+  }
+  if (state->collective_cliques == nullptr) {
+    return FailedPrecondition(
+        "GPU device communicator get is only available after cliques are "
+        "acquired");
+  }
+
+  ABSL_ASSIGN_OR_RETURN(std::vector<ReplicaGroup> replica_groups,
+                        ToReplicaGroups(args->groups, args->num_groups));
+  ABSL_ASSIGN_OR_RETURN(
+      GpuCliqueKey clique_key,
+      GetCliqueKey(*state->collective_params, args->group_mode, replica_groups,
+                   args->communication_id));
+  ABSL_ASSIGN_OR_RETURN(
+      GpuDeviceCommunicator * comm,
+      state->collective_cliques->GetDeviceComm(
+          clique_key, state->collective_params->global_device_id,
+          requirements));
+  PlatformDeviceCommunicatorHandle descriptor = comm->platform_comm();
+  if (descriptor.handle == nullptr || descriptor.byte_size == 0) {
+    return Unimplemented(
+        "Platform device communicator descriptor is not available");
+  }
+  args->device_communicator =
+      reinterpret_cast<const XLA_FFI_DeviceCommunicator*>(descriptor.handle);
+  args->byte_size = descriptor.byte_size;
+  args->version = descriptor.version;
+  return absl::OkStatus();
+}
+
+XLA_FFI_Error* DeviceCommunicatorRequest(
+    const XLA_FFI_Collectives_Extension* self,
+    XLA_FFI_DeviceCommunicator_Request_Args* args) {
+  return ffi::CreateError(DeviceCommunicatorRequestImpl(self, args));
+}
+
+XLA_FFI_Error* DeviceCommunicatorGet(
+    const XLA_FFI_Collectives_Extension* self,
+    XLA_FFI_DeviceCommunicator_Get_Args* args) {
+  return ffi::CreateError(DeviceCommunicatorGetImpl(self, args));
+}
+
 absl::Status WindowRequestImpl(const XLA_FFI_Collectives_Extension* self,
                                XLA_FFI_Window_Request_Args* args) {
   if (self == nullptr) {
@@ -356,6 +467,8 @@ XLA_FFI_Collectives_Extension MakeCollectivesExtension(
   ext.get_communicator = CommunicatorGet;
   ext.request_window = WindowRequest;
   ext.get_window = WindowGet;
+  ext.request_device_communicator = DeviceCommunicatorRequest;
+  ext.get_device_communicator = DeviceCommunicatorGet;
   return ext;
 }
 

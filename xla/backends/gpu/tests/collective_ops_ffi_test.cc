@@ -85,6 +85,10 @@ absl::StatusOr<void*> GetWindowPeerDevicePointer(XLA_FFI_Window* window,
                                                  size_t window_offset,
                                                  int peer);
 
+absl::Status DeviceCommunicatorAllReduceU32(
+    se::Stream* stream, ffi::DeviceCommunicatorLookup communicator,
+    ffi::WindowLookup src, ffi::WindowLookup dst, size_t count);
+
 struct SynchronizationSignals {
   absl::Mutex mutex;
   absl::BlockingCounter finished_kernels_counter;
@@ -384,6 +388,67 @@ absl::Status PreparePublicApiWindow(ffi::BufferR0<U32> src,
   return comm.RequestWindow(ffi::GroupMode::kFlattenedId,
                             PublicApiReplicaGroups(),
                             /*communication_id=*/0, regions);
+}
+
+absl::Status PreparePublicApiDeviceAllReduce(
+    ffi::BufferR0<U32> src, ffi::Result<ffi::BufferR0<U32>> dst,
+    ffi::Communicator comm) {
+  ABSL_RETURN_IF_ERROR(comm.RequestDeviceCommunicator(
+      ffi::GroupMode::kFlattenedId, PublicApiReplicaGroups(),
+      /*communication_id=*/0,
+      ffi::DeviceCommunicatorRequirements{.lsa_barrier_count = 8}));
+  return comm.RequestWindow(
+      ffi::GroupMode::kFlattenedId, PublicApiReplicaGroups(),
+      /*communication_id=*/0,
+      {{src.device_memory().opaque(), src.device_memory().size()},
+       {dst->device_memory().opaque(), dst->device_memory().size()}});
+}
+
+absl::Status InitializePublicApiDeviceAllReduce(ffi::Communicator comm) {
+  return comm
+      .GetDeviceCommunicator(
+          ffi::GroupMode::kFlattenedId, PublicApiReplicaGroups(),
+          /*communication_id=*/0,
+          ffi::DeviceCommunicatorRequirements{.lsa_barrier_count = 8})
+      .status();
+}
+
+absl::Status PreparePublicApiInvalidDeviceCommunicator(ffi::Communicator comm) {
+  return comm.RequestDeviceCommunicator(
+      ffi::GroupMode::kFlattenedId, PublicApiReplicaGroups(),
+      /*communication_id=*/0,
+      ffi::DeviceCommunicatorRequirements{.lsa_barrier_count = -1});
+}
+
+absl::Status PublicApiRequestDeviceCommunicatorInExecute(
+    ffi::BufferR0<U32>, ffi::Result<ffi::BufferR0<U32>>,
+    ffi::Communicator comm) {
+  return comm.RequestDeviceCommunicator(
+      ffi::GroupMode::kFlattenedId, PublicApiReplicaGroups(),
+      /*communication_id=*/0,
+      ffi::DeviceCommunicatorRequirements{.lsa_barrier_count = 8});
+}
+
+absl::Status PublicApiDeviceAllReduce(se::Stream* stream,
+                                      ffi::BufferR0<U32> src,
+                                      ffi::Result<ffi::BufferR0<U32>> dst,
+                                      ffi::Communicator comm) {
+  ABSL_ASSIGN_OR_RETURN(
+      ffi::DeviceCommunicatorLookup communicator,
+      comm.GetDeviceCommunicator(
+          ffi::GroupMode::kFlattenedId, PublicApiReplicaGroups(),
+          /*communication_id=*/0,
+          ffi::DeviceCommunicatorRequirements{.lsa_barrier_count = 8}));
+  ABSL_ASSIGN_OR_RETURN(
+      ffi::WindowLookup src_window,
+      comm.GetWindow(ffi::GroupMode::kFlattenedId, PublicApiReplicaGroups(),
+                     /*communication_id=*/0, src.device_memory().opaque()));
+  ABSL_ASSIGN_OR_RETURN(
+      ffi::WindowLookup dst_window,
+      comm.GetWindow(ffi::GroupMode::kFlattenedId, PublicApiReplicaGroups(),
+                     /*communication_id=*/0, dst->device_memory().opaque()));
+  return DeviceCommunicatorAllReduceU32(stream, communicator, src_window,
+                                        dst_window, src.element_count());
 }
 
 absl::Status PrepareBadPublicApiWindow(ffi::BufferR0<U32> src,
@@ -1006,6 +1071,36 @@ XLA_FFI_DEFINE_HANDLER(kPublicApiWindow, PublicApiWindow,
                            .Ret<ffi::BufferR0<U32>>()  // dst
                            .Ctx<ffi::Extension<ffi::Collectives>>());
 
+XLA_FFI_DEFINE_HANDLER(kPreparePublicApiDeviceAllReduce,
+                       PreparePublicApiDeviceAllReduce,
+                       ffi::Ffi::BindPrepare()
+                           .Arg<ffi::BufferR0<U32>>()
+                           .Ret<ffi::BufferR0<U32>>()
+                           .Ctx<ffi::Extension<ffi::Collectives>>());
+
+XLA_FFI_DEFINE_HANDLER(
+    kInitializePublicApiDeviceAllReduce, InitializePublicApiDeviceAllReduce,
+    ffi::Ffi::BindInitialize().Ctx<ffi::Extension<ffi::Collectives>>());
+
+XLA_FFI_DEFINE_HANDLER(kPublicApiDeviceAllReduce, PublicApiDeviceAllReduce,
+                       ffi::Ffi::Bind()
+                           .Ctx<ffi::Stream>()
+                           .Arg<ffi::BufferR0<U32>>()
+                           .Ret<ffi::BufferR0<U32>>()
+                           .Ctx<ffi::Extension<ffi::Collectives>>());
+
+XLA_FFI_DEFINE_HANDLER(
+    kPreparePublicApiInvalidDeviceCommunicator,
+    PreparePublicApiInvalidDeviceCommunicator,
+    ffi::Ffi::BindPrepare().Ctx<ffi::Extension<ffi::Collectives>>());
+
+XLA_FFI_DEFINE_HANDLER(kPublicApiRequestDeviceCommunicatorInExecute,
+                       PublicApiRequestDeviceCommunicatorInExecute,
+                       ffi::Ffi::Bind()
+                           .Arg<ffi::BufferR0<U32>>()
+                           .Ret<ffi::BufferR0<U32>>()
+                           .Ctx<ffi::Extension<ffi::Collectives>>());
+
 XLA_FFI_DEFINE_HANDLER(kPrepareBadPublicApiWindow, PrepareBadPublicApiWindow,
                        ffi::Ffi::BindPrepare()
                            .Arg<ffi::BufferR0<U32>>()  // src
@@ -1226,6 +1321,35 @@ XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), "__xla_test$$public_api_window",
                              /*initialize=*/nullptr,
                              /*execute=*/kPublicApiWindow,
                          });
+
+XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(),
+                         "__xla_test$$public_api_device_all_reduce", "gpu",
+                         XLA_FFI_Handler_Bundle{
+                             /*instantiate=*/nullptr,
+                             /*prepare=*/kPreparePublicApiDeviceAllReduce,
+                             /*initialize=*/kInitializePublicApiDeviceAllReduce,
+                             /*execute=*/kPublicApiDeviceAllReduce,
+                         });
+
+XLA_FFI_REGISTER_HANDLER(
+    ffi::GetXlaFfiApi(), "__xla_test$$public_api_invalid_device_communicator",
+    "gpu",
+    XLA_FFI_Handler_Bundle{
+        /*instantiate=*/nullptr,
+        /*prepare=*/kPreparePublicApiInvalidDeviceCommunicator,
+        /*initialize=*/nullptr,
+        /*execute=*/kPublicApiRequestDeviceCommunicatorInExecute,
+    });
+
+XLA_FFI_REGISTER_HANDLER(
+    ffi::GetXlaFfiApi(),
+    "__xla_test$$public_api_request_device_communicator_in_execute", "gpu",
+    XLA_FFI_Handler_Bundle{
+        /*instantiate=*/nullptr,
+        /*prepare=*/nullptr,
+        /*initialize=*/nullptr,
+        /*execute=*/kPublicApiRequestDeviceCommunicatorInExecute,
+    });
 
 // Register handler bundle for the negative FFI window test.
 XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(),
@@ -1517,6 +1641,108 @@ TEST_F(CollectiveOpsTestFFI, PublicApiWindow) {
     LiteralTestUtil::ExpectR0Equal<uint32_t>(expected, results[i]);
   }
 }
+
+namespace {
+
+TEST_F(CollectiveOpsTestFFI, PublicApiDeviceAllReduce) {
+  if (device_count() < kNumReplicas) {
+    GTEST_SKIP() << "Test requires at least " << kNumReplicas << " devices ("
+                 << device_count() << " available)";
+  }
+  if (!IsHopperAndHigher()) {
+    GTEST_SKIP() << "NCCL symmetric memory requires Hopper+";
+  }
+
+  constexpr absl::string_view hlo_string = R"hlo(
+      HloModule m, replica_count=2
+      ENTRY test_computation {
+        id = u32[] replica-id()
+        in = u32[]{:S(7)} copy(id)
+        ar = u32[]{:S(7)} custom-call(in),
+          custom_call_target="__xla_test$$public_api_device_all_reduce",
+          api_version=API_VERSION_TYPED_FFI
+        ROOT out = u32[] copy(ar)
+      }
+    )hlo";
+
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnVerifiedModule(hlo_string, kNumReplicas));
+  ASSERT_OK_AND_ASSIGN(ExecutionResult execution_result,
+                       ExecuteReplicated(std::move(module),
+                                         /*arguments=*/std::vector<Literal*>(),
+                                         /*run_hlo_passes=*/false));
+
+  const uint32_t expected = kNumReplicas * (kNumReplicas - 1) / 2;
+  ASSERT_EQ(execution_result.results.size(), kNumReplicas);
+  for (const Literal& result : execution_result.results) {
+    LiteralTestUtil::ExpectR0Equal<uint32_t>(expected, result);
+  }
+
+  // Reuse the cached communicator and its device-side barrier state.
+  ASSERT_OK_AND_ASSIGN(
+      std::vector<Literal> repeated_results,
+      ExecuteReplicated(execution_result.executable.get(),
+                        std::vector<std::vector<Literal*>>(kNumReplicas),
+                        /*run_hlo_passes=*/false));
+  ASSERT_EQ(repeated_results.size(), kNumReplicas);
+  for (const Literal& result : repeated_results) {
+    LiteralTestUtil::ExpectR0Equal<uint32_t>(expected, result);
+  }
+}
+
+struct InvalidDeviceCommunicatorRequest {
+  absl::string_view target;
+  absl::StatusCode code;
+  absl::string_view message;
+};
+
+class PublicApiDeviceCommunicatorErrorTest
+    : public CollectiveOpsTestFFI,
+      public ::testing::WithParamInterface<InvalidDeviceCommunicatorRequest> {};
+
+TEST_P(PublicApiDeviceCommunicatorErrorTest, RejectsInvalidRequest) {
+  if (!Capability().IsCuda()) {
+    GTEST_SKIP()
+        << "Device communicators are not implemented for this platform";
+  }
+  if (device_count() < kNumReplicas) {
+    GTEST_SKIP() << "Test requires at least " << kNumReplicas << " devices ("
+                 << device_count() << " available)";
+  }
+
+  std::string hlo_string = absl::Substitute(R"hlo(
+      HloModule m, replica_count=2
+      ENTRY test_computation {
+        id = u32[] replica-id()
+        ROOT out = u32[] custom-call(id),
+          custom_call_target="$0",
+          api_version=API_VERSION_TYPED_FFI
+      }
+    )hlo",
+                                            GetParam().target);
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnVerifiedModule(hlo_string, kNumReplicas));
+  absl::StatusOr<ExecutionResult> result =
+      ExecuteReplicated(std::move(module),
+                        /*arguments=*/std::vector<Literal*>(),
+                        /*run_hlo_passes=*/false);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.status().code(), GetParam().code);
+  EXPECT_THAT(result.status().message(),
+              ::testing::HasSubstr(GetParam().message));
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    PublicApi, PublicApiDeviceCommunicatorErrorTest,
+    Values(
+        InvalidDeviceCommunicatorRequest{
+            "__xla_test$$public_api_invalid_device_communicator",
+            absl::StatusCode::kInvalidArgument, "lsa_barrier_count"},
+        InvalidDeviceCommunicatorRequest{
+            "__xla_test$$public_api_request_device_communicator_in_execute",
+            absl::StatusCode::kFailedPrecondition, "prepare stage"}));
+
+}  // namespace
 
 TEST_F(CollectiveOpsTestFFI, PublicApiWindowRequiresCommunicatorRequest) {
   if (!Capability().IsCuda()) {

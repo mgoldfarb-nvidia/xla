@@ -18,15 +18,46 @@ limitations under the License.
 
 #include "absl/base/casts.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "third_party/gpus/cuda/include/driver_types.h"
 #include "third_party/nccl/nccl.h"         // IWYU pragma: keep
 #include "third_party/nccl/nccl_device.h"  // IWYU pragma: keep
+#include "xla/backends/gpu/tests/collective_ops_ffi_kernels.h"
+#include "xla/ffi/api/collectives_api.h"
 #include "xla/ffi/api/collectives_c_api.h"
 #include "xla/status_macros.h"
+#include "xla/stream_executor/device_address.h"
+#include "xla/stream_executor/gpu/gpu_kernel_registry.h"
+#include "xla/stream_executor/kernel_args.h"
+#include "xla/stream_executor/launch_dim.h"
 #include "xla/stream_executor/stream.h"
 
 namespace xla::gpu {
+
+absl::Status DeviceCommunicatorAllReduceU32(
+    stream_executor::Stream* stream, ffi::DeviceCommunicatorLookup communicator,
+    ffi::WindowLookup src, ffi::WindowLookup dst, size_t count) {
+  TF_RET_CHECK(communicator.device_communicator != nullptr);
+  TF_RET_CHECK(communicator.byte_size == sizeof(ncclDevComm));
+  TF_RET_CHECK(communicator.version == NCCL_VERSION_CODE);
+  TF_RET_CHECK(src.window != nullptr && dst.window != nullptr);
+
+  const auto* dev_comm =
+      reinterpret_cast<const ncclDevComm*>(communicator.device_communicator);
+  ABSL_ASSIGN_OR_RETURN(
+      auto kernel, stream_executor::gpu::GpuKernelRegistry::GetGlobalRegistry()
+                       .LoadKernel<SymmetricAllReduce>(stream->parent()));
+  auto args = stream_executor::PackKernelArgs(
+      /*shmem_bytes=*/0, *dev_comm,
+      stream_executor::DeviceAddressBase(reinterpret_cast<void*>(src.window)),
+      stream_executor::DeviceAddressBase(reinterpret_cast<void*>(dst.window)),
+      src.offset, dst.offset, count);
+  ABSL_RETURN_IF_ERROR(kernel->Launch(stream_executor::ThreadDim(8),
+                                      stream_executor::BlockDim(1), stream,
+                                      *args));
+  return stream->BlockHostUntilDone();
+}
 
 absl::Status CommunicatorAllReduceU32(stream_executor::Stream* stream,
                                       XLA_FFI_Communicator* communicator,

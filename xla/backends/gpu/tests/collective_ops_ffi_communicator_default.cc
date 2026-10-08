@@ -18,6 +18,7 @@ limitations under the License.
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "xla/ffi/api/collectives_api.h"
 #include "xla/ffi/api/collectives_c_api.h"
 
 namespace stream_executor {
@@ -25,6 +26,14 @@ class Stream;
 }  // namespace stream_executor
 
 namespace xla::gpu {
+
+absl::Status DeviceCommunicatorAllReduceU32(stream_executor::Stream*,
+                                            ffi::DeviceCommunicatorLookup,
+                                            ffi::WindowLookup,
+                                            ffi::WindowLookup, size_t) {
+  return absl::UnimplementedError(
+      "Device communicator all-reduce is not implemented for this platform");
+}
 
 absl::Status CommunicatorAllReduceU32(stream_executor::Stream*,
                                       XLA_FFI_Communicator*, const void*, void*,

@@ -360,7 +360,7 @@ class NcclDeviceCommunicator : public GpuDeviceCommunicator {
   static absl::StatusOr<std::unique_ptr<NcclDeviceCommunicator>> CreateFrom(
       const NcclCommunicator& comm, const Requirements& requirements);
 
-  PlatformCommunicatorHandle platform_comm() const final;
+  PlatformDeviceCommunicatorHandle platform_comm() const final;
 
   // Returns the size of the load/store accessible communication.
   int64_t lsa_size() const final { return dev_comm_.lsaSize; };

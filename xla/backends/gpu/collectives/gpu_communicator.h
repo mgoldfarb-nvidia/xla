@@ -66,6 +66,15 @@ struct PlatformCommunicatorHandle {
   void* handle = nullptr;  // will be nullptr if not supported
 };
 
+// A borrowed host descriptor that can be copied into a device kernel argument.
+// The version identifies the backend's descriptor layout, not its loaded
+// runtime. For NCCL it is the NCCL_VERSION_CODE used to compile the descriptor.
+struct PlatformDeviceCommunicatorHandle {
+  const void* handle = nullptr;
+  size_t byte_size = 0;
+  int32_t version = 0;
+};
+
 // A device communicator that corresponds to the host side GPU communicator
 // object (it has same rank in the collective clique and shares underlying
 // resources). A host-side GPU communicator object can instantiate multiple
@@ -135,9 +144,7 @@ class GpuDeviceCommunicator {
   }
 
   // Returns a platform-specific handle to the underlying communicator object.
-  virtual PlatformCommunicatorHandle platform_comm() const {
-    return PlatformCommunicatorHandle{nullptr};
-  }
+  virtual PlatformDeviceCommunicatorHandle platform_comm() const { return {}; }
 
   // Returns the size of the load/store accessible communication.
   virtual int64_t lsa_size() const = 0;

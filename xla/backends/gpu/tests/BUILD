@@ -1467,6 +1467,7 @@ xla_test(
         "@com_google_googletest//:gtest",
     ] + if_cuda_is_configured([
         ":collective_ops_ffi_kernels_cuda",
+        "//xla/stream_executor:kernel_args",
         "@com_google_absl//absl/base",
         "@local_config_cuda//cuda:cuda_headers",
         "@local_config_nccl//:nccl",

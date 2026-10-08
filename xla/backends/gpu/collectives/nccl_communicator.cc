@@ -1278,8 +1278,8 @@ NcclDeviceCommunicator::CreateFrom(const NcclCommunicator& comm,
       comm_state, comm.stream_executor(), comm.executor(), dev_comm));
 }
 
-PlatformCommunicatorHandle NcclDeviceCommunicator::platform_comm() const {
-  return {const_cast<ncclDevComm*>(&dev_comm_)};
+PlatformDeviceCommunicatorHandle NcclDeviceCommunicator::platform_comm() const {
+  return {&dev_comm_, sizeof(ncclDevComm), NCCL_VERSION_CODE};
 }
 
 std::string NcclDeviceCommunicator::ToString() const {
