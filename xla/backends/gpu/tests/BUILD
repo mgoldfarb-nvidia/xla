@@ -1470,6 +1470,45 @@ xla_test(
 )
 
 xla_test(
+    name = "collective_ops_ffi_device_communicator_test",
+    srcs = ["collective_ops_ffi_device_communicator_test.cc"],
+    backend_tags = {
+        "gpu": ["multi_gpu"],
+    },
+    backends = ["gpu"],
+    tags = ["cuda-only"],
+    deps = [
+        ":collective_ops_e2e_test_base",
+        ":collective_ops_ffi_kernels",
+        "//xla:literal",
+        "//xla:status_macros",
+        "//xla:xla_data_proto_cc",
+        "//xla/backends/gpu:ffi",
+        "//xla/ffi",
+        "//xla/ffi:collectives_ffi",
+        "//xla/ffi/api:c_api",
+        "//xla/ffi/api:collectives_api",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:kernel_args",
+        "//xla/stream_executor:launch_dim",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor/gpu:gpu_kernel_registry",
+        "//xla/tests:literal_test_util",
+        "//xla/tests:xla_internal_test_main",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest",
+    ] + if_cuda_is_configured([
+        ":collective_ops_ffi_kernels_cuda",
+        "@local_config_cuda//cuda:cuda_headers",
+        "@local_config_nccl//:nccl",
+    ]),
+)
+
+xla_test(
     name = "collective_ops_sharded_unsharded_e2e_test",
     srcs = ["collective_ops_sharded_unsharded_e2e_test.cc"],
     backend_tags = {

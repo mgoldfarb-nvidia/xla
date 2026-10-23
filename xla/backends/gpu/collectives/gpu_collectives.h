@@ -60,6 +60,18 @@ class GpuCollectives : public Collectives {
       absl::string_view platform_name,
       std::optional<std::string> impl = std::nullopt);
 
+  struct BackendInfo {
+    // Null-terminated name with static lifetime.
+    const char* backend;
+    // Version encoding is backend-specific.
+    int64_t build_version;
+    int64_t runtime_version;
+  };
+
+  virtual absl::StatusOr<BackendInfo> GetBackendInfo() const {
+    return Unimplemented("Collectives backend information is not implemented");
+  }
+
   // A callback to get a unique clique ids.
   using CliqueIdCallback =  // NOLINT
       std::function<absl::StatusOr<CliqueIds>(const CliqueKey&)>;

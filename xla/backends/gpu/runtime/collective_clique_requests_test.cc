@@ -86,6 +86,32 @@ TEST(CollectiveCliqueRequestsTest, RequestDevComms) {
   EXPECT_TRUE(ordered_requests[0].dev_comms.contains(dev_comm1));
 }
 
+TEST(CollectiveCliqueRequestsTest, RequiredDeviceCommSurvivesMergedRequests) {
+  GpuCliqueKey key({GlobalDeviceId(0), GlobalDeviceId(1)}, 2);
+  std::vector<std::vector<GlobalDeviceId>> groups = {
+      {GlobalDeviceId(0), GlobalDeviceId(1)}};
+  GpuDeviceCommunicator::Requirements required;
+  required.gin_signal_count = 1;
+  GpuDeviceCommunicator::Requirements optional;
+  optional.lsa_barrier_count = 1;
+
+  for (bool request_required_first : {false, true}) {
+    CollectiveCliqueRequests requests;
+    if (!request_required_first) {
+      ASSERT_OK(requests.RequestClique(key, groups, {required}));
+    }
+    ASSERT_OK(requests.RequestDeviceComm(key, groups, required));
+    ASSERT_OK(requests.RequestClique(key, groups, {optional}));
+    ASSERT_OK(requests.RequestClique(key, groups, {required}));
+    std::vector<CollectiveCliqueRequests::CliqueRequest> ordered =
+        requests.OrderedRequestedCliques();
+    ASSERT_EQ(ordered.size(), 1);
+    EXPECT_EQ(ordered[0].dev_comms.size(), 2);
+    EXPECT_TRUE(ordered[0].required_dev_comms.contains(required));
+    EXPECT_FALSE(ordered[0].required_dev_comms.contains(optional));
+  }
+}
+
 TEST(CollectiveCliqueRequestsTest, DeviceGroupsMismatch) {
   GlobalDeviceId d0 = GlobalDeviceId(0);
   GlobalDeviceId d1 = GlobalDeviceId(1);

@@ -35,7 +35,7 @@ static __global__ void NcclDevAllReduce(ncclDevComm dev_comm,
                                         size_t dst_offset, size_t count) {
   ncclLsaBarrierSession<ncclCoopCta> bar(ncclCoopCta(), dev_comm,
                                          ncclTeamTagLsa(), blockIdx.x);
-  bar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+  bar.sync(ncclCoopCta(), cuda::memory_order_acquire);
 
   const int rank = dev_comm.lsaRank, nRanks = dev_comm.lsaSize;
   const int globalTid = threadIdx.x + blockDim.x * (rank + blockIdx.x * nRanks);

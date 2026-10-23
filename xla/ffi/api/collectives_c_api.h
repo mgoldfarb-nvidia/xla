@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef XLA_FFI_API_COLLECTIVES_C_API_H_
 #define XLA_FFI_API_COLLECTIVES_C_API_H_
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -44,7 +45,7 @@ extern "C" {
 
 #define XLA_FFI_Extension_Collectives 129
 #define XLA_FFI_Extension_Collectives_MajorVersion 0
-#define XLA_FFI_Extension_Collectives_MinorVersion 2
+#define XLA_FFI_Extension_Collectives_MinorVersion 3
 
 // Mirrors `xla::CollectiveOpGroupMode`.
 typedef enum XLA_FFI_CollectiveGroupMode {
@@ -177,6 +178,95 @@ typedef XLA_FFI_Error* XLA_FFI_Window_Get(
     const XLA_FFI_Collectives_Extension* self, XLA_FFI_Window_Get_Args* args);
 
 //===----------------------------------------------------------------------===//
+// Backend information and device communicators
+//===----------------------------------------------------------------------===//
+
+typedef struct XLA_FFI_Collectives_GetBackendInfo_Args {
+  size_t struct_size;
+  XLA_FFI_InternalExtension* extension_start;
+
+  // Null-terminated backend name with static lifetime (e.g. "nccl").
+  const char* backend;      // out
+  int64_t build_version;    // out: headers used to compile XLA
+  int64_t runtime_version;  // out: library called by XLA
+} XLA_FFI_Collectives_GetBackendInfo_Args;
+
+XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_Collectives_GetBackendInfo_Args,
+                             runtime_version);
+
+// Queries the active backend without acquiring a clique or communicating with
+// other ranks. Available in Prepare, Initialize, and Execute. Version encoding
+// is backend-defined; NCCL uses NCCL_VERSION_CODE.
+typedef XLA_FFI_Error* XLA_FFI_Collectives_GetBackendInfo(
+    const XLA_FFI_Collectives_Extension* self,
+    XLA_FFI_Collectives_GetBackendInfo_Args* args);
+
+// Borrowed, immutable host descriptor owned by XLA. On CUDA this is an
+// ncclDevComm*, whose value is copied into kernel arguments, not a device
+// pointer. Callers must not mutate or destroy it, or retain it past execution.
+typedef struct XLA_FFI_DeviceCommunicator XLA_FFI_DeviceCommunicator;
+
+typedef struct XLA_FFI_DeviceCommunicator_Requirements {
+  size_t struct_size;
+  XLA_FFI_InternalExtension* extension_start;
+
+  int32_t barrier_count;
+  int32_t lsa_barrier_count;
+  int32_t rail_gin_barrier_count;
+  int32_t gin_signal_count;
+  bool gin_connection_full;
+} XLA_FFI_DeviceCommunicator_Requirements;
+
+XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_DeviceCommunicator_Requirements,
+                             gin_connection_full);
+
+typedef struct XLA_FFI_DeviceCommunicator_Request_Args {
+  size_t struct_size;
+  XLA_FFI_InternalExtension* extension_start;
+
+  XLA_FFI_CollectiveGroupMode group_mode;
+  const XLA_FFI_ReplicaGroup* groups;
+  size_t num_groups;
+  int64_t communication_id;
+  const XLA_FFI_DeviceCommunicator_Requirements* requirements;
+  // Caller's device-header version; must be positive and match build_version.
+  int64_t expected_build_version;
+} XLA_FFI_DeviceCommunicator_Request_Args;
+
+XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_DeviceCommunicator_Request_Args,
+                             expected_build_version);
+
+// Requests the clique and a device communicator in Prepare. All ranks must
+// request identical requirements; counts must be nonnegative. Equal requests
+// share synchronization resources and require ordered kernel execution. Use
+// distinct communication_ids for independently concurrent kernels.
+typedef XLA_FFI_Error* XLA_FFI_DeviceCommunicator_Request(
+    const XLA_FFI_Collectives_Extension* self,
+    XLA_FFI_DeviceCommunicator_Request_Args* args);
+
+typedef struct XLA_FFI_DeviceCommunicator_Get_Args {
+  size_t struct_size;
+  XLA_FFI_InternalExtension* extension_start;
+
+  XLA_FFI_CollectiveGroupMode group_mode;
+  const XLA_FFI_ReplicaGroup* groups;
+  size_t num_groups;
+  int64_t communication_id;
+  const XLA_FFI_DeviceCommunicator_Requirements* requirements;
+  int64_t expected_build_version;
+  const XLA_FFI_DeviceCommunicator* communicator;  // out
+} XLA_FFI_DeviceCommunicator_Get_Args;
+
+XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_DeviceCommunicator_Get_Args, communicator);
+
+// Returns the descriptor in Initialize/Execute after acquisition. The group,
+// communication_id, requirements, and expected_build_version must match the
+// request. NCCL GIN requests also require runtime_version == build_version.
+typedef XLA_FFI_Error* XLA_FFI_DeviceCommunicator_Get(
+    const XLA_FFI_Collectives_Extension* self,
+    XLA_FFI_DeviceCommunicator_Get_Args* args);
+
+//===----------------------------------------------------------------------===//
 // Extension struct
 //===----------------------------------------------------------------------===//
 
@@ -190,9 +280,14 @@ struct XLA_FFI_Collectives_Extension {
 
   XLA_FFI_Window_Request* request_window;
   XLA_FFI_Window_Get* get_window;
+
+  XLA_FFI_Collectives_GetBackendInfo* get_backend_info;
+  XLA_FFI_DeviceCommunicator_Request* request_device_communicator;
+  XLA_FFI_DeviceCommunicator_Get* get_device_communicator;
 };
 
-XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_Collectives_Extension, get_window);
+XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_Collectives_Extension,
+                             get_device_communicator);
 
 #ifdef __cplusplus
 }  // extern "C"

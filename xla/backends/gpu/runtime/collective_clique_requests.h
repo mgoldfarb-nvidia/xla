@@ -118,6 +118,9 @@ class CollectiveCliqueRequests {
     // order, otherwise it might lead to deadlocks.
     absl::btree_set<GpuDeviceCommunicator::Requirements> dev_comms;
 
+    // Explicit FFI requests cannot use the fallback paths of internal thunks.
+    absl::btree_set<GpuDeviceCommunicator::Requirements> required_dev_comms;
+
     // Requirements for barriers.
     bool use_cross_device_barrier_requested = false;
 
@@ -171,6 +174,13 @@ class CollectiveCliqueRequests {
       const GpuCliqueKey& clique_key,
       absl::Span<const std::vector<GlobalDeviceId>> device_groups,
       const CliqueRequirements& requirements = CliqueRequirements());
+
+  // Requests a clique and a device communicator that must be created, even
+  // when internal collective kernels could fall back to another implementation.
+  absl::Status RequestDeviceComm(
+      const GpuCliqueKey& clique_key,
+      absl::Span<const std::vector<GlobalDeviceId>> device_groups,
+      const GpuDeviceCommunicator::Requirements& requirements);
 
   // Returns all requested cliques in undefined order.
   std::vector<GpuCliqueKey> RequestedCliques() const;
