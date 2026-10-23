@@ -55,6 +55,29 @@ using ::testing::HasSubstr;
 constexpr int64_t kCommunicationId = 0;
 constexpr int64_t kNumReplicas = 2;
 
+// Requires a live GetDeviceCommunicator result after its version check.
+// The copy borrows XLA's resources for the current execution.
+absl::StatusOr<ncclDevComm> DecodeNcclDeviceCommunicator(
+    const XLA_FFI_DeviceCommunicator* descriptor) {
+  if (descriptor == nullptr) {
+    return absl::InvalidArgumentError("NCCL device communicator is null");
+  }
+  const ncclDevComm* comm = reinterpret_cast<const ncclDevComm*>(descriptor);
+#if NCCL_VERSION_CODE >= 23000
+  // Earlier NCCL descriptors have no versioning metadata.
+  if (comm->magic != NCCL_API_MAGIC) {
+    return absl::FailedPreconditionError(
+        "NCCL device communicator magic mismatch");
+  }
+  if (comm->version != NCCL_VERSION_CODE) {
+    return absl::FailedPreconditionError(absl::Substitute(
+        "NCCL device communicator version mismatch: descriptor=$0, caller=$1",
+        comm->version, NCCL_VERSION_CODE));
+  }
+#endif
+  return *comm;
+}
+
 absl::Status Instantiate(ffi::Communicator comm, int64_t version_offset,
                          int32_t /*lsa_barrier_count*/) {
   ABSL_ASSIGN_OR_RETURN(ffi::GpuCollectivesVersion version,
@@ -96,6 +119,8 @@ absl::Status Execute(se::Stream* stream, ffi::BufferR0<U32> src,
       const XLA_FFI_DeviceCommunicator* descriptor,
       comm.GetDeviceCommunicator(ffi::GroupMode::kFlattenedId, {{0, 1}},
                                  kCommunicationId, requirements));
+  ABSL_ASSIGN_OR_RETURN(ncclDevComm dev_comm,
+                        DecodeNcclDeviceCommunicator(descriptor));
   ABSL_ASSIGN_OR_RETURN(
       ffi::WindowLookup src_window,
       comm.GetWindow(ffi::GroupMode::kFlattenedId, {{0, 1}}, kCommunicationId,
@@ -104,9 +129,6 @@ absl::Status Execute(se::Stream* stream, ffi::BufferR0<U32> src,
       ffi::WindowLookup dst_window,
       comm.GetWindow(ffi::GroupMode::kFlattenedId, {{0, 1}}, kCommunicationId,
                      dst->device_memory().opaque()));
-  TF_RET_CHECK(descriptor != nullptr);
-  const ncclDevComm& dev_comm =
-      *reinterpret_cast<const ncclDevComm*>(descriptor);
   TF_RET_CHECK(dev_comm.lsaSize == kNumReplicas);
 
   ABSL_ASSIGN_OR_RETURN(auto kernel,
@@ -150,6 +172,45 @@ XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(),
                          "__xla_test$$public_api_device_communicator", "gpu",
                          XLA_FFI_Handler_Bundle{kInstantiate, kPrepare, nullptr,
                                                 kExecute});
+
+TEST(NcclDeviceCommunicatorDecodeTest, CopiesDescriptor) {
+  ncclDevComm comm{};
+#if NCCL_VERSION_CODE >= 23000
+  comm.magic = NCCL_API_MAGIC;
+  comm.version = NCCL_VERSION_CODE;
+#endif
+  comm.rank = 1;
+  comm.nRanks = 2;
+  const XLA_FFI_DeviceCommunicator* descriptor =
+      reinterpret_cast<const XLA_FFI_DeviceCommunicator*>(&comm);
+  ASSERT_OK_AND_ASSIGN(ncclDevComm decoded,
+                       DecodeNcclDeviceCommunicator(descriptor));
+  comm.rank = 0;
+  EXPECT_EQ(decoded.rank, 1);
+  EXPECT_EQ(decoded.nRanks, 2);
+}
+
+TEST(NcclDeviceCommunicatorDecodeTest, RejectsNull) {
+  EXPECT_THAT(DecodeNcclDeviceCommunicator(nullptr),
+              StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("null")));
+}
+
+#if NCCL_VERSION_CODE >= 23000
+TEST(NcclDeviceCommunicatorDecodeTest, RejectsInvalidMarkers) {
+  ncclDevComm comm{};
+  comm.version = NCCL_VERSION_CODE;
+  const XLA_FFI_DeviceCommunicator* descriptor =
+      reinterpret_cast<const XLA_FFI_DeviceCommunicator*>(&comm);
+  EXPECT_THAT(
+      DecodeNcclDeviceCommunicator(descriptor),
+      StatusIs(absl::StatusCode::kFailedPrecondition, HasSubstr("magic")));
+  comm.magic = NCCL_API_MAGIC;
+  ++comm.version;
+  EXPECT_THAT(
+      DecodeNcclDeviceCommunicator(descriptor),
+      StatusIs(absl::StatusCode::kFailedPrecondition, HasSubstr("version")));
+}
+#endif
 
 class DeviceCommunicatorFfiTest : public CollectiveOpsE2ETestBase {
  public:
