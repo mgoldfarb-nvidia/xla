@@ -211,6 +211,8 @@ typedef struct XLA_FFI_DeviceCommunicator_Requirements {
   size_t struct_size;
   XLA_FFI_InternalExtension* extension_start;
 
+  // Caller's device-header version; must be positive and match XLA's build.
+  int64_t expected_build_version;
   int32_t barrier_count;
   int32_t lsa_barrier_count;
   int32_t rail_gin_barrier_count;
@@ -230,12 +232,10 @@ typedef struct XLA_FFI_DeviceCommunicator_Request_Args {
   size_t num_groups;
   int64_t communication_id;
   const XLA_FFI_DeviceCommunicator_Requirements* requirements;
-  // Caller's device-header version; must be positive and match build_version.
-  int64_t expected_build_version;
 } XLA_FFI_DeviceCommunicator_Request_Args;
 
 XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_DeviceCommunicator_Request_Args,
-                             expected_build_version);
+                             requirements);
 
 // Requests the clique and a device communicator in Prepare. All ranks must
 // request identical requirements; counts must be nonnegative. Equal requests
@@ -254,15 +254,14 @@ typedef struct XLA_FFI_DeviceCommunicator_Get_Args {
   size_t num_groups;
   int64_t communication_id;
   const XLA_FFI_DeviceCommunicator_Requirements* requirements;
-  int64_t expected_build_version;
   const XLA_FFI_DeviceCommunicator* communicator;  // out
 } XLA_FFI_DeviceCommunicator_Get_Args;
 
 XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_DeviceCommunicator_Get_Args, communicator);
 
 // Returns the descriptor in Initialize/Execute after acquisition. The group,
-// communication_id, requirements, and expected_build_version must match the
-// request. GIN requests also require runtime_version == build_version.
+// communication_id, and requirements must match the request. GIN requests also
+// require runtime_version == build_version.
 typedef XLA_FFI_Error* XLA_FFI_DeviceCommunicator_Get(
     const XLA_FFI_Collectives_Extension* self,
     XLA_FFI_DeviceCommunicator_Get_Args* args);

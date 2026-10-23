@@ -286,7 +286,7 @@ TEST(CollectivesFfiTest, RequestAndGetDeviceCommunicator) {
         EXPECT_EQ(args->groups[0].ids[0], 0);
         EXPECT_EQ(args->groups[0].ids[1], 1);
         EXPECT_EQ(args->communication_id, 17);
-        EXPECT_EQ(args->expected_build_version, 22907);
+        EXPECT_EQ(args->requirements->expected_build_version, 22907);
         return static_cast<XLA_FFI_Error*>(nullptr);
       };
   ext.get_device_communicator = [](const XLA_FFI_Collectives_Extension* self,
@@ -299,7 +299,7 @@ TEST(CollectivesFfiTest, RequestAndGetDeviceCommunicator) {
     EXPECT_EQ(args->extension_start, nullptr);
     EXPECT_EQ(args->group_mode, XLA_FFI_GROUP_FLATTENED_ID);
     EXPECT_EQ(args->communication_id, 17);
-    EXPECT_EQ(args->expected_build_version, 22907);
+    EXPECT_EQ(args->requirements->expected_build_version, 22907);
     EXPECT_EQ(args->requirements->barrier_count, 1);
     EXPECT_EQ(args->requirements->lsa_barrier_count, 2);
     EXPECT_EQ(args->requirements->rail_gin_barrier_count, 3);
@@ -311,14 +311,15 @@ TEST(CollectivesFfiTest, RequestAndGetDeviceCommunicator) {
   };
 
   Communicator comm(Api(), &ext);
-  DeviceCommunicatorRequirements requirements{1, 2, 3, 4, true};
-  Error status = comm.RequestDeviceCommunicator(
-      GroupMode::kFlattenedId, {{0, 1}}, 17, requirements, 22907);
+  DeviceCommunicatorRequirements requirements{22907, 1, 2, 3, 4, true};
+  Error status = comm.RequestDeviceCommunicator(GroupMode::kFlattenedId,
+                                                {{0, 1}}, 17, requirements);
   ASSERT_TRUE(status.success());
   EXPECT_TRUE(request.requested);
   EXPECT_EQ(request.requirements.struct_size,
             XLA_FFI_DeviceCommunicator_Requirements_STRUCT_SIZE);
   EXPECT_EQ(request.requirements.extension_start, nullptr);
+  EXPECT_EQ(request.requirements.expected_build_version, 22907);
   EXPECT_EQ(request.requirements.barrier_count, 1);
   EXPECT_EQ(request.requirements.lsa_barrier_count, 2);
   EXPECT_EQ(request.requirements.rail_gin_barrier_count, 3);
@@ -327,7 +328,7 @@ TEST(CollectivesFfiTest, RequestAndGetDeviceCommunicator) {
 
   ErrorOr<const XLA_FFI_DeviceCommunicator*> device_comm =
       comm.GetDeviceCommunicator(GroupMode::kFlattenedId, {{0, 1}}, 17,
-                                 requirements, 22907);
+                                 requirements);
   ASSERT_FALSE(device_comm.has_error());
   EXPECT_EQ(device_comm.value(),
             reinterpret_cast<const XLA_FFI_DeviceCommunicator*>(&request));
@@ -370,11 +371,11 @@ TEST(CollectivesFfiTest, RejectsUnavailableDeviceCommunicatorApi) {
     ASSERT_TRUE(version.has_error());
     EXPECT_EQ(version.error().errc(), ErrorCode::kUnimplemented);
     Error request = comm.RequestDeviceCommunicator(GroupMode::kFlattenedId,
-                                                   {{0, 1}}, 0, {}, 22907);
+                                                   {{0, 1}}, 0, {22907});
     EXPECT_EQ(request.errc(), ErrorCode::kUnimplemented);
     ErrorOr<const XLA_FFI_DeviceCommunicator*> device_comm =
-        comm.GetDeviceCommunicator(GroupMode::kFlattenedId, {{0, 1}}, 0, {},
-                                   22907);
+        comm.GetDeviceCommunicator(GroupMode::kFlattenedId, {{0, 1}}, 0,
+                                   {22907});
     ASSERT_TRUE(device_comm.has_error());
     EXPECT_EQ(device_comm.error().errc(), ErrorCode::kUnimplemented);
   }

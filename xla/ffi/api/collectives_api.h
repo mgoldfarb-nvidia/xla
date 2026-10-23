@@ -51,6 +51,8 @@ struct GpuCollectivesVersion {
 };
 
 struct DeviceCommunicatorRequirements {
+  // Caller's compiled device-header version, not a queried XLA version.
+  int64_t expected_build_version = 0;
   int32_t barrier_count = 0;
   int32_t lsa_barrier_count = 0;
   int32_t rail_gin_barrier_count = 0;
@@ -198,13 +200,11 @@ class CommunicatorContextBase {
     return GpuCollectivesVersion{args.build_version, args.runtime_version};
   }
 
-  // Requests the clique and device communicator in Prepare. The expected
-  // version is the caller's device-header version, not a queried XLA version.
+  // Requests the clique and device communicator in Prepare.
   Status RequestDeviceCommunicator(
       GroupMode group_mode, const std::vector<std::vector<int64_t>>& groups,
       int64_t communication_id,
-      const DeviceCommunicatorRequirements& requirements,
-      int64_t expected_build_version) {
+      const DeviceCommunicatorRequirements& requirements) {
     if (ext_ == nullptr ||
         ext_->extension_base.id.major_version !=
             XLA_FFI_Extension_Collectives_MajorVersion ||
@@ -226,7 +226,6 @@ class CommunicatorContextBase {
     args.num_groups = raw_groups.size();
     args.communication_id = communication_id;
     args.requirements = &raw_requirements;
-    args.expected_build_version = expected_build_version;
     if (XLA_FFI_Error* err = ext_->request_device_communicator(ext_, &args)) {
       return ErrorPolicy::TakeError(api_, err);
     }
@@ -239,8 +238,7 @@ class CommunicatorContextBase {
   StatusOr<const XLA_FFI_DeviceCommunicator*> GetDeviceCommunicator(
       GroupMode group_mode, const std::vector<std::vector<int64_t>>& groups,
       int64_t communication_id,
-      const DeviceCommunicatorRequirements& requirements,
-      int64_t expected_build_version) {
+      const DeviceCommunicatorRequirements& requirements) {
     if (ext_ == nullptr ||
         ext_->extension_base.id.major_version !=
             XLA_FFI_Extension_Collectives_MajorVersion ||
@@ -262,7 +260,6 @@ class CommunicatorContextBase {
     args.num_groups = raw_groups.size();
     args.communication_id = communication_id;
     args.requirements = &raw_requirements;
-    args.expected_build_version = expected_build_version;
     if (XLA_FFI_Error* err = ext_->get_device_communicator(ext_, &args)) {
       return ErrorPolicy::TakeError(api_, err);
     }
@@ -279,6 +276,7 @@ class CommunicatorContextBase {
     return XLA_FFI_DeviceCommunicator_Requirements{
         XLA_FFI_DeviceCommunicator_Requirements_STRUCT_SIZE,
         nullptr,
+        requirements.expected_build_version,
         requirements.barrier_count,
         requirements.lsa_barrier_count,
         requirements.rail_gin_barrier_count,

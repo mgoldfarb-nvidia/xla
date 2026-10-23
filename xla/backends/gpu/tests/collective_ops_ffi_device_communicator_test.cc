@@ -75,10 +75,10 @@ absl::Status Prepare(ffi::BufferR0<U32> src,
                      ffi::Communicator comm, int64_t version_offset,
                      int32_t lsa_barrier_count) {
   ffi::DeviceCommunicatorRequirements requirements;
+  requirements.expected_build_version = NCCL_VERSION_CODE + version_offset;
   requirements.lsa_barrier_count = lsa_barrier_count;
   ABSL_RETURN_IF_ERROR(comm.RequestDeviceCommunicator(
-      ffi::GroupMode::kFlattenedId, {{0, 1}}, kCommunicationId, requirements,
-      NCCL_VERSION_CODE + version_offset));
+      ffi::GroupMode::kFlattenedId, {{0, 1}}, kCommunicationId, requirements));
   return comm.RequestWindow(
       ffi::GroupMode::kFlattenedId, {{0, 1}}, kCommunicationId,
       {{src.device_memory().opaque(), src.device_memory().size()},
@@ -90,12 +90,12 @@ absl::Status Execute(se::Stream* stream, ffi::BufferR0<U32> src,
                      ffi::Communicator comm, int64_t version_offset,
                      int32_t lsa_barrier_count) {
   ffi::DeviceCommunicatorRequirements requirements;
+  requirements.expected_build_version = NCCL_VERSION_CODE + version_offset;
   requirements.lsa_barrier_count = lsa_barrier_count;
   ABSL_ASSIGN_OR_RETURN(
       const XLA_FFI_DeviceCommunicator* descriptor,
       comm.GetDeviceCommunicator(ffi::GroupMode::kFlattenedId, {{0, 1}},
-                                 kCommunicationId, requirements,
-                                 NCCL_VERSION_CODE + version_offset));
+                                 kCommunicationId, requirements));
   ABSL_ASSIGN_OR_RETURN(
       ffi::WindowLookup src_window,
       comm.GetWindow(ffi::GroupMode::kFlattenedId, {{0, 1}}, kCommunicationId,

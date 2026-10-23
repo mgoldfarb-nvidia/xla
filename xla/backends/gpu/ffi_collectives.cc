@@ -192,8 +192,7 @@ absl::Status GpuCollectivesVersionImpl(
 
 absl::StatusOr<GpuDeviceCommunicator::Requirements> DeviceCommRequirements(
     const GpuCollectivesState* state,
-    const XLA_FFI_DeviceCommunicator_Requirements* requirements,
-    int64_t expected_build_version) {
+    const XLA_FFI_DeviceCommunicator_Requirements* requirements) {
   if (requirements == nullptr) {
     return InvalidArgument("Device communicator requirements are null");
   }
@@ -207,7 +206,7 @@ absl::StatusOr<GpuDeviceCommunicator::Requirements> DeviceCommRequirements(
     return InvalidArgument(
         "Device communicator resource counts must be non-negative");
   }
-  if (expected_build_version <= 0) {
+  if (requirements->expected_build_version <= 0) {
     return InvalidArgument("expected_build_version must be positive");
   }
   GpuDeviceCommunicator::Requirements reqs;
@@ -222,11 +221,12 @@ absl::StatusOr<GpuDeviceCommunicator::Requirements> DeviceCommRequirements(
   }
   ABSL_ASSIGN_OR_RETURN(GpuCollectives::GpuCollectivesVersion version,
                         GetGpuCollectivesVersion(state));
-  if (version.build_version != expected_build_version) {
+  if (version.build_version != requirements->expected_build_version) {
     return FailedPrecondition(
         "Device communicator header version mismatch: caller=%d, "
         "XLA build=%d, runtime=%d",
-        expected_build_version, version.build_version, version.runtime_version);
+        requirements->expected_build_version, version.build_version,
+        version.runtime_version);
   }
   // GIN's device ABI has a stricter compatibility contract than host NCCL.
   if (GpuDeviceCommunicator::RequestsGin(reqs) &&
@@ -256,8 +256,7 @@ absl::Status DeviceCommunicatorRequestImpl(
         "stage");
   }
   ABSL_ASSIGN_OR_RETURN(GpuDeviceCommunicator::Requirements reqs,
-                        DeviceCommRequirements(state, args->requirements,
-                                               args->expected_build_version));
+                        DeviceCommRequirements(state, args->requirements));
   ABSL_ASSIGN_OR_RETURN(std::vector<ReplicaGroup> groups,
                         ToReplicaGroups(args->groups, args->num_groups));
   ABSL_ASSIGN_OR_RETURN(
@@ -288,8 +287,7 @@ absl::Status DeviceCommunicatorGetImpl(
         "Device communicator get is only available after cliques are acquired");
   }
   ABSL_ASSIGN_OR_RETURN(GpuDeviceCommunicator::Requirements reqs,
-                        DeviceCommRequirements(state, args->requirements,
-                                               args->expected_build_version));
+                        DeviceCommRequirements(state, args->requirements));
   ABSL_ASSIGN_OR_RETURN(std::vector<ReplicaGroup> groups,
                         ToReplicaGroups(args->groups, args->num_groups));
   ABSL_ASSIGN_OR_RETURN(
