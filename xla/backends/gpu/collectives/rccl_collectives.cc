@@ -145,7 +145,7 @@ absl::StatusOr<GpuCollectives::GpuCollectivesVersion>
 RcclCollectives::GetGpuCollectivesVersion() const {
   int runtime_version;
   XLA_RCCL_RETURN_IF_ERROR(ncclGetVersion(&runtime_version));
-  return GpuCollectivesVersion{"rccl", NCCL_VERSION_CODE, runtime_version};
+  return GpuCollectivesVersion{NCCL_VERSION_CODE, runtime_version};
 }
 
 absl::StatusOr<CliqueId> RcclCollectives::CreateUniqueCliqueId() const {

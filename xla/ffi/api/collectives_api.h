@@ -18,7 +18,6 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
-#include <string>
 #include <vector>
 
 #include "xla/ffi/api/c_api.h"
@@ -47,7 +46,6 @@ struct WindowLookup {
 };
 
 struct GpuCollectivesVersion {
-  std::string backend;
   int64_t build_version;
   int64_t runtime_version;
 };
@@ -175,7 +173,7 @@ class CommunicatorContextBase {
     return WindowLookup{args.window, args.window_offset};
   }
 
-  // Queries the active backend locally, including during Prepare.
+  // Queries build-time and runtime versions locally, including during Prepare.
   StatusOr<GpuCollectivesVersion> GetGpuCollectivesVersion() {
     if (ext_ == nullptr ||
         ext_->extension_base.id.major_version !=
@@ -194,12 +192,7 @@ class CommunicatorContextBase {
     if (XLA_FFI_Error* err = ext_->get_gpu_collectives_version(ext_, &args)) {
       return ErrorPolicy::TakeError(api_, err);
     }
-    if (args.backend == nullptr) {
-      return ErrorPolicy::FromErrorCode(XLA_FFI_Error_Code_INTERNAL,
-                                        "Collectives backend name is null");
-    }
-    return GpuCollectivesVersion{args.backend, args.build_version,
-                                 args.runtime_version};
+    return GpuCollectivesVersion{args.build_version, args.runtime_version};
   }
 
   // Requests the clique and device communicator in Prepare. The expected

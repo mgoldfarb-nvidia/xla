@@ -61,8 +61,6 @@ class GpuCollectives : public Collectives {
       std::optional<std::string> impl = std::nullopt);
 
   struct GpuCollectivesVersion {
-    // Null-terminated name with static lifetime.
-    const char* backend;
     // Version encoding is backend-specific.
     int64_t build_version;
     int64_t runtime_version;

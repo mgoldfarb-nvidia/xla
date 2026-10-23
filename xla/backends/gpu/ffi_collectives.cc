@@ -164,7 +164,6 @@ absl::Status GpuCollectivesVersionImpl(
       args->struct_size));
   ABSL_ASSIGN_OR_RETURN(GpuCollectives::GpuCollectivesVersion version,
                         GetGpuCollectivesVersion(AsState(self)));
-  args->backend = version.backend;
   args->build_version = version.build_version;
   args->runtime_version = version.runtime_version;
   return absl::OkStatus();
@@ -204,17 +203,15 @@ absl::StatusOr<GpuDeviceCommunicator::Requirements> DeviceCommRequirements(
                         GetGpuCollectivesVersion(state));
   if (version.build_version != expected_build_version) {
     return FailedPrecondition(
-        "Device communicator header version mismatch for %s: caller=%d, "
+        "Device communicator header version mismatch: caller=%d, "
         "XLA build=%d, runtime=%d",
-        version.backend, expected_build_version, version.build_version,
-        version.runtime_version);
+        expected_build_version, version.build_version, version.runtime_version);
   }
   // GIN's device ABI has a stricter compatibility contract than host NCCL.
-  if (absl::string_view(version.backend) == "nccl" &&
-      GpuDeviceCommunicator::RequestsGin(reqs) &&
+  if (GpuDeviceCommunicator::RequestsGin(reqs) &&
       version.runtime_version != version.build_version) {
     return FailedPrecondition(
-        "GIN device communicators require matching NCCL build and runtime "
+        "GIN device communicators require matching build and runtime "
         "versions: build=%d, runtime=%d",
         version.build_version, version.runtime_version);
   }

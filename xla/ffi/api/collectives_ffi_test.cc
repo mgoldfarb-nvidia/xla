@@ -251,7 +251,6 @@ TEST(CollectivesFfiTest, GetGpuCollectivesVersion) {
             args->struct_size,
             XLA_FFI_Collectives_GetGpuCollectivesVersion_Args_STRUCT_SIZE);
         EXPECT_EQ(args->extension_start, nullptr);
-        args->backend = "nccl";
         args->build_version = 22907;
         args->runtime_version = 22908;
         return static_cast<XLA_FFI_Error*>(nullptr);
@@ -260,7 +259,6 @@ TEST(CollectivesFfiTest, GetGpuCollectivesVersion) {
   Communicator comm(Api(), &ext);
   ErrorOr<GpuCollectivesVersion> version = comm.GetGpuCollectivesVersion();
   ASSERT_FALSE(version.has_error());
-  EXPECT_EQ(version->backend, "nccl");
   EXPECT_EQ(version->build_version, 22907);
   EXPECT_EQ(version->runtime_version, 22908);
 }

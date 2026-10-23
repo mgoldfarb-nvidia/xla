@@ -63,7 +63,6 @@ absl::Status Prepare(ffi::BufferR0<U32> src,
                         comm.GetGpuCollectivesVersion());
   int runtime_version;
   TF_RET_CHECK(ncclGetVersion(&runtime_version) == ncclSuccess);
-  TF_RET_CHECK(version.backend == "nccl");
   TF_RET_CHECK(version.build_version == NCCL_VERSION_CODE);
   TF_RET_CHECK(version.runtime_version == runtime_version);
 

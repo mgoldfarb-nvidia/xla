@@ -223,7 +223,7 @@ static absl::StatusOr<int> GetLinkedNcclVersion() {
 absl::StatusOr<GpuCollectives::GpuCollectivesVersion>
 NcclCollectives::GetGpuCollectivesVersion() const {
   ABSL_ASSIGN_OR_RETURN(int runtime_version, GetLinkedNcclVersion());
-  return GpuCollectivesVersion{"nccl", NCCL_VERSION_CODE, runtime_version};
+  return GpuCollectivesVersion{NCCL_VERSION_CODE, runtime_version};
 }
 
 static std::string FormatNcclVersion(int nccl_version) {

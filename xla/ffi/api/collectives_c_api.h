@@ -185,8 +185,6 @@ typedef struct XLA_FFI_Collectives_GetGpuCollectivesVersion_Args {
   size_t struct_size;
   XLA_FFI_InternalExtension* extension_start;
 
-  // Null-terminated backend name with static lifetime (e.g. "nccl").
-  const char* backend;      // out
   int64_t build_version;    // out: headers used to compile XLA
   int64_t runtime_version;  // out: library called by XLA
 } XLA_FFI_Collectives_GetGpuCollectivesVersion_Args;
@@ -194,9 +192,9 @@ typedef struct XLA_FFI_Collectives_GetGpuCollectivesVersion_Args {
 XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_Collectives_GetGpuCollectivesVersion_Args,
                              runtime_version);
 
-// Queries the active backend without acquiring a clique or communicating with
-// other ranks. Available in Prepare, Initialize, and Execute. Version encoding
-// is backend-defined; NCCL uses NCCL_VERSION_CODE.
+// Queries versions for the active backend without acquiring a clique or
+// communicating with other ranks. Available in Prepare, Initialize, and
+// Execute. Version encoding is backend-defined; NCCL uses NCCL_VERSION_CODE.
 typedef XLA_FFI_Error* XLA_FFI_Collectives_GetGpuCollectivesVersion(
     const XLA_FFI_Collectives_Extension* self,
     XLA_FFI_Collectives_GetGpuCollectivesVersion_Args* args);
@@ -261,7 +259,7 @@ XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_DeviceCommunicator_Get_Args, communicator);
 
 // Returns the descriptor in Initialize/Execute after acquisition. The group,
 // communication_id, requirements, and expected_build_version must match the
-// request. NCCL GIN requests also require runtime_version == build_version.
+// request. GIN requests also require runtime_version == build_version.
 typedef XLA_FFI_Error* XLA_FFI_DeviceCommunicator_Get(
     const XLA_FFI_Collectives_Extension* self,
     XLA_FFI_DeviceCommunicator_Get_Args* args);
