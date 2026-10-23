@@ -45,7 +45,7 @@ class NcclCollectives : public GpuCollectives {
  public:
   bool IsImplemented() const final { return true; }
 
-  absl::StatusOr<BackendInfo> GetBackendInfo() const final;
+  absl::StatusOr<CommunicatorVersion> GetCommunicatorVersion() const final;
 
   absl::Status GroupLaunch(absl::Span<const GpuCommunicator* const> comms,
                            absl::FunctionRef<absl::Status()> group) final;

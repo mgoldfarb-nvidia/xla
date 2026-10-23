@@ -141,11 +141,11 @@ static ncclComm_t Cast(const Communicator* comm) {
   return rccl_communicator->comm();
 }
 
-absl::StatusOr<GpuCollectives::BackendInfo> RcclCollectives::GetBackendInfo()
-    const {
+absl::StatusOr<GpuCollectives::CommunicatorVersion>
+RcclCollectives::GetCommunicatorVersion() const {
   int runtime_version;
   XLA_RCCL_RETURN_IF_ERROR(ncclGetVersion(&runtime_version));
-  return BackendInfo{"rccl", NCCL_VERSION_CODE, runtime_version};
+  return CommunicatorVersion{"rccl", NCCL_VERSION_CODE, runtime_version};
 }
 
 absl::StatusOr<CliqueId> RcclCollectives::CreateUniqueCliqueId() const {

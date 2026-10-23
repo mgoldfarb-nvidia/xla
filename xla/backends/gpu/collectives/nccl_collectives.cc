@@ -220,10 +220,10 @@ static absl::StatusOr<int> GetLinkedNcclVersion() {
   return nccl_version;
 }
 
-absl::StatusOr<GpuCollectives::BackendInfo> NcclCollectives::GetBackendInfo()
-    const {
+absl::StatusOr<GpuCollectives::CommunicatorVersion>
+NcclCollectives::GetCommunicatorVersion() const {
   ABSL_ASSIGN_OR_RETURN(int runtime_version, GetLinkedNcclVersion());
-  return BackendInfo{"nccl", NCCL_VERSION_CODE, runtime_version};
+  return CommunicatorVersion{"nccl", NCCL_VERSION_CODE, runtime_version};
 }
 
 static std::string FormatNcclVersion(int nccl_version) {

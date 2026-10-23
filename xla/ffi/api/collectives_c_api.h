@@ -178,10 +178,10 @@ typedef XLA_FFI_Error* XLA_FFI_Window_Get(
     const XLA_FFI_Collectives_Extension* self, XLA_FFI_Window_Get_Args* args);
 
 //===----------------------------------------------------------------------===//
-// Backend information and device communicators
+// Communicator versions and device communicators
 //===----------------------------------------------------------------------===//
 
-typedef struct XLA_FFI_Collectives_GetBackendInfo_Args {
+typedef struct XLA_FFI_Collectives_GetCommunicatorVersion_Args {
   size_t struct_size;
   XLA_FFI_InternalExtension* extension_start;
 
@@ -189,17 +189,17 @@ typedef struct XLA_FFI_Collectives_GetBackendInfo_Args {
   const char* backend;      // out
   int64_t build_version;    // out: headers used to compile XLA
   int64_t runtime_version;  // out: library called by XLA
-} XLA_FFI_Collectives_GetBackendInfo_Args;
+} XLA_FFI_Collectives_GetCommunicatorVersion_Args;
 
-XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_Collectives_GetBackendInfo_Args,
+XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_Collectives_GetCommunicatorVersion_Args,
                              runtime_version);
 
 // Queries the active backend without acquiring a clique or communicating with
 // other ranks. Available in Prepare, Initialize, and Execute. Version encoding
 // is backend-defined; NCCL uses NCCL_VERSION_CODE.
-typedef XLA_FFI_Error* XLA_FFI_Collectives_GetBackendInfo(
+typedef XLA_FFI_Error* XLA_FFI_Collectives_GetCommunicatorVersion(
     const XLA_FFI_Collectives_Extension* self,
-    XLA_FFI_Collectives_GetBackendInfo_Args* args);
+    XLA_FFI_Collectives_GetCommunicatorVersion_Args* args);
 
 // Borrowed, immutable host descriptor owned by XLA. On CUDA this is an
 // ncclDevComm*, whose value is copied into kernel arguments, not a device
@@ -281,7 +281,7 @@ struct XLA_FFI_Collectives_Extension {
   XLA_FFI_Window_Request* request_window;
   XLA_FFI_Window_Get* get_window;
 
-  XLA_FFI_Collectives_GetBackendInfo* get_backend_info;
+  XLA_FFI_Collectives_GetCommunicatorVersion* get_communicator_version;
   XLA_FFI_DeviceCommunicator_Request* request_device_communicator;
   XLA_FFI_DeviceCommunicator_Get* get_device_communicator;
 };

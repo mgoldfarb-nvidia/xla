@@ -59,12 +59,13 @@ absl::Status Prepare(ffi::BufferR0<U32> src,
                      ffi::Result<ffi::BufferR0<U32>> dst,
                      ffi::Communicator comm, int64_t version_offset,
                      int32_t lsa_barrier_count) {
-  ABSL_ASSIGN_OR_RETURN(ffi::BackendInfo info, comm.GetBackendInfo());
+  ABSL_ASSIGN_OR_RETURN(ffi::CommunicatorVersion version,
+                        comm.GetCommunicatorVersion());
   int runtime_version;
   TF_RET_CHECK(ncclGetVersion(&runtime_version) == ncclSuccess);
-  TF_RET_CHECK(info.backend == "nccl");
-  TF_RET_CHECK(info.build_version == NCCL_VERSION_CODE);
-  TF_RET_CHECK(info.runtime_version == runtime_version);
+  TF_RET_CHECK(version.backend == "nccl");
+  TF_RET_CHECK(version.build_version == NCCL_VERSION_CODE);
+  TF_RET_CHECK(version.runtime_version == runtime_version);
 
   ffi::DeviceCommunicatorRequirements requirements;
   requirements.lsa_barrier_count = lsa_barrier_count;

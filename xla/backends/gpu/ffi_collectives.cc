@@ -142,28 +142,31 @@ GpuCollectivesState* AsState(const XLA_FFI_Collectives_Extension* self) {
   return reinterpret_cast<GpuCollectivesState*>(self->state);
 }
 
-absl::StatusOr<GpuCollectives::BackendInfo> GetBackendInfo(
+absl::StatusOr<GpuCollectives::CommunicatorVersion> GetCommunicatorVersion(
     const GpuCollectivesState* state) {
   if (state == nullptr || state->collective_params == nullptr ||
       state->collective_params->collectives == nullptr) {
     return FailedPrecondition("Collectives backend is not available");
   }
-  return state->collective_params->collectives->GetBackendInfo();
+  return state->collective_params->collectives->GetCommunicatorVersion();
 }
 
-absl::Status BackendInfoImpl(const XLA_FFI_Collectives_Extension* self,
-                             XLA_FFI_Collectives_GetBackendInfo_Args* args) {
+absl::Status CommunicatorVersionImpl(
+    const XLA_FFI_Collectives_Extension* self,
+    XLA_FFI_Collectives_GetCommunicatorVersion_Args* args) {
   if (args == nullptr) {
-    return InvalidArgument("XLA_FFI_Collectives_GetBackendInfo_Args is null");
+    return InvalidArgument(
+        "XLA_FFI_Collectives_GetCommunicatorVersion_Args is null");
   }
   ABSL_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
-      "XLA_FFI_Collectives_GetBackendInfo_Args",
-      XLA_FFI_Collectives_GetBackendInfo_Args_STRUCT_SIZE, args->struct_size));
-  ABSL_ASSIGN_OR_RETURN(GpuCollectives::BackendInfo info,
-                        GetBackendInfo(AsState(self)));
-  args->backend = info.backend;
-  args->build_version = info.build_version;
-  args->runtime_version = info.runtime_version;
+      "XLA_FFI_Collectives_GetCommunicatorVersion_Args",
+      XLA_FFI_Collectives_GetCommunicatorVersion_Args_STRUCT_SIZE,
+      args->struct_size));
+  ABSL_ASSIGN_OR_RETURN(GpuCollectives::CommunicatorVersion version,
+                        GetCommunicatorVersion(AsState(self)));
+  args->backend = version.backend;
+  args->build_version = version.build_version;
+  args->runtime_version = version.runtime_version;
   return absl::OkStatus();
 }
 
@@ -197,23 +200,23 @@ absl::StatusOr<GpuDeviceCommunicator::Requirements> DeviceCommRequirements(
     return InvalidArgument(
         "barrier_count requires GIN resources or connectivity");
   }
-  ABSL_ASSIGN_OR_RETURN(GpuCollectives::BackendInfo info,
-                        GetBackendInfo(state));
-  if (info.build_version != expected_build_version) {
+  ABSL_ASSIGN_OR_RETURN(GpuCollectives::CommunicatorVersion version,
+                        GetCommunicatorVersion(state));
+  if (version.build_version != expected_build_version) {
     return FailedPrecondition(
         "Device communicator header version mismatch for %s: caller=%d, "
         "XLA build=%d, runtime=%d",
-        info.backend, expected_build_version, info.build_version,
-        info.runtime_version);
+        version.backend, expected_build_version, version.build_version,
+        version.runtime_version);
   }
   // GIN's device ABI has a stricter compatibility contract than host NCCL.
-  if (absl::string_view(info.backend) == "nccl" &&
+  if (absl::string_view(version.backend) == "nccl" &&
       GpuDeviceCommunicator::RequestsGin(reqs) &&
-      info.runtime_version != info.build_version) {
+      version.runtime_version != version.build_version) {
     return FailedPrecondition(
         "GIN device communicators require matching NCCL build and runtime "
         "versions: build=%d, runtime=%d",
-        info.build_version, info.runtime_version);
+        version.build_version, version.runtime_version);
   }
   return reqs;
 }
@@ -289,9 +292,10 @@ absl::Status DeviceCommunicatorGetImpl(
   return absl::OkStatus();
 }
 
-XLA_FFI_Error* BackendInfo(const XLA_FFI_Collectives_Extension* self,
-                           XLA_FFI_Collectives_GetBackendInfo_Args* args) {
-  return ffi::CreateError(BackendInfoImpl(self, args));
+XLA_FFI_Error* CommunicatorVersion(
+    const XLA_FFI_Collectives_Extension* self,
+    XLA_FFI_Collectives_GetCommunicatorVersion_Args* args) {
+  return ffi::CreateError(CommunicatorVersionImpl(self, args));
 }
 
 XLA_FFI_Error* DeviceCommunicatorRequest(
@@ -521,7 +525,7 @@ XLA_FFI_Collectives_Extension MakeCollectivesExtension(
   ext.get_communicator = CommunicatorGet;
   ext.request_window = WindowRequest;
   ext.get_window = WindowGet;
-  ext.get_backend_info = BackendInfo;
+  ext.get_communicator_version = CommunicatorVersion;
   ext.request_device_communicator = DeviceCommunicatorRequest;
   ext.get_device_communicator = DeviceCommunicatorGet;
   return ext;

@@ -241,26 +241,27 @@ TEST(CollectivesFfiTest, RequestAndGetWindow) {
   EXPECT_EQ(got_lookup.offset, kFakeWindowOffset);
 }
 
-TEST(CollectivesFfiTest, GetBackendInfo) {
+TEST(CollectivesFfiTest, GetCommunicatorVersion) {
   XLA_FFI_Collectives_Extension ext = MakeFakeCollectivesExtension(
       nullptr, FakeRequestCommunicator, FakeGetCommunicator);
-  ext.get_backend_info = [](const XLA_FFI_Collectives_Extension*,
-                            XLA_FFI_Collectives_GetBackendInfo_Args* args) {
-    EXPECT_EQ(args->struct_size,
-              XLA_FFI_Collectives_GetBackendInfo_Args_STRUCT_SIZE);
-    EXPECT_EQ(args->extension_start, nullptr);
-    args->backend = "nccl";
-    args->build_version = 22907;
-    args->runtime_version = 22908;
-    return static_cast<XLA_FFI_Error*>(nullptr);
-  };
+  ext.get_communicator_version =
+      [](const XLA_FFI_Collectives_Extension*,
+         XLA_FFI_Collectives_GetCommunicatorVersion_Args* args) {
+        EXPECT_EQ(args->struct_size,
+                  XLA_FFI_Collectives_GetCommunicatorVersion_Args_STRUCT_SIZE);
+        EXPECT_EQ(args->extension_start, nullptr);
+        args->backend = "nccl";
+        args->build_version = 22907;
+        args->runtime_version = 22908;
+        return static_cast<XLA_FFI_Error*>(nullptr);
+      };
 
   Communicator comm(Api(), &ext);
-  ErrorOr<BackendInfo> info = comm.GetBackendInfo();
-  ASSERT_FALSE(info.has_error());
-  EXPECT_EQ(info->backend, "nccl");
-  EXPECT_EQ(info->build_version, 22907);
-  EXPECT_EQ(info->runtime_version, 22908);
+  ErrorOr<CommunicatorVersion> version = comm.GetCommunicatorVersion();
+  ASSERT_FALSE(version.has_error());
+  EXPECT_EQ(version->backend, "nccl");
+  EXPECT_EQ(version->build_version, 22907);
+  EXPECT_EQ(version->runtime_version, 22908);
 }
 
 TEST(CollectivesFfiTest, RequestAndGetDeviceCommunicator) {
@@ -344,14 +345,15 @@ TEST(CollectivesFfiTest, RejectsUnavailableDeviceCommunicatorApi) {
       ext.extension_base.id.minor_version = 2;
     } else if (test_case == 2) {
       ext.extension_base.struct_size =
-          offsetof(XLA_FFI_Collectives_Extension, get_backend_info);
+          offsetof(XLA_FFI_Collectives_Extension, get_communicator_version);
     }
     if (test_case != 3) {
-      ext.get_backend_info = [](const XLA_FFI_Collectives_Extension*,
-                                XLA_FFI_Collectives_GetBackendInfo_Args*) {
-        ADD_FAILURE() << "Called an unavailable callback";
-        return static_cast<XLA_FFI_Error*>(nullptr);
-      };
+      ext.get_communicator_version =
+          [](const XLA_FFI_Collectives_Extension*,
+             XLA_FFI_Collectives_GetCommunicatorVersion_Args*) {
+            ADD_FAILURE() << "Called an unavailable callback";
+            return static_cast<XLA_FFI_Error*>(nullptr);
+          };
       ext.request_device_communicator =
           [](const XLA_FFI_Collectives_Extension*,
              XLA_FFI_DeviceCommunicator_Request_Args*) {
@@ -365,9 +367,9 @@ TEST(CollectivesFfiTest, RejectsUnavailableDeviceCommunicatorApi) {
       };
     }
     Communicator comm(Api(), &ext);
-    ErrorOr<BackendInfo> info = comm.GetBackendInfo();
-    ASSERT_TRUE(info.has_error());
-    EXPECT_EQ(info.error().errc(), ErrorCode::kUnimplemented);
+    ErrorOr<CommunicatorVersion> version = comm.GetCommunicatorVersion();
+    ASSERT_TRUE(version.has_error());
+    EXPECT_EQ(version.error().errc(), ErrorCode::kUnimplemented);
     Error request = comm.RequestDeviceCommunicator(GroupMode::kFlattenedId,
                                                    {{0, 1}}, 0, {}, 22907);
     EXPECT_EQ(request.errc(), ErrorCode::kUnimplemented);
