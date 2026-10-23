@@ -76,6 +76,7 @@ cc_library(
         "//xla/runtime:device_id",
         "//xla/service:collective_ops_utils",
         "//xla/stream_executor:device_address",
+        "//xla/stream_executor:device_description",
         "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",

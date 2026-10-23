@@ -60,6 +60,12 @@ class GpuCollectives : public Collectives {
       absl::string_view platform_name,
       std::optional<std::string> impl = std::nullopt);
 
+  // Resolves the same process-configured implementation without aborting when
+  // the platform or implementation is unavailable.
+  static absl::StatusOr<GpuCollectives*> TryResolve(
+      absl::string_view platform_name,
+      std::optional<std::string> impl = std::nullopt);
+
   struct GpuCollectivesVersion {
     // Version encoding is backend-specific.
     int64_t build_version;

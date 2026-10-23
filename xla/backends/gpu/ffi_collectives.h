@@ -23,6 +23,10 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/collective_params.h"
 #include "xla/ffi/api/collectives_c_api.h"
 
+namespace stream_executor {
+class GpuComputeCapability;
+}  // namespace stream_executor
+
 namespace xla::gpu {
 
 // Per-invocation collective state read by the collectives FFI extension
@@ -31,12 +35,14 @@ namespace xla::gpu {
 //   * `collective_clique_requests` / `collective_memory_requests` — Prepare.
 //   * `collective_cliques` / `collective_memory` — Initialize / Execute /
 //   Record.
+//   * `gpu_compute_capability` — Instantiate, before a run selects a provider.
 struct GpuCollectivesState {
   const CollectiveParams* collective_params = nullptr;
   CollectiveCliqueRequests* collective_clique_requests = nullptr;
   CollectiveMemoryRequests* collective_memory_requests = nullptr;
   const CollectiveCliques* collective_cliques = nullptr;
   const CollectiveMemory* collective_memory = nullptr;
+  const stream_executor::GpuComputeCapability* gpu_compute_capability = nullptr;
 };
 
 // Builds a collectives FFI extension whose callbacks read `state`. Borrows

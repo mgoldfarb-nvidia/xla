@@ -192,9 +192,12 @@ typedef struct XLA_FFI_Collectives_GetGpuCollectivesVersion_Args {
 XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_Collectives_GetGpuCollectivesVersion_Args,
                              runtime_version);
 
-// Queries versions for the active backend without acquiring a clique or
-// communicating with other ranks. Available in Prepare, Initialize, and
-// Execute. Version encoding is backend-defined; NCCL uses NCCL_VERSION_CODE.
+// Queries versions without acquiring a clique or communicating with ranks.
+// Instantiate reports the compile/load process's configured provider for the
+// target GPU platform. Prepare and later stages report the actual per-run
+// provider, which may differ; device communicator requests validate against
+// that provider. Version encoding is backend-defined; NCCL uses
+// NCCL_VERSION_CODE.
 typedef XLA_FFI_Error* XLA_FFI_Collectives_GetGpuCollectivesVersion(
     const XLA_FFI_Collectives_Extension* self,
     XLA_FFI_Collectives_GetGpuCollectivesVersion_Args* args);

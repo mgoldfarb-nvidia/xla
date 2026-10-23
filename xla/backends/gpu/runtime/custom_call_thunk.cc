@@ -231,6 +231,11 @@ absl::StatusOr<std::unique_ptr<CustomCallThunk>> CustomCallThunk::Create(
       InvokeContext call_options = BuildInstantiateInvokeContext(
           execution_state.get(), &gpu_compute_capability,
           &*cpu_target_machine_options);
+      GpuCollectivesState collectives_state;
+      collectives_state.gpu_compute_capability = &gpu_compute_capability;
+      XLA_FFI_Collectives_Extension collectives =
+          MakeCollectivesExtension(&collectives_state);
+      call_options.extension_start = &collectives.extension_base;
       ABSL_RETURN_IF_ERROR(Invoke(ffi::GetXlaFfiApi(), bundle.instantiate,
                                   call_frame, call_options,
                                   XLA_FFI_ExecutionStage_INSTANTIATE));
@@ -274,6 +279,11 @@ absl::StatusOr<std::unique_ptr<CustomCallThunk>> CustomCallThunk::Create(
     InvokeContext context = BuildInstantiateInvokeContext(
         execution_state.get(), &gpu_compute_capability,
         &*cpu_target_machine_options);
+    GpuCollectivesState collectives_state;
+    collectives_state.gpu_compute_capability = &gpu_compute_capability;
+    XLA_FFI_Collectives_Extension collectives =
+        MakeCollectivesExtension(&collectives_state);
+    context.extension_start = &collectives.extension_base;
     ABSL_RETURN_IF_ERROR(Invoke(ffi::GetXlaFfiApi(), *bundle.instantiate,
                                 call_frame, context,
                                 xla::ffi::ExecutionStage::kInstantiate));

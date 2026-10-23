@@ -44,6 +44,7 @@ limitations under the License.
 #include "xla/service/collective_ops_utils.h"
 #include "xla/status_macros.h"
 #include "xla/stream_executor/device_address.h"
+#include "xla/stream_executor/device_description.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
 
@@ -144,11 +145,31 @@ GpuCollectivesState* AsState(const XLA_FFI_Collectives_Extension* self) {
 
 absl::StatusOr<GpuCollectives::GpuCollectivesVersion> GetGpuCollectivesVersion(
     const GpuCollectivesState* state) {
-  if (state == nullptr || state->collective_params == nullptr ||
-      state->collective_params->collectives == nullptr) {
+  if (state == nullptr) {
     return FailedPrecondition("Collectives backend is not available");
   }
-  return state->collective_params->collectives->GetGpuCollectivesVersion();
+  if (state->collective_params != nullptr) {
+    if (state->collective_params->collectives == nullptr) {
+      return FailedPrecondition("Collectives backend is not available");
+    }
+    return state->collective_params->collectives->GetGpuCollectivesVersion();
+  }
+  if (state->gpu_compute_capability == nullptr) {
+    return FailedPrecondition("GPU target is not available");
+  }
+  absl::string_view platform_name;
+  if (state->gpu_compute_capability->IsCuda()) {
+    platform_name = "CUDA";
+  } else if (state->gpu_compute_capability->IsRocm()) {
+    platform_name = "ROCM";
+  } else if (state->gpu_compute_capability->IsOneAPI()) {
+    platform_name = "SYCL";
+  } else {
+    return Unimplemented("Unsupported GPU target for collectives version");
+  }
+  ABSL_ASSIGN_OR_RETURN(GpuCollectives * collectives,
+                        GpuCollectives::TryResolve(platform_name));
+  return collectives->GetGpuCollectivesVersion();
 }
 
 absl::Status GpuCollectivesVersionImpl(

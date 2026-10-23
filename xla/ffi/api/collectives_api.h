@@ -173,7 +173,10 @@ class CommunicatorContextBase {
     return WindowLookup{args.window, args.window_offset};
   }
 
-  // Queries build-time and runtime versions locally, including during Prepare.
+  // Queries versions without acquiring collective resources. Instantiate uses
+  // the compile/load process's configured provider for the target GPU platform.
+  // Prepare and later stages use the actual per-run provider; device requests
+  // validate against that provider even when versions were queried earlier.
   StatusOr<GpuCollectivesVersion> GetGpuCollectivesVersion() {
     if (ext_ == nullptr ||
         ext_->extension_base.id.major_version !=

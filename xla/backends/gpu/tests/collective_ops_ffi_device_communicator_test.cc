@@ -55,17 +55,25 @@ using ::testing::HasSubstr;
 constexpr int64_t kCommunicationId = 0;
 constexpr int64_t kNumReplicas = 2;
 
-absl::Status Prepare(ffi::BufferR0<U32> src,
-                     ffi::Result<ffi::BufferR0<U32>> dst,
-                     ffi::Communicator comm, int64_t version_offset,
-                     int32_t lsa_barrier_count) {
+absl::Status Instantiate(ffi::Communicator comm, int64_t version_offset,
+                         int32_t /*lsa_barrier_count*/) {
   ABSL_ASSIGN_OR_RETURN(ffi::GpuCollectivesVersion version,
                         comm.GetGpuCollectivesVersion());
   int runtime_version;
   TF_RET_CHECK(ncclGetVersion(&runtime_version) == ncclSuccess);
-  TF_RET_CHECK(version.build_version == NCCL_VERSION_CODE);
   TF_RET_CHECK(version.runtime_version == runtime_version);
+  if (version.build_version != NCCL_VERSION_CODE + version_offset) {
+    return absl::FailedPreconditionError(absl::Substitute(
+        "NCCL header version mismatch: caller=$0, XLA=$1",
+        NCCL_VERSION_CODE + version_offset, version.build_version));
+  }
+  return absl::OkStatus();
+}
 
+absl::Status Prepare(ffi::BufferR0<U32> src,
+                     ffi::Result<ffi::BufferR0<U32>> dst,
+                     ffi::Communicator comm, int64_t version_offset,
+                     int32_t lsa_barrier_count) {
   ffi::DeviceCommunicatorRequirements requirements;
   requirements.lsa_barrier_count = lsa_barrier_count;
   ABSL_RETURN_IF_ERROR(comm.RequestDeviceCommunicator(
@@ -115,6 +123,12 @@ absl::Status Execute(se::Stream* stream, ffi::BufferR0<U32> src,
   return stream->BlockHostUntilDone();
 }
 
+XLA_FFI_DEFINE_HANDLER(kInstantiate, Instantiate,
+                       ffi::Ffi::BindInstantiate()
+                           .Ctx<ffi::Extension<ffi::Collectives>>()
+                           .Attr<int64_t>("version_offset")
+                           .Attr<int32_t>("lsa_barrier_count"));
+
 XLA_FFI_DEFINE_HANDLER(kPrepare, Prepare,
                        ffi::Ffi::BindPrepare()
                            .Arg<ffi::BufferR0<U32>>()
@@ -134,7 +148,7 @@ XLA_FFI_DEFINE_HANDLER(kExecute, Execute,
 
 XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(),
                          "__xla_test$$public_api_device_communicator", "gpu",
-                         XLA_FFI_Handler_Bundle{nullptr, kPrepare, nullptr,
+                         XLA_FFI_Handler_Bundle{kInstantiate, kPrepare, nullptr,
                                                 kExecute});
 
 class DeviceCommunicatorFfiTest : public CollectiveOpsE2ETestBase {
