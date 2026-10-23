@@ -123,7 +123,7 @@ class FfiKernelArgsPacked : public se::KernelArgsPackedArrayBase {
     return argument_addresses_.size() + (shared_memory_bytes_ > 0);
   }
 
-  size_t number_of_shared_bytes() const override {
+  uint64_t number_of_shared_bytes() const override {
     return shared_memory_bytes_;
   }
 

@@ -25,6 +25,7 @@ limitations under the License.
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/strings/str_format.h"
 #include "absl/types/span.h"
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
@@ -105,6 +106,16 @@ absl::Status CollectiveCliqueRequests::RequestClique(
   req.use_gxl_requested |= requirements.use_gxl;
 
   cliques_.try_emplace(clique_key, std::move(req));
+  return absl::OkStatus();
+}
+
+absl::Status CollectiveCliqueRequests::RequestDeviceComm(
+    const GpuCliqueKey& clique_key,
+    absl::Span<const std::vector<GlobalDeviceId>> device_groups,
+    const GpuDeviceCommunicator::Requirements& requirements) {
+  ABSL_RETURN_IF_ERROR(
+      RequestClique(clique_key, device_groups, {requirements}));
+  cliques_.at(clique_key).required_dev_comms.insert(requirements);
   return absl::OkStatus();
 }
 

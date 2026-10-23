@@ -54,6 +54,14 @@ GpuCollectives* GpuCollectives::Default(absl::string_view platform_name) {
 
 GpuCollectives* GpuCollectives::Resolve(absl::string_view platform_name,
                                         std::optional<std::string> impl) {
+  absl::StatusOr<GpuCollectives*> collectives = TryResolve(platform_name, impl);
+  CHECK_OK(collectives) << "Failed to get GPU collectives implementation: "
+                        << impl.value_or("default");
+  return *collectives;
+}
+
+absl::StatusOr<GpuCollectives*> GpuCollectives::TryResolve(
+    absl::string_view platform_name, std::optional<std::string> impl) {
   auto debug_options = xla::GetDebugOptionsFromFlags();
   if (!impl.has_value() &&
       !debug_options.xla_gpu_collectives_implementation().empty()) {
@@ -63,12 +71,14 @@ GpuCollectives* GpuCollectives::Resolve(absl::string_view platform_name,
                             ? CollectivesRegistry::Get(platform_name, *impl)
                             : CollectivesRegistry::Default(platform_name);
 
-  CHECK_OK(collectives_or) << "Failed to get GPU collectives implementation: "
-                           << impl.value_or("default");
-  if (auto* gpu_coll = absl::down_cast<GpuCollectives*>(*collectives_or)) {
+  if (!collectives_or.ok()) {
+    return collectives_or.status();
+  }
+  if (GpuCollectives* gpu_coll =
+          dynamic_cast<GpuCollectives*>(*collectives_or)) {
     return gpu_coll;
   }
-  LOG(FATAL) << "Unsupported collectives implementation for GPU";
+  return Internal("Unsupported collectives implementation for GPU");
 }
 
 GpuCollectives::Device::Device(se::StreamExecutor* stream_executor)

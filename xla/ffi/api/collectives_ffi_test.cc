@@ -241,5 +241,145 @@ TEST(CollectivesFfiTest, RequestAndGetWindow) {
   EXPECT_EQ(got_lookup.offset, kFakeWindowOffset);
 }
 
+TEST(CollectivesFfiTest, GetGpuCollectivesVersion) {
+  XLA_FFI_Collectives_Extension ext = MakeFakeCollectivesExtension(
+      nullptr, FakeRequestCommunicator, FakeGetCommunicator);
+  ext.get_gpu_collectives_version =
+      [](const XLA_FFI_Collectives_Extension*,
+         XLA_FFI_Collectives_GetGpuCollectivesVersion_Args* args) {
+        EXPECT_EQ(
+            args->struct_size,
+            XLA_FFI_Collectives_GetGpuCollectivesVersion_Args_STRUCT_SIZE);
+        EXPECT_EQ(args->extension_start, nullptr);
+        args->build_version = 22907;
+        args->runtime_version = 22908;
+        return static_cast<XLA_FFI_Error*>(nullptr);
+      };
+
+  Communicator comm(Api(), &ext);
+  ErrorOr<GpuCollectivesVersion> version = comm.GetGpuCollectivesVersion();
+  ASSERT_FALSE(version.has_error());
+  EXPECT_EQ(version->build_version, 22907);
+  EXPECT_EQ(version->runtime_version, 22908);
+}
+
+TEST(CollectivesFfiTest, RequestAndGetDeviceCommunicator) {
+  struct DeviceRequest {
+    bool requested = false;
+    XLA_FFI_DeviceCommunicator_Requirements requirements = {};
+  } request;
+  XLA_FFI_Collectives_Extension ext = MakeFakeCollectivesExtension(
+      reinterpret_cast<XLA_FFI_CollectivesState*>(&request),
+      FakeRequestCommunicator, FakeGetCommunicator);
+  ext.request_device_communicator =
+      [](const XLA_FFI_Collectives_Extension* self,
+         XLA_FFI_DeviceCommunicator_Request_Args* args) {
+        DeviceRequest* request = reinterpret_cast<DeviceRequest*>(self->state);
+        request->requested = true;
+        request->requirements = *args->requirements;
+        EXPECT_EQ(args->struct_size,
+                  XLA_FFI_DeviceCommunicator_Request_Args_STRUCT_SIZE);
+        EXPECT_EQ(args->extension_start, nullptr);
+        EXPECT_EQ(args->group_mode, XLA_FFI_GROUP_FLATTENED_ID);
+        EXPECT_EQ(args->num_groups, 1);
+        EXPECT_EQ(args->groups[0].size, 2);
+        EXPECT_EQ(args->groups[0].ids[0], 0);
+        EXPECT_EQ(args->groups[0].ids[1], 1);
+        EXPECT_EQ(args->communication_id, 17);
+        EXPECT_EQ(args->requirements->expected_build_version, 22907);
+        return static_cast<XLA_FFI_Error*>(nullptr);
+      };
+  ext.get_device_communicator = [](const XLA_FFI_Collectives_Extension* self,
+                                   XLA_FFI_DeviceCommunicator_Get_Args* args) {
+    const DeviceRequest* request =
+        reinterpret_cast<const DeviceRequest*>(self->state);
+    EXPECT_TRUE(request->requested);
+    EXPECT_EQ(args->struct_size,
+              XLA_FFI_DeviceCommunicator_Get_Args_STRUCT_SIZE);
+    EXPECT_EQ(args->extension_start, nullptr);
+    EXPECT_EQ(args->group_mode, XLA_FFI_GROUP_FLATTENED_ID);
+    EXPECT_EQ(args->communication_id, 17);
+    EXPECT_EQ(args->requirements->expected_build_version, 22907);
+    EXPECT_EQ(args->requirements->barrier_count, 1);
+    EXPECT_EQ(args->requirements->lsa_barrier_count, 2);
+    EXPECT_EQ(args->requirements->rail_gin_barrier_count, 3);
+    EXPECT_EQ(args->requirements->gin_signal_count, 4);
+    EXPECT_TRUE(args->requirements->gin_connection_full);
+    args->communicator =
+        reinterpret_cast<const XLA_FFI_DeviceCommunicator*>(self->state);
+    return static_cast<XLA_FFI_Error*>(nullptr);
+  };
+
+  Communicator comm(Api(), &ext);
+  DeviceCommunicatorRequirements requirements{22907, 1, 2, 3, 4, true};
+  Error status = comm.RequestDeviceCommunicator(GroupMode::kFlattenedId,
+                                                {{0, 1}}, 17, requirements);
+  ASSERT_TRUE(status.success());
+  EXPECT_TRUE(request.requested);
+  EXPECT_EQ(request.requirements.struct_size,
+            XLA_FFI_DeviceCommunicator_Requirements_STRUCT_SIZE);
+  EXPECT_EQ(request.requirements.extension_start, nullptr);
+  EXPECT_EQ(request.requirements.expected_build_version, 22907);
+  EXPECT_EQ(request.requirements.barrier_count, 1);
+  EXPECT_EQ(request.requirements.lsa_barrier_count, 2);
+  EXPECT_EQ(request.requirements.rail_gin_barrier_count, 3);
+  EXPECT_EQ(request.requirements.gin_signal_count, 4);
+  EXPECT_TRUE(request.requirements.gin_connection_full);
+
+  ErrorOr<const XLA_FFI_DeviceCommunicator*> device_comm =
+      comm.GetDeviceCommunicator(GroupMode::kFlattenedId, {{0, 1}}, 17,
+                                 requirements);
+  ASSERT_FALSE(device_comm.has_error());
+  EXPECT_EQ(device_comm.value(),
+            reinterpret_cast<const XLA_FFI_DeviceCommunicator*>(&request));
+}
+
+TEST(CollectivesFfiTest, RejectsUnavailableDeviceCommunicatorApi) {
+  for (int test_case = 0; test_case < 4; ++test_case) {
+    SCOPED_TRACE(test_case);
+    XLA_FFI_Collectives_Extension ext = MakeFakeCollectivesExtension(
+        nullptr, FakeRequestCommunicator, FakeGetCommunicator);
+    if (test_case == 0) {
+      ext.extension_base.id.major_version = 1;
+    } else if (test_case == 1) {
+      ext.extension_base.id.minor_version = 2;
+    } else if (test_case == 2) {
+      ext.extension_base.struct_size =
+          offsetof(XLA_FFI_Collectives_Extension, get_gpu_collectives_version);
+    }
+    if (test_case != 3) {
+      ext.get_gpu_collectives_version =
+          [](const XLA_FFI_Collectives_Extension*,
+             XLA_FFI_Collectives_GetGpuCollectivesVersion_Args*) {
+            ADD_FAILURE() << "Called an unavailable callback";
+            return static_cast<XLA_FFI_Error*>(nullptr);
+          };
+      ext.request_device_communicator =
+          [](const XLA_FFI_Collectives_Extension*,
+             XLA_FFI_DeviceCommunicator_Request_Args*) {
+            ADD_FAILURE() << "Called an unavailable callback";
+            return static_cast<XLA_FFI_Error*>(nullptr);
+          };
+      ext.get_device_communicator = [](const XLA_FFI_Collectives_Extension*,
+                                       XLA_FFI_DeviceCommunicator_Get_Args*) {
+        ADD_FAILURE() << "Called an unavailable callback";
+        return static_cast<XLA_FFI_Error*>(nullptr);
+      };
+    }
+    Communicator comm(Api(), &ext);
+    ErrorOr<GpuCollectivesVersion> version = comm.GetGpuCollectivesVersion();
+    ASSERT_TRUE(version.has_error());
+    EXPECT_EQ(version.error().errc(), ErrorCode::kUnimplemented);
+    Error request = comm.RequestDeviceCommunicator(GroupMode::kFlattenedId,
+                                                   {{0, 1}}, 0, {22907});
+    EXPECT_EQ(request.errc(), ErrorCode::kUnimplemented);
+    ErrorOr<const XLA_FFI_DeviceCommunicator*> device_comm =
+        comm.GetDeviceCommunicator(GroupMode::kFlattenedId, {{0, 1}}, 0,
+                                   {22907});
+    ASSERT_TRUE(device_comm.has_error());
+    EXPECT_EQ(device_comm.error().errc(), ErrorCode::kUnimplemented);
+  }
+}
+
 }  // namespace
 }  // namespace xla::ffi

@@ -1120,6 +1120,29 @@ cc_library(
     ],
 )
 
+xla_cc_test(
+    name = "custom_call_thunk_instantiate_test",
+    srcs = ["custom_call_thunk_instantiate_test.cc"],
+    deps = [
+        ":custom_call_thunk",
+        ":thunk",
+        "//xla/backends/gpu/collectives:gpu_collectives",
+        "//xla/backends/gpu/collectives:gpu_collectives_stub",
+        "//xla/core/collectives:collectives_registry",
+        "//xla/ffi",
+        "//xla/ffi:collectives_ffi",
+        "//xla/ffi/api:c_api",
+        "//xla/ffi/api:collectives_api",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor/cuda:cuda_compute_capability",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 xla_test(
     name = "custom_call_thunk_test",
     srcs = ["custom_call_thunk_test.cc"],
@@ -2792,6 +2815,7 @@ cc_library(
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/types:span",
     ],
