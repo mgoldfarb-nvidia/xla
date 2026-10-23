@@ -41,7 +41,7 @@ class RcclCollectives : public GpuCollectives {
  public:
   bool IsImplemented() const final { return true; }
 
-  absl::StatusOr<CommunicatorVersion> GetCommunicatorVersion() const final;
+  absl::StatusOr<GpuCollectivesVersion> GetGpuCollectivesVersion() const final;
 
   absl::Status GroupLaunch(absl::Span<const GpuCommunicator* const> comms,
                            absl::FunctionRef<absl::Status()> group) final;

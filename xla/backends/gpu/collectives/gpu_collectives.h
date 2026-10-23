@@ -60,7 +60,7 @@ class GpuCollectives : public Collectives {
       absl::string_view platform_name,
       std::optional<std::string> impl = std::nullopt);
 
-  struct CommunicatorVersion {
+  struct GpuCollectivesVersion {
     // Null-terminated name with static lifetime.
     const char* backend;
     // Version encoding is backend-specific.
@@ -68,8 +68,10 @@ class GpuCollectives : public Collectives {
     int64_t runtime_version;
   };
 
-  virtual absl::StatusOr<CommunicatorVersion> GetCommunicatorVersion() const {
-    return Unimplemented("Communicator version information is not implemented");
+  virtual absl::StatusOr<GpuCollectivesVersion> GetGpuCollectivesVersion()
+      const {
+    return Unimplemented(
+        "GPU collectives version information is not implemented");
   }
 
   // A callback to get a unique clique ids.

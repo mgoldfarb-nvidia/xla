@@ -142,28 +142,28 @@ GpuCollectivesState* AsState(const XLA_FFI_Collectives_Extension* self) {
   return reinterpret_cast<GpuCollectivesState*>(self->state);
 }
 
-absl::StatusOr<GpuCollectives::CommunicatorVersion> GetCommunicatorVersion(
+absl::StatusOr<GpuCollectives::GpuCollectivesVersion> GetGpuCollectivesVersion(
     const GpuCollectivesState* state) {
   if (state == nullptr || state->collective_params == nullptr ||
       state->collective_params->collectives == nullptr) {
     return FailedPrecondition("Collectives backend is not available");
   }
-  return state->collective_params->collectives->GetCommunicatorVersion();
+  return state->collective_params->collectives->GetGpuCollectivesVersion();
 }
 
-absl::Status CommunicatorVersionImpl(
+absl::Status GpuCollectivesVersionImpl(
     const XLA_FFI_Collectives_Extension* self,
-    XLA_FFI_Collectives_GetCommunicatorVersion_Args* args) {
+    XLA_FFI_Collectives_GetGpuCollectivesVersion_Args* args) {
   if (args == nullptr) {
     return InvalidArgument(
-        "XLA_FFI_Collectives_GetCommunicatorVersion_Args is null");
+        "XLA_FFI_Collectives_GetGpuCollectivesVersion_Args is null");
   }
   ABSL_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
-      "XLA_FFI_Collectives_GetCommunicatorVersion_Args",
-      XLA_FFI_Collectives_GetCommunicatorVersion_Args_STRUCT_SIZE,
+      "XLA_FFI_Collectives_GetGpuCollectivesVersion_Args",
+      XLA_FFI_Collectives_GetGpuCollectivesVersion_Args_STRUCT_SIZE,
       args->struct_size));
-  ABSL_ASSIGN_OR_RETURN(GpuCollectives::CommunicatorVersion version,
-                        GetCommunicatorVersion(AsState(self)));
+  ABSL_ASSIGN_OR_RETURN(GpuCollectives::GpuCollectivesVersion version,
+                        GetGpuCollectivesVersion(AsState(self)));
   args->backend = version.backend;
   args->build_version = version.build_version;
   args->runtime_version = version.runtime_version;
@@ -200,8 +200,8 @@ absl::StatusOr<GpuDeviceCommunicator::Requirements> DeviceCommRequirements(
     return InvalidArgument(
         "barrier_count requires GIN resources or connectivity");
   }
-  ABSL_ASSIGN_OR_RETURN(GpuCollectives::CommunicatorVersion version,
-                        GetCommunicatorVersion(state));
+  ABSL_ASSIGN_OR_RETURN(GpuCollectives::GpuCollectivesVersion version,
+                        GetGpuCollectivesVersion(state));
   if (version.build_version != expected_build_version) {
     return FailedPrecondition(
         "Device communicator header version mismatch for %s: caller=%d, "
@@ -292,10 +292,10 @@ absl::Status DeviceCommunicatorGetImpl(
   return absl::OkStatus();
 }
 
-XLA_FFI_Error* CommunicatorVersion(
+XLA_FFI_Error* GpuCollectivesVersion(
     const XLA_FFI_Collectives_Extension* self,
-    XLA_FFI_Collectives_GetCommunicatorVersion_Args* args) {
-  return ffi::CreateError(CommunicatorVersionImpl(self, args));
+    XLA_FFI_Collectives_GetGpuCollectivesVersion_Args* args) {
+  return ffi::CreateError(GpuCollectivesVersionImpl(self, args));
 }
 
 XLA_FFI_Error* DeviceCommunicatorRequest(
@@ -525,7 +525,7 @@ XLA_FFI_Collectives_Extension MakeCollectivesExtension(
   ext.get_communicator = CommunicatorGet;
   ext.request_window = WindowRequest;
   ext.get_window = WindowGet;
-  ext.get_communicator_version = CommunicatorVersion;
+  ext.get_gpu_collectives_version = GpuCollectivesVersion;
   ext.request_device_communicator = DeviceCommunicatorRequest;
   ext.get_device_communicator = DeviceCommunicatorGet;
   return ext;

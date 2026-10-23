@@ -59,8 +59,8 @@ absl::Status Prepare(ffi::BufferR0<U32> src,
                      ffi::Result<ffi::BufferR0<U32>> dst,
                      ffi::Communicator comm, int64_t version_offset,
                      int32_t lsa_barrier_count) {
-  ABSL_ASSIGN_OR_RETURN(ffi::CommunicatorVersion version,
-                        comm.GetCommunicatorVersion());
+  ABSL_ASSIGN_OR_RETURN(ffi::GpuCollectivesVersion version,
+                        comm.GetGpuCollectivesVersion());
   int runtime_version;
   TF_RET_CHECK(ncclGetVersion(&runtime_version) == ncclSuccess);
   TF_RET_CHECK(version.backend == "nccl");

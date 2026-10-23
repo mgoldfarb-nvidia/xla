@@ -241,14 +241,15 @@ TEST(CollectivesFfiTest, RequestAndGetWindow) {
   EXPECT_EQ(got_lookup.offset, kFakeWindowOffset);
 }
 
-TEST(CollectivesFfiTest, GetCommunicatorVersion) {
+TEST(CollectivesFfiTest, GetGpuCollectivesVersion) {
   XLA_FFI_Collectives_Extension ext = MakeFakeCollectivesExtension(
       nullptr, FakeRequestCommunicator, FakeGetCommunicator);
-  ext.get_communicator_version =
+  ext.get_gpu_collectives_version =
       [](const XLA_FFI_Collectives_Extension*,
-         XLA_FFI_Collectives_GetCommunicatorVersion_Args* args) {
-        EXPECT_EQ(args->struct_size,
-                  XLA_FFI_Collectives_GetCommunicatorVersion_Args_STRUCT_SIZE);
+         XLA_FFI_Collectives_GetGpuCollectivesVersion_Args* args) {
+        EXPECT_EQ(
+            args->struct_size,
+            XLA_FFI_Collectives_GetGpuCollectivesVersion_Args_STRUCT_SIZE);
         EXPECT_EQ(args->extension_start, nullptr);
         args->backend = "nccl";
         args->build_version = 22907;
@@ -257,7 +258,7 @@ TEST(CollectivesFfiTest, GetCommunicatorVersion) {
       };
 
   Communicator comm(Api(), &ext);
-  ErrorOr<CommunicatorVersion> version = comm.GetCommunicatorVersion();
+  ErrorOr<GpuCollectivesVersion> version = comm.GetGpuCollectivesVersion();
   ASSERT_FALSE(version.has_error());
   EXPECT_EQ(version->backend, "nccl");
   EXPECT_EQ(version->build_version, 22907);
@@ -345,12 +346,12 @@ TEST(CollectivesFfiTest, RejectsUnavailableDeviceCommunicatorApi) {
       ext.extension_base.id.minor_version = 2;
     } else if (test_case == 2) {
       ext.extension_base.struct_size =
-          offsetof(XLA_FFI_Collectives_Extension, get_communicator_version);
+          offsetof(XLA_FFI_Collectives_Extension, get_gpu_collectives_version);
     }
     if (test_case != 3) {
-      ext.get_communicator_version =
+      ext.get_gpu_collectives_version =
           [](const XLA_FFI_Collectives_Extension*,
-             XLA_FFI_Collectives_GetCommunicatorVersion_Args*) {
+             XLA_FFI_Collectives_GetGpuCollectivesVersion_Args*) {
             ADD_FAILURE() << "Called an unavailable callback";
             return static_cast<XLA_FFI_Error*>(nullptr);
           };
@@ -367,7 +368,7 @@ TEST(CollectivesFfiTest, RejectsUnavailableDeviceCommunicatorApi) {
       };
     }
     Communicator comm(Api(), &ext);
-    ErrorOr<CommunicatorVersion> version = comm.GetCommunicatorVersion();
+    ErrorOr<GpuCollectivesVersion> version = comm.GetGpuCollectivesVersion();
     ASSERT_TRUE(version.has_error());
     EXPECT_EQ(version.error().errc(), ErrorCode::kUnimplemented);
     Error request = comm.RequestDeviceCommunicator(GroupMode::kFlattenedId,

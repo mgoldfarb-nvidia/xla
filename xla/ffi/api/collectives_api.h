@@ -46,7 +46,7 @@ struct WindowLookup {
   size_t offset;
 };
 
-struct CommunicatorVersion {
+struct GpuCollectivesVersion {
   std::string backend;
   int64_t build_version;
   int64_t runtime_version;
@@ -176,30 +176,30 @@ class CommunicatorContextBase {
   }
 
   // Queries the active backend locally, including during Prepare.
-  StatusOr<CommunicatorVersion> GetCommunicatorVersion() {
+  StatusOr<GpuCollectivesVersion> GetGpuCollectivesVersion() {
     if (ext_ == nullptr ||
         ext_->extension_base.id.major_version !=
             XLA_FFI_Extension_Collectives_MajorVersion ||
         ext_->extension_base.id.minor_version < 3 ||
         ext_->extension_base.struct_size <
             XLA_FFI_Collectives_Extension_STRUCT_SIZE ||
-        ext_->get_communicator_version == nullptr) {
+        ext_->get_gpu_collectives_version == nullptr) {
       return ErrorPolicy::FromErrorCode(
           XLA_FFI_Error_Code_UNIMPLEMENTED,
-          "Communicator versions require collectives extension version 0.3");
+          "GPU collectives versions require collectives extension version 0.3");
     }
-    XLA_FFI_Collectives_GetCommunicatorVersion_Args args = {};
+    XLA_FFI_Collectives_GetGpuCollectivesVersion_Args args = {};
     args.struct_size =
-        XLA_FFI_Collectives_GetCommunicatorVersion_Args_STRUCT_SIZE;
-    if (XLA_FFI_Error* err = ext_->get_communicator_version(ext_, &args)) {
+        XLA_FFI_Collectives_GetGpuCollectivesVersion_Args_STRUCT_SIZE;
+    if (XLA_FFI_Error* err = ext_->get_gpu_collectives_version(ext_, &args)) {
       return ErrorPolicy::TakeError(api_, err);
     }
     if (args.backend == nullptr) {
       return ErrorPolicy::FromErrorCode(XLA_FFI_Error_Code_INTERNAL,
                                         "Collectives backend name is null");
     }
-    return CommunicatorVersion{args.backend, args.build_version,
-                               args.runtime_version};
+    return GpuCollectivesVersion{args.backend, args.build_version,
+                                 args.runtime_version};
   }
 
   // Requests the clique and device communicator in Prepare. The expected
